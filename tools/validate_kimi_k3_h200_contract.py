@@ -12,8 +12,10 @@ from pathlib import Path
 MILES_BASE = "e13758d9b40a3d164f87651c7ac513b844070b6a"
 MILES_ORPHAN_ROOT = "93a7fa4f262f6f241aa3f00c42e066c9d022ee25"
 MILES_UPSTREAM_TREE_SOURCE = "7e575f0549db9664277a26b7862a181c4faa0e5e"
-SGLANG_COMMIT = "2380121e9b16fd3ce778bcc2b4717414b9c4d8a5"
+SGLANG_COMMIT = "f22c2d11a584d84f2aa20fbbf21c92c533de4641"
 SGLANG_K3_MERGE = "abddb1c7e9d61ddddeaf016d885c2f20aab426e8"
+SGLANG_K3_PACKED_MODULES = "b7686e17d6"
+SGLANG_MARLIN_MOE_LORA_IMPORT = "92b3a51ba6"
 
 
 def git(repo: Path, *args: str) -> str:
@@ -49,6 +51,16 @@ def main() -> None:
     subprocess.check_call(
         ["git", "-C", str(sglang), "merge-base", "--is-ancestor", SGLANG_K3_MERGE, SGLANG_COMMIT]
     )
+    subprocess.check_call(
+        ["git", "-C", str(sglang), "merge-base", "--is-ancestor", SGLANG_K3_PACKED_MODULES, SGLANG_COMMIT]
+    )
+    subprocess.check_call(
+        ["git", "-C", str(sglang), "merge-base", "--is-ancestor", SGLANG_MARLIN_MOE_LORA_IMPORT, SGLANG_COMMIT]
+    )
+
+    hybrid_source = (sglang / "python/sglang/srt/layers/attention/hybrid_attn_backend.py").read_text()
+    if hybrid_source.count("    def forward(\n") != 1:
+        raise RuntimeError("HybridAttnBackend must expose exactly one forward implementation")
 
     require_text(
         miles / "scripts/run_kimi_k3_lora.py",
@@ -76,6 +88,7 @@ def main() -> None:
         miles / "miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py",
         (
             "_lora_ipc_live_tensors",
+            "_LORA_TRANSFER_BUFFERS",
             "_prepare_lora_ipc_payload_for_reuse",
             "_refresh_flattened_lora_ipc_payload",
             "metadata changed across publications",

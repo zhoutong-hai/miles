@@ -27,6 +27,7 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 )
 from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import (
     UpdateWeightFromTensor,
+    _LORA_TRANSFER_BUFFERS,
     _LoraVersionChangeValidator,
     _refresh_flattened_lora_ipc_payload,
     _send_to_colocated_engine,
@@ -58,6 +59,9 @@ SAMPLE_BASE_ONLY_WEIGHTS = [
 
 
 class TestColocatedK3FlattenedLoraIpcLifecycle:
+    def setup_method(self):
+        _LORA_TRANSFER_BUFFERS.clear()
+
     def test_refresh_preserves_exporter_storage_and_updates_values(self):
         first = [("layer.lora_A.weight", torch.arange(6, dtype=torch.float32).reshape(2, 3))]
         payload = _refresh_flattened_lora_ipc_payload(first, None)
@@ -68,7 +72,30 @@ class TestColocatedK3FlattenedLoraIpcLifecycle:
 
         assert refreshed is payload
         assert refreshed["flattened_tensor"].untyped_storage().data_ptr() == storage_ptr
-        torch.testing.assert_close(refreshed["flattened_tensor"], second[0][1].reshape(-1))
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+        expected = FlattenedTensorBucket(named_tensors=second).get_flattened_tensor()
+        torch.testing.assert_close(refreshed["flattened_tensor"], expected)
+
+    def test_distinct_chunks_share_one_persistent_transfer_storage(self):
+        first = _refresh_flattened_lora_ipc_payload(
+            [("layer0.lora_A.weight", torch.arange(6, dtype=torch.float32).reshape(2, 3))],
+            None,
+        )
+        second = _refresh_flattened_lora_ipc_payload(
+            [("layer1.lora_B.weight", torch.arange(4, dtype=torch.float32).reshape(2, 2))],
+            None,
+        )
+
+        assert first["flattened_tensor"].untyped_storage().data_ptr() == second[
+            "flattened_tensor"
+        ].untyped_storage().data_ptr()
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+        expected = FlattenedTensorBucket(
+            named_tensors=[("layer1.lora_B.weight", torch.arange(4, dtype=torch.float32).reshape(2, 2))]
+        ).get_flattened_tensor()
+        torch.testing.assert_close(second["flattened_tensor"], expected)
 
     def test_refresh_rejects_tensor_inventory_change(self):
         first = [("layer.lora_A.weight", torch.empty(2, 3))]

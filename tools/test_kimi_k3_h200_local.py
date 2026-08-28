@@ -84,7 +84,11 @@ def load_refresh_function():
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node],
         type_ignores=[],
     )
-    namespace = {"torch": torch, "FlattenedTensorBucket": FakeFlattenedTensorBucket}
+    namespace = {
+        "torch": torch,
+        "FlattenedTensorBucket": FakeFlattenedTensorBucket,
+        "_LORA_TRANSFER_BUFFERS": {},
+    }
     exec(compile(ast.fix_missing_locations(module), str(UPDATE_SOURCE), "exec"), namespace)
     return namespace[node.name]
 
@@ -124,6 +128,16 @@ def test_stable_refresh() -> None:
         assert "metadata changed" in str(error)
     else:
         raise AssertionError("metadata drift was accepted")
+
+
+def test_distinct_chunks_share_one_transfer_storage() -> None:
+    refresh = load_refresh_function()
+    first = refresh([("layer0.lora_A.weight", torch.arange(6, dtype=torch.float32))], None)
+    second = refresh([("layer1.lora_B.weight", torch.arange(4, dtype=torch.float32))], None)
+    assert first["flattened_tensor"].untyped_storage().data_ptr() == second[
+        "flattened_tensor"
+    ].untyped_storage().data_ptr()
+    torch.testing.assert_close(second["flattened_tensor"], torch.arange(4, dtype=torch.float32))
 
 
 def test_unload_ack_barrier_before_refresh() -> None:
@@ -182,6 +196,10 @@ def test_source_contracts() -> None:
     assert "_lora_grad_sum_group" in lora_utils
     assert 'gradient = getattr(parameter, "main_grad", None)' in lora_utils
     assert "dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)" in lora_utils
+    update_source = UPDATE_SOURCE.read_text()
+    assert "_LORA_TRANSFER_BUFFERS" in update_source
+    assert "torch.cuda.current_stream(device=target.device).synchronize()" in update_source
+    assert "_wait_for_colocated_transfer(refs, self._ipc_gather_group, is_lora=True)" in update_source
 
 
 def test_launcher_positive_and_negative_layouts() -> None:
@@ -236,6 +254,7 @@ def test_launcher_positive_and_negative_layouts() -> None:
 
 def main() -> None:
     test_stable_refresh()
+    test_distinct_chunks_share_one_transfer_storage()
     test_unload_ack_barrier_before_refresh()
     test_source_contracts()
     test_launcher_positive_and_negative_layouts()

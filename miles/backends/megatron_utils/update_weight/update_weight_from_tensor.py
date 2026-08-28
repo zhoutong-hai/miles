@@ -158,8 +158,8 @@ class UpdateWeightFromTensor:
             self._lora_base_synced = False
             self._lora_version_change_validator = _LoraVersionChangeValidator()
             # SGLang may retain CUDA-IPC handles after a load RPC returns. Keep
-            # one stable flattened exporter payload per K3 chunk and refresh its
-            # values in place across publications.
+            # payload views alive while all K3 chunks share one persistent
+            # transfer allocation across chunks and publications.
             self._lora_ipc_live_tensors: list[dict[str, Any]] | None = None
 
         # Create IPC gather groups for complete colocated engines. A partial tail
@@ -643,16 +643,48 @@ def _send_to_colocated_engine(
     return refs, long_live_tensors
 
 
+# PR #1923 invariant: all K3 LoRA chunks published by one process reuse one
+# persistent CUDA-IPC allocation. The existing per-chunk ACK barrier makes it
+# safe to refresh this storage before the next chunk, while stable storage
+# avoids CUDA-IPC handle/ref-counter churn across chunks and publications.
+_LORA_TRANSFER_BUFFERS: dict[int | None, torch.Tensor] = {}
+
+
 def _refresh_flattened_lora_ipc_payload(
     hf_named_tensors: list[tuple[str, torch.Tensor]],
     reusable_payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build or refresh one stable flattened K3 LoRA CUDA-IPC payload."""
+    """Build or refresh a view into one stable K3 LoRA transfer allocation."""
     bucket = FlattenedTensorBucket(named_tensors=hf_named_tensors)
     flattened = bucket.get_flattened_tensor()
     metadata = bucket.get_metadata()
     if reusable_payload is None:
-        return {"flattened_tensor": flattened, "metadata": metadata}
+        device_index = flattened.device.index
+        transfer_buffer = _LORA_TRANSFER_BUFFERS.get(device_index)
+        if transfer_buffer is None:
+            min_numel = 512 * 1024 * 1024 // flattened.element_size() if flattened.is_cuda else 0
+            transfer_buffer = torch.empty(
+                max(flattened.numel(), min_numel),
+                dtype=flattened.dtype,
+                device=flattened.device,
+            )
+            _LORA_TRANSFER_BUFFERS[device_index] = transfer_buffer
+        if transfer_buffer.dtype != flattened.dtype or transfer_buffer.device != flattened.device:
+            raise RuntimeError(
+                "K3 LoRA transfer buffer dtype/device changed across chunks: "
+                f"buffer={(transfer_buffer.dtype, transfer_buffer.device)} "
+                f"chunk={(flattened.dtype, flattened.device)}"
+            )
+        if transfer_buffer.numel() < flattened.numel():
+            raise RuntimeError(
+                "K3 LoRA chunk exceeds the persistent transfer buffer; refusing to rotate the CUDA-IPC handle: "
+                f"buffer_numel={transfer_buffer.numel()} chunk_numel={flattened.numel()}"
+            )
+        view = transfer_buffer[: flattened.numel()]
+        view.copy_(flattened)
+        if view.is_cuda:
+            torch.cuda.current_stream(device=view.device).synchronize()
+        return {"flattened_tensor": view, "metadata": metadata}
 
     if set(reusable_payload) != {"flattened_tensor", "metadata"}:
         raise RuntimeError("colocated LoRA IPC payload schema changed across publications")

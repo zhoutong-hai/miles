@@ -157,6 +157,10 @@ class UpdateWeightFromTensor:
             self._lora_loaded = False
             self._lora_base_synced = False
             self._lora_version_change_validator = _LoraVersionChangeValidator()
+            # SGLang may retain CUDA-IPC handles after a load RPC returns. Keep
+            # one stable flattened exporter payload per K3 chunk and refresh its
+            # values in place across publications.
+            self._lora_ipc_live_tensors: list[dict[str, Any]] | None = None
 
         # Create IPC gather groups for complete colocated engines. A partial tail
         # of trainer ranks can be reserved as placeholder GPU slots.
@@ -281,6 +285,31 @@ class UpdateWeightFromTensor:
         out = self.__dict__.pop("update_weight_metrics", {})
         return out
 
+    def _prepare_lora_ipc_payload_for_reuse(self) -> None:
+        """Unload the receiver before refreshing retained exporter storage."""
+        group = self._ipc_gather_group
+        if group is None:
+            return
+        if not self._lora_loaded or self._lora_ipc_live_tensors is None:
+            raise RuntimeError("loaded colocated LoRA adapter has no retained CUDA-IPC payload")
+
+        unload_error: list[str | None] = [None]
+        if dist.get_rank() == self._ipc_gather_src:
+            try:
+                if self._ipc_engine is None:
+                    raise RuntimeError("colocated LoRA IPC source has no rollout engine")
+                ray.get(self._ipc_engine.unload_lora_adapter.remote(lora_name=LORA_ADAPTER_NAME))
+            except Exception as exc:
+                unload_error[0] = f"{type(exc).__name__}: {exc}"
+
+        dist.broadcast_object_list(unload_error, src=self._ipc_gather_src, group=group)
+        if unload_error[0] is not None:
+            raise RuntimeError(f"failed to unload colocated LoRA adapter: {unload_error[0]}")
+
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
+        self._lora_loaded = False
+
     @torch.no_grad()
     def update_weights(self, *, resume_generation: bool = True) -> None:
         """
@@ -333,6 +362,10 @@ class UpdateWeightFromTensor:
                 torch.cuda.empty_cache()
 
         if self.is_lora:
+            reusable_payloads = self._lora_ipc_live_tensors
+            if self._lora_loaded:
+                self._prepare_lora_ipc_payload_for_reuse()
+            publication_payloads: list[dict[str, Any]] = []
             chunks = iter(self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights, weight_type="lora"))
             try:
                 hf_named_tensors = next(chunks)
@@ -349,9 +382,15 @@ class UpdateWeightFromTensor:
                     hf_named_tensors,
                     is_first_chunk=is_first_chunk,
                     is_last_chunk=False,
+                    reusable_lora_payload=(
+                        reusable_payloads[sent_chunks]
+                        if reusable_payloads is not None and sent_chunks < len(reusable_payloads)
+                        else None
+                    ),
                 )
+                publication_payloads.extend(long_lived_tensors)
+                self._lora_ipc_live_tensors = publication_payloads
                 _wait_for_colocated_transfer(refs, self._ipc_gather_group, is_lora=True)
-                del long_lived_tensors
                 sent_chunks += 1
                 hf_named_tensors = next_hf_named_tensors
                 is_first_chunk = False
@@ -360,15 +399,26 @@ class UpdateWeightFromTensor:
                 hf_named_tensors,
                 is_first_chunk=is_first_chunk,
                 is_last_chunk=True,
+                reusable_lora_payload=(
+                    reusable_payloads[sent_chunks]
+                    if reusable_payloads is not None and sent_chunks < len(reusable_payloads)
+                    else None
+                ),
             )
+            publication_payloads.extend(long_lived_tensors)
+            self._lora_ipc_live_tensors = publication_payloads
             _wait_for_colocated_transfer(refs, self._ipc_gather_group, is_lora=True)
-            del long_lived_tensors
             sent_chunks += 1
 
+            if reusable_payloads is not None and len(reusable_payloads) != sent_chunks:
+                raise RuntimeError(
+                    "colocated LoRA IPC chunk inventory changed across publications: "
+                    f"old={len(reusable_payloads)} new={sent_chunks}"
+                )
+
             del chunks, hf_named_tensors, next_hf_named_tensors
-            # Collect after the transfer. Repeated source-side collection while
-            # later IPC handles are still in flight can double-unlink their shm files.
-            torch.cuda.ipc_collect()
+            # The exported CUDA-IPC storages remain owned by this updater and
+            # are reused on the next publication. Do not collect them here.
             torch.cuda.empty_cache()
 
             if rank == 0:
@@ -414,6 +464,7 @@ class UpdateWeightFromTensor:
         *,
         is_first_chunk: bool = True,
         is_last_chunk: bool = True,
+        reusable_lora_payload: dict[str, Any] | None = None,
     ) -> tuple[list[ObjectRef], Any]:
         if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):
             raise RuntimeError(
@@ -442,6 +493,7 @@ class UpdateWeightFromTensor:
                 lora_is_last_chunk=is_last_chunk,
                 check_lora_weight_equal=getattr(self.args, "check_lora_weight_equal", False),
                 lora_version_validator=self._lora_version_change_validator.validate,
+                reusable_lora_payload=reusable_lora_payload,
             )
             if is_last_chunk:
                 self._lora_loaded = True
@@ -462,6 +514,7 @@ def _send_to_colocated_engine(
     lora_is_last_chunk: bool = True,
     check_lora_weight_equal: bool = False,
     lora_version_validator: Callable[..., None] | None = None,
+    reusable_lora_payload: dict[str, Any] | None = None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -480,11 +533,10 @@ def _send_to_colocated_engine(
         # Use one CUDA IPC allocation per existing chunk. K3 exports thousands
         # of tensors; serializing them individually overflows PyTorch's CUDA IPC
         # limbo before the receiver-side references are reaped.
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=hf_named_tensors)
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": flattened_tensor_bucket.get_metadata(),
-        }
+        flattened_tensor_data = _refresh_flattened_lora_ipc_payload(
+            hf_named_tensors,
+            reusable_lora_payload,
+        )
         long_live_tensors.append(flattened_tensor_data)
         serialized_tensors = [MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)]
     elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
@@ -589,3 +641,32 @@ def _send_to_colocated_engine(
                 refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _refresh_flattened_lora_ipc_payload(
+    hf_named_tensors: list[tuple[str, torch.Tensor]],
+    reusable_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build or refresh one stable flattened K3 LoRA CUDA-IPC payload."""
+    bucket = FlattenedTensorBucket(named_tensors=hf_named_tensors)
+    flattened = bucket.get_flattened_tensor()
+    metadata = bucket.get_metadata()
+    if reusable_payload is None:
+        return {"flattened_tensor": flattened, "metadata": metadata}
+
+    if set(reusable_payload) != {"flattened_tensor", "metadata"}:
+        raise RuntimeError("colocated LoRA IPC payload schema changed across publications")
+    if reusable_payload["metadata"] != metadata:
+        raise RuntimeError("colocated LoRA IPC payload metadata changed across publications")
+
+    target = reusable_payload["flattened_tensor"]
+    if target.shape != flattened.shape or target.dtype != flattened.dtype or target.device != flattened.device:
+        raise RuntimeError(
+            "colocated LoRA IPC flattened layout changed across publications: "
+            f"old={(target.shape, target.dtype, target.device)} "
+            f"new={(flattened.shape, flattened.dtype, flattened.device)}"
+        )
+    target.copy_(flattened)
+    if target.is_cuda:
+        torch.cuda.current_stream(device=target.device).synchronize()
+    return reusable_payload

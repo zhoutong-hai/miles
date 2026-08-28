@@ -1,9 +1,7 @@
 sglang:
   - name: default
     update_weights: true
-    num_gpus_per_engine: 8
+    num_gpus_per_engine: 32
     server_groups:
       - worker_type: regular
-        num_gpus: 16
-      - worker_type: placeholder
-        num_gpus: 48
+        num_gpus: 128

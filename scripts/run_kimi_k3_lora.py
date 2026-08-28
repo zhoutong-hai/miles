@@ -14,6 +14,11 @@ _FOUR_LAYER_DCP = "/root/models/Kimi-K3-4layer-torch-dist"
 _FULL_HF = "/root/models/yueming-model-support/native"
 _FULL_DCP = "/root/models/yueming-model-support/torch_dist"
 _FULL_SGLANG_CONFIG = Path(__file__).with_name("models") / "kimi-k3-lora-full-sglang.yaml"
+_K3_NUM_ATTENTION_HEADS = 96
+_K3_NUM_ROUTED_EXPERTS = 896
+_K3_H200_FULL_NODES = 16
+_K3_H200_GPUS_PER_NODE = 8
+_K3_H200_WORLD_SIZE = _K3_H200_FULL_NODES * _K3_H200_GPUS_PER_NODE
 
 _LAYERS = "decoder.layers.*"
 _DEFAULT_TARGET_MODULES = ",".join(
@@ -82,8 +87,47 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 raise NotImplementedError("The verified four-layer Kimi K3 LoRA configuration is one 8-GPU node")
             return
 
-        if self.num_nodes != 16 or self.num_gpus_per_node != 4:
-            raise NotImplementedError("Full-model Kimi K3 LoRA requires 16 four-GPU GB300 nodes")
+        if self.num_nodes != _K3_H200_FULL_NODES or self.num_gpus_per_node != _K3_H200_GPUS_PER_NODE:
+            raise NotImplementedError(
+                "Full-model Kimi K3 H200 LoRA requires exactly "
+                f"{_K3_H200_FULL_NODES} nodes x {_K3_H200_GPUS_PER_NODE} GPUs"
+            )
+        if (self.lora_rank, self.lora_alpha, self.lora_dropout) != (32, 64, 0.0):
+            raise ValueError("Full-model Kimi K3 H200 canary requires rank32/alpha64/dropout0")
+        if not self.check_lora_weight_equal:
+            raise ValueError("Full-model Kimi K3 H200 canary requires --check-lora-weight-equal")
+        if self.target_modules != _DEFAULT_TARGET_MODULES or not self.experts_shared_outer_loras:
+            raise ValueError("Full-model Kimi K3 H200 canary requires the exact native K3 LoRA inventory")
+        if (
+            self.mode,
+            self.num_rollout,
+            self.rollout_batch_size,
+            self.n_samples_per_prompt,
+            self.global_batch_size,
+            self.rollout_max_response_len,
+        ) != ("normal", 2, 8, 8, 64, 1024):
+            raise ValueError(
+                "Full-model Kimi K3 H200 canary requires normal mode, two rollouts, "
+                "8 prompts x 8 samples, GBS64, and a 1024-token response cap"
+            )
+        if self.total_actor_gpus != _K3_H200_WORLD_SIZE:
+            raise ValueError(f"Full-model Kimi K3 H200 world size must be {_K3_H200_WORLD_SIZE}")
+        if self.total_actor_gpus % self.tensor_parallel_size:
+            raise ValueError("Kimi K3 trainer world size must be divisible by tensor parallel size")
+        if _K3_NUM_ATTENTION_HEADS % self.tensor_parallel_size:
+            raise ValueError("Kimi K3 attention heads must divide evenly across trainer TP ranks")
+        if _K3_NUM_ROUTED_EXPERTS % self.expert_parallel_size:
+            raise ValueError("Kimi K3 routed experts must divide evenly across trainer EP ranks")
+        if self.trainer_data_parallel_size != 4:
+            raise ValueError("Kimi K3 128-rank trainer must resolve to DP4")
+        if self.total_actor_gpus % self.rollout_num_gpus_per_engine:
+            raise ValueError("Kimi K3 rollout engine size must divide the actor world")
+        if self.rollout_engine_count != 4:
+            raise ValueError("Kimi K3 H200 canary requires exactly four rollout engines")
+        if _K3_NUM_ATTENTION_HEADS % self.rollout_num_gpus_per_engine:
+            raise ValueError("Kimi K3 attention heads must divide evenly across rollout TP ranks")
+        if _K3_NUM_ROUTED_EXPERTS % self.rollout_expert_parallel_size:
+            raise ValueError("Kimi K3 routed experts must divide evenly across rollout EP ranks")
         if self.checkpoint_load_mode == "rank_local_cache" and self.local_checkpoint_cache_root is None:
             raise ValueError("Full-model Kimi K3 LoRA requires a rank-local checkpoint cache")
         if self.checkpoint_load_mode == "shared" and self.local_checkpoint_cache_root is not None:
@@ -100,16 +144,43 @@ class ScriptArgs(U.ExecuteTrainConfig):
         return 8 if self.model_variant == "4layer" else 32
 
     @property
+    def pipeline_parallel_size(self) -> int:
+        return 1
+
+    @property
+    def context_parallel_size(self) -> int:
+        return 1
+
+    @property
     def expert_parallel_size(self) -> int:
-        return 8 if self.model_variant == "4layer" else 64
+        return 8 if self.model_variant == "4layer" else 128
+
+    @property
+    def expert_tensor_parallel_size(self) -> int:
+        return 1
+
+    @property
+    def total_actor_gpus(self) -> int:
+        return self.num_nodes * self.num_gpus_per_node
+
+    @property
+    def trainer_data_parallel_size(self) -> int:
+        model_parallel = self.tensor_parallel_size * self.pipeline_parallel_size * self.context_parallel_size
+        if self.total_actor_gpus % model_parallel:
+            raise ValueError("Actor world size does not divide the trainer model-parallel product")
+        return self.total_actor_gpus // model_parallel
 
     @property
     def rollout_num_gpus_per_engine(self) -> int:
-        return 8
+        return 8 if self.model_variant == "4layer" else 32
 
     @property
     def rollout_expert_parallel_size(self) -> int:
-        return 8 if self.model_variant == "4layer" else 1
+        return 8 if self.model_variant == "4layer" else 32
+
+    @property
+    def rollout_engine_count(self) -> int:
+        return self.total_actor_gpus // self.rollout_num_gpus_per_engine
 
 
 def _validate_paths(args: ScriptArgs) -> None:
@@ -200,10 +271,10 @@ def _execute_train(args: ScriptArgs) -> None:
     perf_args = (
         f"--tensor-model-parallel-size {args.tensor_parallel_size} "
         "--sequence-parallel "
-        "--pipeline-model-parallel-size 1 "
-        "--context-parallel-size 1 "
+        f"--pipeline-model-parallel-size {args.pipeline_parallel_size} "
+        f"--context-parallel-size {args.context_parallel_size} "
         f"--expert-model-parallel-size {args.expert_parallel_size} "
-        "--expert-tensor-parallel-size 1 "
+        f"--expert-tensor-parallel-size {args.expert_tensor_parallel_size} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
@@ -238,7 +309,7 @@ def _execute_train(args: ScriptArgs) -> None:
     update_weight_buffer_size = args.update_weight_buffer_size
     if update_weight_buffer_size is None:
         update_weight_buffer_size = 256 * 1024**2 if args.model_variant == "full" else 2 * 1024**3
-    # Each full-model TP8 engine serves one request at a time. K3's radix
+    # Each full-model TP32 engine serves one request at a time. K3's radix
     # extra-buffer strategy needs five KDA cache slots per running request.
     sglang_request_capacity = 1 if args.model_variant == "full" else 16
     sglang_mamba_capacity = 5 if args.model_variant == "full" else 16
@@ -259,8 +330,10 @@ def _execute_train(args: ScriptArgs) -> None:
         sglang_args += (
             f"--sglang-config {_FULL_SGLANG_CONFIG} "
             "--sglang-moe-runner-backend marlin "
-            "--sglang-decode-attention-backend trtllm_mla "
-            "--sglang-mamba-radix-cache-strategy extra_buffer "
+            "--sglang-decode-attention-backend flashmla "
+            "--sglang-enable-symm-mem "
+            "--sglang-mem-fraction-static 0.90 "
+            "--sglang-mamba-radix-cache-strategy extra_buffer_lazy "
             "--sglang-cuda-graph-bs-decode 1 "
             "--sglang-cuda-graph-backend-prefill disabled "
         )
@@ -328,6 +401,15 @@ def _execute_train(args: ScriptArgs) -> None:
         "PYTHONPATH": os.pathsep.join((str(Path(__file__).resolve().parents[1]), args.sglang_path)),
         "SGLANG_JIT_ROUTE_RADIX": "1",
     }
+    if args.model_variant == "full":
+        extra_env_vars.update(
+            {
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+                "SGLANG_K3_ATTN_RES_MODE": "jit",
+                "SGLANG_MOE_FUSED_GATE_RADIX": "1",
+            }
+        )
     if args.checkpoint_load_mode == "rank_local_cache" and args.local_checkpoint_cache_root is not None:
         extra_env_vars["MILES_MEGATRON_LOCAL_CHECKPOINT_CACHE"] = args.local_checkpoint_cache_root
 

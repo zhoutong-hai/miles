@@ -216,15 +216,66 @@ def test_full_recompute_keeps_native_lora_in_autograd_graph():
     assert not model.embedding(torch.tensor([[1, 2]])).requires_grad
 
 
-def test_full_rollout_uses_two_official_tp8_engines():
+def test_full_rollout_uses_four_public_h200_tp32_engines():
     config = SglangConfig.from_yaml(_FULL_SGLANG_CONFIG)
 
-    assert config.total_num_gpus == 64
-    assert config.models[0].num_gpus_per_engine == 8
+    assert config.total_num_gpus == 128
+    assert config.models[0].num_gpus_per_engine == 32
     assert [(group.worker_type, group.num_gpus) for group in config.models[0].server_groups] == [
-        ("regular", 16),
-        ("placeholder", 48),
+        ("regular", 128),
     ]
+
+
+def test_full_h200_topology_is_explicit_and_divisible():
+    args = ScriptArgs(
+        model_variant="full",
+        num_nodes=16,
+        num_gpus_per_node=8,
+        checkpoint_load_mode="shared",
+        lora_rank=32,
+        lora_alpha=64,
+        check_lora_weight_equal=True,
+        mode="normal",
+        num_rollout=2,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        global_batch_size=64,
+        rollout_max_response_len=1024,
+    )
+
+    assert args.total_actor_gpus == 128
+    assert args.tensor_parallel_size == 32
+    assert args.pipeline_parallel_size == 1
+    assert args.context_parallel_size == 1
+    assert args.expert_parallel_size == 128
+    assert args.expert_tensor_parallel_size == 1
+    assert args.trainer_data_parallel_size == 4
+    assert args.rollout_num_gpus_per_engine == 32
+    assert args.rollout_expert_parallel_size == 32
+    assert args.rollout_engine_count == 4
+
+
+@pytest.mark.parametrize(
+    ("nodes", "gpus_per_node"),
+    [(16, 4), (8, 8), (24, 8), (16, 7)],
+)
+def test_full_h200_topology_rejects_legacy_and_ambiguous_worlds(nodes, gpus_per_node):
+    with pytest.raises(NotImplementedError, match="exactly 16 nodes x 8 GPUs"):
+        ScriptArgs(
+            model_variant="full",
+            num_nodes=nodes,
+            num_gpus_per_node=gpus_per_node,
+            checkpoint_load_mode="shared",
+            lora_rank=32,
+            lora_alpha=64,
+            check_lora_weight_equal=True,
+            mode="normal",
+            num_rollout=2,
+            rollout_batch_size=8,
+            n_samples_per_prompt=8,
+            global_batch_size=64,
+            rollout_max_response_len=1024,
+        )
 
 
 def test_full_rollout_matches_official_sglang_runtime(monkeypatch, tmp_path):
@@ -246,8 +297,17 @@ def test_full_rollout_matches_official_sglang_runtime(monkeypatch, tmp_path):
         model_variant="full",
         task="dapo-math",
         num_nodes=16,
-        num_gpus_per_node=4,
+        num_gpus_per_node=8,
         checkpoint_load_mode="shared",
+        lora_rank=32,
+        lora_alpha=64,
+        check_lora_weight_equal=True,
+        mode="normal",
+        num_rollout=2,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        global_batch_size=64,
+        rollout_max_response_len=1024,
         hf_checkpoint=str(hf_checkpoint),
         ref_load=str(ref_load),
         megatron_model_type="kimi-k3",
@@ -258,12 +318,19 @@ def test_full_rollout_matches_official_sglang_runtime(monkeypatch, tmp_path):
 
     train_args = captured["train_args"]
     for expected in (
-        "--rollout-num-gpus-per-engine 8",
-        "--sglang-tp-size 8",
-        "--sglang-ep-size 1",
+        "--tensor-model-parallel-size 32",
+        "--pipeline-model-parallel-size 1",
+        "--context-parallel-size 1",
+        "--expert-model-parallel-size 128",
+        "--expert-tensor-parallel-size 1",
+        "--rollout-num-gpus-per-engine 32",
+        "--sglang-tp-size 32",
+        "--sglang-ep-size 32",
         "--sglang-moe-runner-backend marlin",
-        "--sglang-decode-attention-backend trtllm_mla",
-        "--sglang-mamba-radix-cache-strategy extra_buffer",
+        "--sglang-decode-attention-backend flashmla",
+        "--sglang-enable-symm-mem",
+        "--sglang-mem-fraction-static 0.90",
+        "--sglang-mamba-radix-cache-strategy extra_buffer_lazy",
         "--sglang-cuda-graph-bs-decode 1",
         "--sglang-cuda-graph-backend-prefill disabled",
         "--sglang-lora-backend triton",
@@ -274,14 +341,15 @@ def test_full_rollout_matches_official_sglang_runtime(monkeypatch, tmp_path):
     for unsupported in (
         "--sglang-dtype",
         "--sglang-quantization",
-        "--sglang-mem-fraction-static",
         "--sglang-disable-shared-experts-fusion",
         "--sglang-weight-loader-drop-cache-after-load",
     ):
         assert unsupported not in train_args
 
     assert captured["extra_env_vars"]["SGLANG_JIT_ROUTE_RADIX"] == "1"
-    assert "SGLANG_K3_ATTN_RES_MODE" not in captured["extra_env_vars"]
+    assert captured["extra_env_vars"]["SGLANG_K3_ATTN_RES_MODE"] == "jit"
+    assert captured["extra_env_vars"]["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] == "0"
+    assert captured["extra_env_vars"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
     assert "SGLANG_K3_FUSE_MOE_FRONT" not in captured["extra_env_vars"]
 
 
@@ -305,8 +373,16 @@ def test_full_gsm8k_uses_math_reward_and_messages(monkeypatch, tmp_path):
         task="gsm8k",
         mode="normal",
         num_nodes=16,
-        num_gpus_per_node=4,
+        num_gpus_per_node=8,
         checkpoint_load_mode="shared",
+        lora_rank=32,
+        lora_alpha=64,
+        check_lora_weight_equal=True,
+        num_rollout=2,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        global_batch_size=64,
+        rollout_max_response_len=1024,
         hf_checkpoint=str(hf_checkpoint),
         ref_load=str(ref_load),
         megatron_model_type="kimi-k3",

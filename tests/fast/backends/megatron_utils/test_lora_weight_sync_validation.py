@@ -28,6 +28,7 @@ from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.
 from miles.backends.megatron_utils.update_weight.update_weight_from_tensor import (
     UpdateWeightFromTensor,
     _LoraVersionChangeValidator,
+    _refresh_flattened_lora_ipc_payload,
     _send_to_colocated_engine,
     _should_skip_lora_base_sync,
     _validate_zero_lora_delta,
@@ -54,6 +55,58 @@ SAMPLE_BASE_ONLY_WEIGHTS = [
     ("model.layers.0.self_attn.q_proj.weight", torch.randn(4, 4)),
     ("model.layers.0.mlp.gate_proj.weight", torch.randn(8, 4)),
 ]
+
+
+class TestColocatedK3FlattenedLoraIpcLifecycle:
+    def test_refresh_preserves_exporter_storage_and_updates_values(self):
+        first = [("layer.lora_A.weight", torch.arange(6, dtype=torch.float32).reshape(2, 3))]
+        payload = _refresh_flattened_lora_ipc_payload(first, None)
+        storage_ptr = payload["flattened_tensor"].untyped_storage().data_ptr()
+
+        second = [("layer.lora_A.weight", first[0][1] + 10)]
+        refreshed = _refresh_flattened_lora_ipc_payload(second, payload)
+
+        assert refreshed is payload
+        assert refreshed["flattened_tensor"].untyped_storage().data_ptr() == storage_ptr
+        torch.testing.assert_close(refreshed["flattened_tensor"], second[0][1].reshape(-1))
+
+    def test_refresh_rejects_tensor_inventory_change(self):
+        first = [("layer.lora_A.weight", torch.empty(2, 3))]
+        payload = _refresh_flattened_lora_ipc_payload(first, None)
+
+        with pytest.raises(RuntimeError, match="metadata changed"):
+            _refresh_flattened_lora_ipc_payload(
+                [("other.lora_A.weight", torch.empty(2, 3))],
+                payload,
+            )
+
+    def test_reuse_waits_for_receiver_unload_and_group_sync(self):
+        events = []
+        unload = MagicMock()
+        unload.remote.side_effect = lambda **_kwargs: events.append("unload_submit") or "unload_ref"
+        updater = SimpleNamespace(
+            _ipc_gather_group="ipc_group",
+            _ipc_gather_src=3,
+            _ipc_engine=SimpleNamespace(unload_lora_adapter=unload),
+            _lora_ipc_live_tensors=[{"flattened_tensor": torch.empty(6), "metadata": []}],
+            _lora_loaded=True,
+        )
+
+        with (
+            patch(f"{_UW_MODULE}.dist") as dist_mock,
+            patch(f"{_UW_MODULE}.ray") as ray_mock,
+            patch(f"{_UW_MODULE}.torch.cuda.synchronize") as synchronize_mock,
+        ):
+            dist_mock.get_rank.return_value = 3
+            ray_mock.get.side_effect = lambda ref: events.append("unload_ack") if ref == "unload_ref" else None
+            dist_mock.broadcast_object_list.side_effect = lambda *_args, **_kwargs: events.append("broadcast")
+            dist_mock.barrier.side_effect = lambda **_kwargs: events.append("barrier")
+            synchronize_mock.side_effect = lambda: events.append("cuda_sync")
+
+            UpdateWeightFromTensor._prepare_lora_ipc_payload_for_reuse(updater)
+
+        assert events == ["unload_submit", "unload_ack", "broadcast", "barrier", "cuda_sync"]
+        assert updater._lora_loaded is False
 
 
 @dataclass

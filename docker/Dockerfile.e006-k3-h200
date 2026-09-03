@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1.7
+
+# The base is an immutable linux/amd64 Miles image built on public SGLang
+# v0.5.18.  That is the first available image in this lineage with the
+# coherent torch 2.13.0 / sglang-kernel 0.4.6.post1 ABI pair.
+FROM --platform=linux/amd64 radixark/miles@sha256:4ee6da9f16e06f8ad24991b18a950482572c458a357aae0bfc396feaf3fe0a6d AS coherent_base
+
+# The July K3 image is used only as an immutable source donor for the
+# historical Megatron fork commit, which is no longer reachable from the
+# current miles-main ref.  No Python or CUDA package is copied from it.
+FROM --platform=linux/amd64 radixark/miles:kimi-k3@sha256:94f133ea5a18283c28fd699657393d57628c1ccd779f3e7bf8a6d3bb80ddcb6c AS legacy_k3_source
+
+FROM coherent_base AS e006_runtime
+
+ARG E006_MILES_CODE_COMMIT=6ddf9f7165044278f65cab2b7ad29e0a94cceb82
+ARG E006_SGLANG_BASE_COMMIT=2380121e9b16fd3ce778bcc2b4717414b9c4d8a5
+ARG E006_SGLANG_EFFECTIVE_COMMIT=f22c2d11a584d84f2aa20fbbf21c92c533de4641
+ARG E006_MEGATRON_COMMIT=ebe3b9d7f6cd54933f3ca7657c00903b9e81c24c
+ARG E006_TMS_COMMIT=d64a639
+
+USER root
+WORKDIR /root
+
+# Restore exactly the Megatron source proven by the July K3 runtime.  The
+# commit assertion is deliberately before replacement of the newer base tree.
+COPY --from=legacy_k3_source /root/Megatron-LM /tmp/e006-megatron
+RUN set -eux; \
+    test "$(git -C /tmp/e006-megatron rev-parse HEAD)" = "${E006_MEGATRON_COMMIT}"; \
+    rm -rf /root/Megatron-LM; \
+    mv /tmp/e006-megatron /root/Megatron-LM; \
+    python3 -m pip install --no-deps -e /root/Megatron-LM
+
+# Pin public SGLang to the reviewed K3 base, then apply only the minimal
+# HybridAttnBackend correction represented by the immutable e006 commit.
+COPY docker/e006/sglang-f22c2d1.patch /tmp/sglang-f22c2d1.patch
+RUN set -eux; \
+    git -C /sgl-workspace/sglang fetch --depth=1 origin "${E006_SGLANG_BASE_COMMIT}"; \
+    git -C /sgl-workspace/sglang checkout --detach --force "${E006_SGLANG_BASE_COMMIT}"; \
+    git -C /sgl-workspace/sglang apply --check /tmp/sglang-f22c2d1.patch; \
+    git -C /sgl-workspace/sglang apply /tmp/sglang-f22c2d1.patch; \
+    test "$(sha256sum /sgl-workspace/sglang/python/sglang/srt/layers/attention/hybrid_attn_backend.py | awk '{print $1}')" = a3ab996d67d98cddd4ea3ebe05078f654b4d33eafd7c7bfa97f5714e319b4318; \
+    test "$(sha256sum /sgl-workspace/sglang/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py | awk '{print $1}')" = 152df3e936812adf79bfc8b8b744f8856d5b85cf65a3f365cc799afa88e4f914; \
+    python3 -m pip install --no-deps -e '/sgl-workspace/sglang/python[all]'; \
+    pytest -q /sgl-workspace/sglang/test/registered/unit/model_executor/model_runner_components/test_attention_backend_setup.py \
+      -k 'forward_routes_linear_attention_args or forward_still_routes_regular_attention_args'; \
+    rm -f /tmp/sglang-f22c2d1.patch
+
+# Apply the public K3 DeepEP top-k16/hidden-3584/SourceMeta correction and
+# rebuild only Hopper cubins for this H200-only experiment.
+RUN set -eux; \
+    TORCH_CUDA_ARCH_LIST=9.0 bash /sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh; \
+    python3 -m pip install --no-deps --force-reinstall sgl-deep-gemm==0.1.5.post2; \
+    python3 -m pip uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache; \
+    rm -rf /root/.cache/flashinfer; \
+    python3 -m pip install --no-deps flashinfer-python==0.6.17; \
+    python3 -m pip install --no-deps flashinfer-cubin==0.6.17 \
+      --index-url https://flashinfer.ai/whl; \
+    python3 -m pip install --no-deps flashinfer-jit-cache==0.6.17 \
+      --index-url https://flashinfer.ai/whl/cu130
+
+# Replace the moving Miles source carried by the base with the reviewed e006
+# source from this build context.  The runtime-code hashes are from commit
+# 6ddf9f7; this Dockerfile-only build commit does not alter those files.
+COPY . /tmp/e006-miles-source
+RUN set -eux; \
+    test "$(sha256sum /tmp/e006-miles-source/scripts/run_kimi_k3_lora.py | awk '{print $1}')" = 926c594e6acebfaa47029047cef45a1a5477b6920cabd2449971eb8fcedbeb37; \
+    test "$(sha256sum /tmp/e006-miles-source/scripts/models/kimi-k3-lora-full-sglang.yaml | awk '{print $1}')" = 6afe1627ba04f0e9f18e7f3cf374e2e2905b408595fdef253a4d846a1234b7c2; \
+    test "$(sha256sum /tmp/e006-miles-source/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py | awk '{print $1}')" = 651e7d4eec27ba91ada76f144e2a03ccfc7c083e4d2c44852e5682ffc6288633; \
+    test "$(sha256sum /tmp/e006-miles-source/tools/test_kimi_k3_h200_local.py | awk '{print $1}')" = 7068732ea61710c35becf85696ddd812e1cc7e76956505955d787f5f54724360; \
+    rm -rf /root/miles; \
+    mv /tmp/e006-miles-source /root/miles; \
+    python3 -m pip install --no-deps -e /root/miles; \
+    python3 /root/miles/tools/validate_kimi_k3_h200_contract.py \
+      --miles /root/miles --sglang /sgl-workspace/sglang; \
+    python3 /root/miles/tools/test_kimi_k3_h200_local.py
+
+# Keep gradient-fusion support on the proven disabled path and restore the
+# exact TMS source identity without allowing pip to replace torch.
+RUN set -eux; \
+    python3 -m pip install --no-deps --force-reinstall \
+      "git+https://github.com/fzyzcjy/torch_memory_saver.git@${E006_TMS_COMMIT}"; \
+    python3 - <<'PY'
+import importlib.metadata as md
+import torch
+
+assert torch.__version__.split('+', 1)[0] == '2.13.0', torch.__version__
+assert md.version('sglang-kernel') == '0.4.6.post1'
+assert md.version('torch-memory-saver') == '0.0.9.post1'
+assert md.version('sgl-deep-gemm') == '0.1.5.post2'
+for name in ('flashinfer-python', 'flashinfer-cubin', 'flashinfer-jit-cache'):
+    assert md.version(name).split('+', 1)[0] == '0.6.17', (name, md.version(name))
+print('E006_RUNTIME_PACKAGE_COHERENCE_OK')
+PY
+
+ENV E006_MILES_CODE_COMMIT=6ddf9f7165044278f65cab2b7ad29e0a94cceb82 \
+    E006_SGLANG_BASE_COMMIT=2380121e9b16fd3ce778bcc2b4717414b9c4d8a5 \
+    E006_SGLANG_EFFECTIVE_COMMIT=f22c2d11a584d84f2aa20fbbf21c92c533de4641 \
+    E006_MEGATRON_COMMIT=ebe3b9d7f6cd54933f3ca7657c00903b9e81c24c \
+    E006_TMS_COMMIT=d64a639 \
+    E006_GRADIENT_ACCUMULATION_FUSION=disabled
+
+LABEL org.opencontainers.image.source="https://github.com/radixark/miles" \
+      org.opencontainers.image.revision="6ddf9f7165044278f65cab2b7ad29e0a94cceb82" \
+      org.opencontainers.image.title="e006 Kimi-K3 H200 coherent runtime" \
+      ai.miles.e006.sglang="f22c2d11a584d84f2aa20fbbf21c92c533de4641" \
+      ai.miles.e006.megatron="ebe3b9d7f6cd54933f3ca7657c00903b9e81c24c" \
+      ai.miles.e006.torch="2.13.0" \
+      ai.miles.e006.sglang-kernel="0.4.6.post1" \
+      ai.miles.e006.flashinfer="0.6.17"
+
+WORKDIR /root/miles
+CMD ["/bin/bash"]

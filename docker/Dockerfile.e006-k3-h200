@@ -5,29 +5,31 @@
 # coherent torch 2.13.0 / sglang-kernel 0.4.6.post1 ABI pair.
 FROM --platform=linux/amd64 radixark/miles@sha256:4ee6da9f16e06f8ad24991b18a950482572c458a357aae0bfc396feaf3fe0a6d AS coherent_base
 
-# The July K3 image is used only as an immutable source donor for the
-# historical Megatron fork commit, which is no longer reachable from the
-# current miles-main ref.  No Python or CUDA package is copied from it.
-FROM --platform=linux/amd64 radixark/miles:kimi-k3@sha256:94f133ea5a18283c28fd699657393d57628c1ccd779f3e7bf8a6d3bb80ddcb6c AS legacy_k3_source
-
 FROM coherent_base AS e006_runtime
 
 ARG E006_MILES_CODE_COMMIT=6ddf9f7165044278f65cab2b7ad29e0a94cceb82
 ARG E006_SGLANG_BASE_COMMIT=2380121e9b16fd3ce778bcc2b4717414b9c4d8a5
 ARG E006_SGLANG_EFFECTIVE_COMMIT=f22c2d11a584d84f2aa20fbbf21c92c533de4641
 ARG E006_MEGATRON_COMMIT=ebe3b9d7f6cd54933f3ca7657c00903b9e81c24c
+ARG E006_MEGATRON_BUNDLE_URL=https://github.com/zhoutong-hai/miles/releases/download/e006-megatron-ebe3b9d7-source-v1/megatron-ebe3b9d7.bundle
+ARG E006_MEGATRON_BUNDLE_SHA256=fcdba06477debdddd8b3d09253cd63ea65210b9b9480d05c2369a5faf7c5664f
 ARG E006_TMS_COMMIT=d64a639
 
 USER root
 WORKDIR /root
 
 # Restore exactly the Megatron source proven by the July K3 runtime.  The
-# commit assertion is deliberately before replacement of the newer base tree.
-COPY --from=legacy_k3_source /root/Megatron-LM /tmp/e006-megatron
+# source-only Git bundle was extracted from immutable linux/amd64 image
+# manifest sha256:94f133ea5a18283c28fd699657393d57628c1ccd779f3e7bf8a6d3bb80ddcb6c;
+# its content digest removes the giant legacy image from this build graph.
 RUN set -eux; \
+    curl --fail --location --retry 3 --output /tmp/e006-megatron.bundle "${E006_MEGATRON_BUNDLE_URL}"; \
+    test "$(sha256sum /tmp/e006-megatron.bundle | awk '{print $1}')" = "${E006_MEGATRON_BUNDLE_SHA256}"; \
+    git clone /tmp/e006-megatron.bundle /tmp/e006-megatron; \
     test "$(git -C /tmp/e006-megatron rev-parse HEAD)" = "${E006_MEGATRON_COMMIT}"; \
     rm -rf /root/Megatron-LM; \
     mv /tmp/e006-megatron /root/Megatron-LM; \
+    rm -f /tmp/e006-megatron.bundle; \
     python3 -m pip install --no-deps -e /root/Megatron-LM
 
 # Pin public SGLang to the reviewed K3 base, then apply only the minimal

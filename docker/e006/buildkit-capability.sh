@@ -20,6 +20,11 @@ test "$(sha256sum "${archive}" | awk '{print $1}')" = "${buildkit_sha256}"
 if [ ! -x "${bin_dir}/buildkitd" ]; then
   tar -xzf "${archive}" -C "${build_root}/dist"
 fi
+if [ ! -e "${bin_dir}/runc" ]; then
+  ln -s buildkit-runc "${bin_dir}/runc"
+fi
+test -x "${bin_dir}/runc"
+export PATH="${bin_dir}:${PATH}"
 
 rm -f "${socket}" "${output}"
 "${bin_dir}/buildkitd" \
@@ -48,7 +53,10 @@ for _ in $(seq 1 60); do
 done
 test -S "${socket}"
 
-"${bin_dir}/buildctl" --addr "unix://${socket}" debug workers
+if ! "${bin_dir}/buildctl" --addr "unix://${socket}" debug workers; then
+  sed -n '1,240p' "${log}" >&2
+  exit 1
+fi
 "${bin_dir}/buildctl" --addr "unix://${socket}" build \
   --frontend dockerfile.v0 \
   --local context=docker/e006/buildkit-smoke \

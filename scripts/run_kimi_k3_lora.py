@@ -357,7 +357,9 @@ def _execute_train(args: ScriptArgs) -> None:
     if args.model_variant == "full":
         sglang_args += (
             "--sglang-moe-runner-backend marlin "
-            "--sglang-decode-attention-backend trtllm_mla "
+            # The H200 rollout topology is Hopper (SM90a); TRTLLM MLA is
+            # Blackwell-only in the pinned SGLang runtime.
+            "--sglang-decode-attention-backend flashmla "
             "--sglang-mamba-radix-cache-strategy extra_buffer "
             f"--sglang-cuda-graph-bs-decode {graph_bs} "
             "--sglang-cuda-graph-backend-prefill disabled "

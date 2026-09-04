@@ -57,3 +57,16 @@ def test_four_layer_variant_is_unaffected():
     args = run_kimi_k3_lora.ScriptArgs(model_variant="4layer", num_nodes=1, num_gpus_per_node=8)
     assert args.tensor_parallel_size == 8
     assert args.expert_parallel_size == 8
+
+
+def test_e006_full_model_uses_hopper_decode_backend(monkeypatch):
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(run_kimi_k3_lora.U, "execute_train", capture)
+    run_kimi_k3_lora._execute_train(_full())
+    train_args = captured["train_args"]
+    assert "--sglang-decode-attention-backend flashmla" in train_args
+    assert "--sglang-decode-attention-backend trtllm_mla" not in train_args

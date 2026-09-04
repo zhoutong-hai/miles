@@ -1,5 +1,6 @@
 import math
 from argparse import Namespace
+from unittest.mock import AsyncMock
 
 import pytest
 from tests.ci.ci_register import register_cpu_ci
@@ -10,6 +11,7 @@ from miles.rollout.on_policy_distillation import (
     _score_payload,
     _teacher_url_for_sample,
     parse_teacher_urls,
+    reward_func,
 )
 from miles.utils.types import Sample
 
@@ -129,6 +131,30 @@ def test_score_payload_routes_per_position_vs_flat():
     per_pos = _score_payload([1, 2, 3], token_ids_positions=[[], [5, 7], [9, 11]])
     assert per_pos["token_ids_logprob_positions"] == [[], [5, 7], [9, 11]]
     assert "token_ids_logprob" not in per_pos
+
+
+def test_score_payload_uses_requested_temperature():
+    payload = _score_payload([1, 2, 3], temperature=1.0)
+
+    assert payload["sampling_params"]["temperature"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_sampled_token_teacher_scoring_uses_rollout_temperature(monkeypatch):
+    post_json = AsyncMock(return_value={"meta_info": {"input_token_logprobs": []}})
+    monkeypatch.setattr("miles.rollout.on_policy_distillation._post_json", post_json)
+    args = Namespace(
+        opd_log_prob_top_k=0,
+        opd_teacher_urls=None,
+        rm_url="http://teacher/generate",
+        rollout_temperature=1.0,
+        sglang_router_request_timeout_secs=300,
+    )
+
+    await reward_func(args, _tagged_sample())
+
+    payload = post_json.await_args.args[1]
+    assert payload["sampling_params"]["temperature"] == 1.0
 
 
 # ---------------------------------------------------------------------------

@@ -1636,6 +1636,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
             )
             parser.add_argument(
+                "--opd-advantage-clip",
+                type=float,
+                default=0.0,
+                help=(
+                    "Symmetric bound for the detached per-token OPD advantage. "
+                    "Set to 0 to disable clipping."
+                ),
+            )
+            parser.add_argument(
                 "--opd-log-prob-top-k",
                 type=int,
                 default=0,
@@ -2986,6 +2995,8 @@ def miles_validate_args(args):
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+        if args.opd_advantage_clip < 0:
+            raise ValueError("--opd-advantage-clip must be non-negative.")
         if args.opd_log_prob_top_k < 0:
             raise ValueError("--opd-log-prob-top-k must be non-negative.")
         if args.opd_log_prob_top_k > 0 and args.opd_type != "sglang":

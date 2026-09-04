@@ -5,6 +5,17 @@ import torch
 from miles.utils.types import RolloutBatch
 
 
+def _opd_advantage(args: Namespace, reverse_kl: torch.Tensor) -> torch.Tensor:
+    """Return the detached, optionally clipped OPD contribution."""
+    advantage = -args.opd_kl_coef * reverse_kl
+    clip = float(getattr(args, "opd_advantage_clip", 0.0))
+    if clip < 0:
+        raise ValueError("opd_advantage_clip must be non-negative")
+    if clip > 0:
+        advantage = advantage.clamp(min=-clip, max=clip)
+    return advantage
+
+
 def apply_opd_kl_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
@@ -39,6 +50,7 @@ def apply_opd_kl_to_advantages(
             )
 
         reverse_kls = []
+        opd_advantages = []
         for i, adv in enumerate(advantages):
             reverse_kl = precomputed_reverse_kls[i]
             if not torch.is_tensor(reverse_kl):
@@ -51,10 +63,13 @@ def apply_opd_kl_to_advantages(
                     f"OPD shape mismatch at sample {i}: advantages={tuple(adv.shape)}, "
                     f"opd_reverse_kl={tuple(reverse_kl.shape)}."
                 )
-            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            opd_advantage = _opd_advantage(args, reverse_kl)
+            advantages[i] = adv + opd_advantage
             reverse_kls.append(reverse_kl)
+            opd_advantages.append(opd_advantage)
 
         rollout_data["opd_reverse_kl"] = reverse_kls
+        rollout_data["opd_advantages"] = opd_advantages
         return
 
     teacher_log_probs = rollout_data.get("teacher_log_probs")
@@ -73,6 +88,7 @@ def apply_opd_kl_to_advantages(
     teacher_log_probs = [t.to(device=device) for t in detached_teacher_log_probs]
 
     reverse_kls = []
+    opd_advantages = []
     for i, adv in enumerate(advantages):
         if student_log_probs[i].shape != teacher_log_probs[i].shape:
             raise ValueError(
@@ -87,8 +103,11 @@ def apply_opd_kl_to_advantages(
             )
         old_student_log_prob = student_log_probs[i].detach()
         reverse_kl = old_student_log_prob - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
+        opd_advantage = _opd_advantage(args, reverse_kl)
+        advantages[i] = adv + opd_advantage
         reverse_kls.append(reverse_kl)
+        opd_advantages.append(opd_advantage)
 
     # Store reverse KL for logging.
     rollout_data["opd_reverse_kl"] = reverse_kls
+    rollout_data["opd_advantages"] = opd_advantages

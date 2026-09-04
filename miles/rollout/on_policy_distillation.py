@@ -97,11 +97,12 @@ def _score_payload(
     top_k: int = 0,
     token_ids: list[int] | None = None,
     token_ids_positions: list[list[int]] | None = None,
+    temperature: float = 0.0,
 ) -> dict[str, Any]:
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 0,
+            "temperature": temperature,
             "max_new_tokens": 0,
             "skip_special_tokens": False,
         },
@@ -358,7 +359,11 @@ async def reward_func(args: Namespace, sample: Sample, **kwargs: Any) -> dict[st
     # --rm-url when --opd-teacher-urls is unset).
     teacher_url = _teacher_url_for_sample(args, sample)
     if top_k == 0:
-        return await _post_json(teacher_url, _score_payload(sample.tokens), timeout_secs=request_timeout)
+        return await _post_json(
+            teacher_url,
+            _score_payload(sample.tokens, temperature=args.rollout_temperature),
+            timeout_secs=request_timeout,
+        )
 
     strategy = _get_top_k_strategy(args)
     # Per-position scoring requires a patched teacher/student server that understands
@@ -376,12 +381,24 @@ async def reward_func(args: Namespace, sample: Sample, **kwargs: Any) -> dict[st
 
     if student_top is not None and per_position:
         teacher_payload = _score_payload(
-            sample.tokens, top_k=teacher_top_k, token_ids_positions=_per_position_ids(student_top, prompt_len)
+            sample.tokens,
+            top_k=teacher_top_k,
+            token_ids_positions=_per_position_ids(student_top, prompt_len),
+            temperature=args.rollout_temperature,
         )
     elif teacher_token_ids is not None:
-        teacher_payload = _score_payload(sample.tokens, top_k=teacher_top_k, token_ids=teacher_token_ids)
+        teacher_payload = _score_payload(
+            sample.tokens,
+            top_k=teacher_top_k,
+            token_ids=teacher_token_ids,
+            temperature=args.rollout_temperature,
+        )
     else:
-        teacher_payload = _score_payload(sample.tokens, top_k=teacher_top_k)
+        teacher_payload = _score_payload(
+            sample.tokens,
+            top_k=teacher_top_k,
+            temperature=args.rollout_temperature,
+        )
     teacher_response = await _post_json(teacher_url, teacher_payload, timeout_secs=request_timeout)
 
     reward_payload = {"teacher": teacher_response}
@@ -389,10 +406,16 @@ async def reward_func(args: Namespace, sample: Sample, **kwargs: Any) -> dict[st
         teacher_top = _trim_input_field(teacher_response["meta_info"], "input_top_logprobs", sample.response_length)
         if per_position:
             student_payload = _score_payload(
-                sample.tokens, token_ids_positions=_per_position_ids(teacher_top, prompt_len)
+                sample.tokens,
+                token_ids_positions=_per_position_ids(teacher_top, prompt_len),
+                temperature=args.rollout_temperature,
             )
         else:
-            student_payload = _score_payload(sample.tokens, token_ids=_unique_ids(teacher_top))
+            student_payload = _score_payload(
+                sample.tokens,
+                token_ids=_unique_ids(teacher_top),
+                temperature=args.rollout_temperature,
+            )
         reward_payload["student_on_teacher"] = await _post_json(
             _student_score_url(args), student_payload, timeout_secs=request_timeout
         )

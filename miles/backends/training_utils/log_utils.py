@@ -228,6 +228,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                         "values",
                         "teacher_log_probs",
                         "opd_reverse_kl",
+                        "opd_advantages",
                         "entropy",
                     ]:
                         sum_of_sample_mean = get_sum_of_sample_mean(

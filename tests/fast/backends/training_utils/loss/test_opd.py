@@ -19,8 +19,13 @@ from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantage
 # (an explicit default-form call would be rejected by the AC-9 meta-test).
 
 
-def _args(opd_kl_coef: float = 1.0) -> Namespace:
-    return Namespace(use_opd=True, opd_type="sglang", opd_kl_coef=opd_kl_coef)
+def _args(opd_kl_coef: float = 1.0, opd_advantage_clip: float = 0.0) -> Namespace:
+    return Namespace(
+        use_opd=True,
+        opd_type="sglang",
+        opd_kl_coef=opd_kl_coef,
+        opd_advantage_clip=opd_advantage_clip,
+    )
 
 
 def test_subtracts_weighted_reverse_kl_and_stores_metric():
@@ -61,6 +66,26 @@ def test_precomputed_reverse_kl_is_detached_before_weighting_advantages():
     (advantages[0] * current_student_log_probs).sum().backward()
     torch.testing.assert_close(current_student_log_probs.grad, advantages[0])
     assert precomputed.grad is None
+
+
+def test_opd_advantage_is_clipped_symmetrically_and_logged():
+    args = _args(opd_advantage_clip=5.0)
+    advantages = [torch.zeros(4)]
+    rollout_data = {"opd_reverse_kl": [torch.tensor([-8.0, -2.0, 2.0, 8.0])]}
+
+    apply_opd_kl_to_advantages(args, rollout_data, advantages, student_log_probs=[torch.zeros(4)])
+
+    expected = torch.tensor([5.0, 2.0, -2.0, -5.0])
+    torch.testing.assert_close(advantages[0], expected)
+    torch.testing.assert_close(rollout_data["opd_advantages"][0], expected)
+
+
+def test_negative_opd_advantage_clip_is_rejected():
+    args = _args(opd_advantage_clip=-1.0)
+    rollout_data = {"opd_reverse_kl": [torch.tensor([1.0])]}
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        apply_opd_kl_to_advantages(args, rollout_data, [torch.zeros(1)], student_log_probs=[torch.zeros(1)])
 
 
 def test_fixed_opd_inputs_are_detached_in_persistent_rollout_data(monkeypatch):

@@ -13,6 +13,11 @@ _FOUR_LAYER_HF = "/root/models/Kimi-K3-4layer-bf16"
 _FOUR_LAYER_DCP = "/root/models/Kimi-K3-4layer-torch-dist"
 _FULL_HF = "/root/models/Kimi-K3/native"
 _FULL_DCP = "/root/models/Kimi-K3/torch_dist"
+_K3_NUM_ATTENTION_HEADS = 96
+_K3_NUM_ROUTED_EXPERTS = 896
+_E006_FULL_NODES = 16
+_E006_GPUS_PER_NODE = 8
+_E006_WORLD_SIZE = _E006_FULL_NODES * _E006_GPUS_PER_NODE
 
 _LAYERS = "decoder.layers.*"
 _DEFAULT_TARGET_MODULES = ",".join(
@@ -89,15 +94,38 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 raise NotImplementedError("Pipeline parallelism is only wired for the full model variant")
             return
 
-        if 64 % self.rollout_tp_size != 0 or 96 % self.rollout_tp_size != 0:
-            raise ValueError(f"rollout_tp_size must divide 64 GPUs and 96 attention heads, got {self.rollout_tp_size}")
-        if self.rollout_tp_size % self.rollout_ep_size != 0 or 896 % self.rollout_ep_size != 0:
+        world_size = self.num_nodes * self.num_gpus_per_node
+        if self.num_nodes != _E006_FULL_NODES or self.num_gpus_per_node != _E006_GPUS_PER_NODE:
+            raise NotImplementedError(
+                f"The e006 full-model Kimi K3 LoRA qualification requires "
+                f"{_E006_FULL_NODES} nodes x {_E006_GPUS_PER_NODE} GPUs"
+            )
+        if world_size != _E006_WORLD_SIZE:
+            raise ValueError(f"The e006 actor world must contain exactly {_E006_WORLD_SIZE} ranks")
+        if self.pipeline_parallel_size != 1 or self.context_parallel_size != 1:
+            raise ValueError("The e006 128-rank trainer requires PP1 and CP1")
+        if self.tp_size_override not in (None, 32) or self.ep_size_override not in (None, 128):
+            raise ValueError("The e006 128-rank trainer requires TP32 and EP128")
+        if self.rollout_tp_size != 32 or self.rollout_ep_size != 32:
+            raise ValueError("The e006 rollout phase requires TP32/EP32 engines")
+        if world_size % self.rollout_tp_size != 0 or _K3_NUM_ATTENTION_HEADS % self.rollout_tp_size != 0:
             raise ValueError(
-                f"rollout_ep_size must divide rollout_tp_size and 896 experts, got {self.rollout_ep_size}"
+                f"rollout_tp_size must divide {world_size} GPUs and {_K3_NUM_ATTENTION_HEADS} attention heads, "
+                f"got {self.rollout_tp_size}"
+            )
+        if (
+            self.rollout_tp_size % self.rollout_ep_size != 0
+            or _K3_NUM_ROUTED_EXPERTS % self.rollout_ep_size != 0
+        ):
+            raise ValueError(
+                f"rollout_ep_size must divide rollout_tp_size and {_K3_NUM_ROUTED_EXPERTS} experts, "
+                f"got {self.rollout_ep_size}"
             )
         if self.pipeline_parallel_size > 1:
-            if 64 % self.pipeline_parallel_size != 0:
-                raise ValueError(f"pipeline_parallel_size must divide 64 GPUs, got {self.pipeline_parallel_size}")
+            if world_size % self.pipeline_parallel_size != 0:
+                raise ValueError(
+                    f"pipeline_parallel_size must divide {world_size} GPUs, got {self.pipeline_parallel_size}"
+                )
             first, last = self.pipeline_layer_split
             if not 1 <= last <= first:
                 raise ValueError(
@@ -106,22 +134,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 )
 
         model_parallel = self.tensor_parallel_size * self.context_parallel_size * self.pipeline_parallel_size
-        if 64 % model_parallel != 0:
+        if world_size % model_parallel != 0:
             raise ValueError(
                 f"TP{self.tensor_parallel_size}*CP{self.context_parallel_size}*PP{self.pipeline_parallel_size}"
-                f"={model_parallel} must divide the 64 training GPUs"
+                f"={model_parallel} must divide the {world_size} training GPUs"
             )
-        data_parallel = 64 // model_parallel
+        data_parallel = world_size // model_parallel
         non_pp_ranks = self.tensor_parallel_size * self.context_parallel_size * data_parallel
         if non_pp_ranks % self.expert_parallel_size != 0:
             raise ValueError(
                 f"expert_parallel_size={self.expert_parallel_size} must divide the DP*CP*TP ranks "
                 f"of one pipeline stage ({non_pp_ranks})"
             )
-        if self.num_nodes != 16 or self.num_gpus_per_node != 4:
-            raise NotImplementedError(
-                "Full-model Kimi K3 LoRA is only validated on 16 nodes x 4 GPUs (64 training GPUs)"
-            )
+        if data_parallel != 4 or self.expert_parallel_size != 128:
+            raise ValueError("The e006 trainer must resolve to TP32/PP1/CP1/EP128/DP4")
         if self.hf_checkpoint == _FOUR_LAYER_HF:
             self.hf_checkpoint = _FULL_HF
         if self.ref_load == _FOUR_LAYER_DCP:
@@ -147,7 +173,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
             return 8
         # EP is bounded by the DP*CP*TP ranks inside one pipeline stage.
         model_parallel = self.tensor_parallel_size * self.context_parallel_size * self.pipeline_parallel_size
-        data_parallel = 64 // model_parallel
+        world_size = self.num_nodes * self.num_gpus_per_node
+        data_parallel = world_size // model_parallel
         return self.tensor_parallel_size * self.context_parallel_size * data_parallel
 
     @property

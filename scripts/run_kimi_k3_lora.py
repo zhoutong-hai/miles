@@ -346,6 +346,7 @@ def _execute_train(args: ScriptArgs) -> None:
         f"--sglang-max-mamba-cache-size {sglang_mamba_capacity} "
         "--sglang-lora-backend triton "
         "--sglang-lora-strict-loading "
+        "--sglang-lora-no-cpu-backup "
         f"--sglang-max-lora-rank {args.lora_rank} "
         "--use-miles-router "
         # /health is slow under long generations and weight-sync sleeps; 3 failures quarantined live engines

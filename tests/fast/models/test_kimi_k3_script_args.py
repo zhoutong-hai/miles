@@ -70,3 +70,4 @@ def test_e006_full_model_uses_hopper_decode_backend(monkeypatch):
     train_args = captured["train_args"]
     assert "--sglang-decode-attention-backend flashmla" in train_args
     assert "--sglang-decode-attention-backend trtllm_mla" not in train_args
+    assert "--sglang-lora-no-cpu-backup" in train_args

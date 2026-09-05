@@ -30,6 +30,45 @@ from .broadcast import (
 logger = logging.getLogger(__name__)
 
 
+# One stable exporter allocation per process/device/dtype.  The receiver's
+# update RPC is a per-bucket copy-completion acknowledgement, so the same bytes
+# may be refreshed only after send_bucket's ray.get returns.
+_IPC_TRANSFER_BUFFERS: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _copy_into_persistent_transfer_buffer(
+    flattened: torch.Tensor,
+    *,
+    minimum_bytes: int,
+) -> torch.Tensor:
+    """Return a view containing ``flattened`` in stable CUDA-IPC storage."""
+    key = (flattened.device, flattened.dtype)
+    minimum_numel = (
+        minimum_bytes + flattened.element_size() - 1
+    ) // flattened.element_size()
+    required_numel = max(flattened.numel(), minimum_numel)
+    transfer = _IPC_TRANSFER_BUFFERS.get(key)
+    if transfer is None:
+        transfer = torch.empty(
+            required_numel,
+            dtype=flattened.dtype,
+            device=flattened.device,
+        )
+        _IPC_TRANSFER_BUFFERS[key] = transfer
+    if transfer.numel() < flattened.numel():
+        raise RuntimeError(
+            "weight-update bucket exceeds the persistent CUDA-IPC transfer buffer; "
+            f"buffer_numel={transfer.numel()} bucket_numel={flattened.numel()}"
+        )
+    view = transfer[: flattened.numel()]
+    view.copy_(flattened)
+    if view.is_cuda:
+        # The first CUDA-IPC share owns the automatic event.  Reuse therefore
+        # needs an explicit producer-stream completion before serialization.
+        torch.cuda.current_stream(device=view.device).synchronize()
+    return view
+
+
 class UpdateWeightFromTensor(WeightTransferProtocol):
     """
     Colocated transfer: every training rank serializes its bucket to CUDA-IPC
@@ -175,6 +214,7 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             selector=self._selector,
+            persistent_transfer_bytes=getattr(self.args, "update_weight_buffer_size", 0),
         )
         if self.use_distribute and self._is_distributed_src_rank:
             refs_distributed = update_weights_from_distributed(
@@ -186,6 +226,8 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
             )
             if refs_distributed:
                 refs = (refs or []) + refs_distributed
+        # This is the transfer-buffer reuse boundary: every receiver has copied
+        # the bucket into memory it owns before its RPC can acknowledge here.
         check_weight_sync_results(ray.get(refs or []), is_lora=False)
         del long_lived_tensors
 
@@ -197,6 +239,7 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     selector: str = "all",
+    persistent_transfer_bytes: int = 0,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -220,7 +263,10 @@ def _send_to_colocated_engine(
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": _copy_into_persistent_transfer_buffer(
+                flattened_tensor_bucket.get_flattened_tensor(),
+                minimum_bytes=persistent_transfer_bytes,
+            ),
             "metadata": flattened_tensor_bucket.get_metadata(),
         }
         long_live_tensors.append(flattened_tensor_data)

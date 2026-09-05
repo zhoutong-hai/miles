@@ -17,6 +17,10 @@ import pytest
 import torch
 
 from miles.backends.training_utils.weight_update.session import check_weight_sync_results
+from miles.backends.training_utils.weight_update.protocols.cuda_ipc import (
+    _IPC_TRANSFER_BUFFERS,
+    _copy_into_persistent_transfer_buffer,
+)
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.utils.lora import is_lora_weight_name
 
@@ -247,3 +251,28 @@ class TestFlattenedTensorBucketRoundTrip:
         for (orig_name, orig_t), (rec_name, rec_t) in zip(lora_only, reconstructed, strict=True):
             assert orig_name == rec_name
             assert torch.equal(orig_t, rec_t)
+
+
+class TestPersistentIpcTransferBuffer:
+    def setup_method(self):
+        _IPC_TRANSFER_BUFFERS.clear()
+
+    def test_reuses_storage_after_ack_boundary(self):
+        first = _copy_into_persistent_transfer_buffer(
+            torch.arange(6, dtype=torch.float32), minimum_bytes=64
+        )
+        ptr = first.untyped_storage().data_ptr()
+        second = _copy_into_persistent_transfer_buffer(
+            torch.full((4,), 7.0, dtype=torch.float32), minimum_bytes=64
+        )
+        assert second.untyped_storage().data_ptr() == ptr
+        torch.testing.assert_close(second, torch.full((4,), 7.0))
+
+    def test_refuses_to_rotate_exported_storage(self):
+        _copy_into_persistent_transfer_buffer(
+            torch.zeros(4, dtype=torch.float32), minimum_bytes=16
+        )
+        with pytest.raises(RuntimeError, match="exceeds the persistent"):
+            _copy_into_persistent_transfer_buffer(
+                torch.zeros(5, dtype=torch.float32), minimum_bytes=16
+            )

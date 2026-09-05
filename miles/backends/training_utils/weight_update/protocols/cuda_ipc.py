@@ -43,9 +43,7 @@ def _copy_into_persistent_transfer_buffer(
 ) -> torch.Tensor:
     """Return a view containing ``flattened`` in stable CUDA-IPC storage."""
     key = (flattened.device, flattened.dtype)
-    minimum_numel = (
-        minimum_bytes + flattened.element_size() - 1
-    ) // flattened.element_size()
+    minimum_numel = (minimum_bytes + flattened.element_size() - 1) // flattened.element_size()
     required_numel = max(flattened.numel(), minimum_numel)
     transfer = _IPC_TRANSFER_BUFFERS.get(key)
     if transfer is None:

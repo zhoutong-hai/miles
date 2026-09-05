@@ -16,7 +16,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from miles.backends.training_utils.weight_update.session import check_weight_sync_results
+from miles.backends.training_utils.weight_update.session import (
+    check_weight_sync_results,
+    end_weight_update,
+)
 from miles.backends.training_utils.weight_update.protocols.cuda_ipc import (
     _IPC_TRANSFER_BUFFERS,
     _copy_into_persistent_transfer_buffer,
@@ -100,6 +103,50 @@ class TestCheckWeightSyncResults:
         ]
         with pytest.raises(RuntimeError, match="oops"):
             check_weight_sync_results(results, is_lora=True)
+
+
+class TestEndWeightUpdateChecksumAcks:
+    def test_rank_addressed_checksum_acks_pass(self, capsys):
+        engine = MagicMock()
+        results = [
+            {
+                "success": True,
+                "message": " | ".join(
+                    f"[LORA-CHECK] rank={rank} PASS adapters=1 tensors=4"
+                    for rank in range(2)
+                ),
+            }
+        ]
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=results,
+        ):
+            end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
+        assert "[E006-LORA-END-ACK]" in capsys.readouterr().out
+
+    def test_missing_rank_addressed_ack_fails(self):
+        engine = MagicMock()
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=[{"success": True, "message": "Success"}],
+        ):
+            with pytest.raises(RuntimeError, match="omitted rank-addressed"):
+                end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
+
+    def test_duplicate_rank_ack_fails(self):
+        engine = MagicMock()
+        message = " | ".join(
+            [
+                "[LORA-CHECK] rank=0 PASS adapters=1 tensors=4",
+                "[LORA-CHECK] rank=0 PASS adapters=1 tensors=4",
+            ]
+        )
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=[{"success": True, "message": message}],
+        ):
+            with pytest.raises(RuntimeError, match="duplicate or malformed"):
+                end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
 
 
 class TestUpdateWeightsEmptyBaseIteration:

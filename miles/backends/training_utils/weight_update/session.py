@@ -46,9 +46,32 @@ def end_weight_update(
             for engine in rollout_engines
         ]
     )
-    for result in results:
+    checksum_ack_engines = 0
+    for engine_index, result in enumerate(results):
         if isinstance(result, Mapping) and result.get("success") is False:
             raise RuntimeError(f"end_weight_update failed on a rollout engine: {result.get('message')}")
+        if expected_lora_checksums is not None and isinstance(result, Mapping):
+            message = result.get("message", "")
+            rank_tokens = {
+                int(token.split("=", 1)[1])
+                for token in message.split()
+                if token.startswith("rank=") and token.split("=", 1)[1].isdigit()
+            }
+            if not rank_tokens or "[LORA-CHECK]" not in message or "PASS" not in message:
+                raise RuntimeError(
+                    f"end_weight_update engine {engine_index} omitted rank-addressed LoRA checksum ACKs"
+                )
+            if message.count("[LORA-CHECK]") != len(rank_tokens):
+                raise RuntimeError(
+                    f"end_weight_update engine {engine_index} returned duplicate or malformed rank ACKs"
+                )
+            checksum_ack_engines += 1
+            print(
+                f"[E006-LORA-END-ACK] engine={engine_index} ranks={sorted(rank_tokens)} {message}",
+                flush=True,
+            )
+    if expected_lora_checksums is not None and checksum_ack_engines == 0:
+        raise RuntimeError("end_weight_update received no rank-addressed LoRA checksum ACKs")
 
 
 def register_lora_adapter(

@@ -32,6 +32,94 @@ def record_lora_checksums(bucket, checksums) -> None:
         checksums[lora_name][hf_key] = digest
 
 
+def build_lora_sender_manifest_payload(
+    rank: int, is_sender: bool, checksums
+) -> dict:
+    """Build one bounded, rank-addressed sender-manifest record."""
+    manifest = checksums if is_sender else None
+    encoded = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        if manifest is not None
+        else b""
+    )
+    return {
+        "rank": rank,
+        "is_sender": is_sender,
+        "manifest_sha256": (
+            hashlib.sha256(encoded).hexdigest() if manifest is not None else None
+        ),
+        "tensor_count": (
+            sum(len(tensors) for tensors in manifest.values())
+            if manifest is not None
+            else 0
+        ),
+        "checksums": manifest,
+    }
+
+
+def validate_lora_sender_manifest_payloads(payloads: list[dict]) -> dict:
+    """Prove every materialized sender produced rank 0's complete adapter."""
+    ranks = [payload.get("rank") for payload in payloads]
+    expected_ranks = list(range(len(payloads)))
+    if sorted(ranks) != expected_ranks:
+        raise RuntimeError(
+            "LoRA sender manifest rank coverage mismatch: "
+            f"expected={expected_ranks} observed={sorted(ranks)}"
+        )
+
+    senders = [payload for payload in payloads if payload.get("is_sender") is True]
+    source = next((payload for payload in senders if payload["rank"] == 0), None)
+    if source is None:
+        raise RuntimeError("global rank 0 is not a materialized LoRA sender")
+    source_checksums = source.get("checksums")
+    if not isinstance(source_checksums, dict) or not source_checksums:
+        raise RuntimeError("global rank 0 produced an empty LoRA checksum manifest")
+
+    mismatches = [
+        payload
+        for payload in senders
+        if payload.get("manifest_sha256") != source.get("manifest_sha256")
+    ]
+    if mismatches:
+        mismatch = min(mismatches, key=lambda payload: payload["rank"])
+        actual_checksums = mismatch.get("checksums") or {}
+        source_flat = {
+            f"{adapter}:{name}": digest
+            for adapter, tensors in source_checksums.items()
+            for name, digest in tensors.items()
+        }
+        actual_flat = {
+            f"{adapter}:{name}": digest
+            for adapter, tensors in actual_checksums.items()
+            for name, digest in tensors.items()
+        }
+        differing_names = sorted(
+            name
+            for name in set(source_flat) | set(actual_flat)
+            if source_flat.get(name) != actual_flat.get(name)
+        )
+        raise RuntimeError(
+            "LoRA sender manifest mismatch before engine finalization: "
+            f"rank={mismatch['rank']} source_sha256={source['manifest_sha256']} "
+            f"actual_sha256={mismatch.get('manifest_sha256')} "
+            f"first_differing_tensor={differing_names[0] if differing_names else None!r}"
+        )
+
+    return {
+        "sender_count": len(senders),
+        "tensor_count": source["tensor_count"],
+        "manifest_sha256": source["manifest_sha256"],
+        "per_rank": [
+            {
+                "rank": payload["rank"],
+                "manifest_sha256": payload["manifest_sha256"],
+                "tensor_count": payload["tensor_count"],
+            }
+            for payload in senders
+        ],
+    }
+
+
 def record_initial_lora_zero_b_evidence(bucket, inventory: dict[str, list]) -> None:
     """Record the exported A names and complete byte-level B evidence."""
     for name, tensor in bucket:

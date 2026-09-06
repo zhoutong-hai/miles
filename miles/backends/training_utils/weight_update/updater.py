@@ -27,9 +27,11 @@ from miles.backends.training_utils.weight_update.session import (
     set_weight_version,
 )
 from miles.backends.training_utils.weight_update.utils import (
+    build_lora_sender_manifest_payload,
     record_initial_lora_zero_b_evidence,
     record_lora_checksums,
     validate_initial_lora_zero_b_evidence,
+    validate_lora_sender_manifest_payloads,
 )
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora import LORA_ADAPTER_NAME
@@ -132,7 +134,7 @@ class WeightUpdater:
         if checksums is not None:
             assert (
                 self._hf_weight_iterator.placement.gather_pp
-            ), "the LoRA checksum manifest is recorded on one rank, which must hold the full adapter"
+            ), "the LoRA checksum manifest requires every sender to hold the full adapter"
         if require_lora_zero_b:
             if checksums is None:
                 raise RuntimeError("the initial LoRA zero-effect gate requires --check-lora-weight-equal")
@@ -150,12 +152,19 @@ class WeightUpdater:
                 materialize=protocol.is_sender,
             ):
                 if protocol.is_sender:
-                    if driver and checksums is not None:
+                    if checksums is not None:
                         record_lora_checksums(bucket, checksums)
                     protocol.send_bucket(bucket)
                     pbar.update(1)
             protocol.after_base_weights()
             dist.barrier(group=get_gloo_group())
+
+        if require_lora_zero_b:
+            self._run_initial_lora_sender_manifest_gate(
+                checksums=checksums,
+                driver=driver,
+                is_sender=bool(protocol.is_sender),
+            )
 
         with timer("finalize_and_resume_engines"):
             protocol.finalize(self.weight_version)
@@ -194,6 +203,19 @@ class WeightUpdater:
 
         gate_result = [None]
         if driver:
+            observed = [
+                {
+                    "rank": item.get("rank"),
+                    "is_sender": item.get("is_sender"),
+                    "manifest_sha256": item.get("manifest_sha256"),
+                    "tensor_count": item.get("tensor_count"),
+                }
+                for item in gathered
+            ]
+            logger.info(
+                "[LORA-SENDER-MANIFEST-OBSERVED] %s",
+                json.dumps(observed, sort_keys=True, separators=(",", ":")),
+            )
             try:
                 if error is not None:
                     raise RuntimeError(error)
@@ -213,6 +235,36 @@ class WeightUpdater:
         if not gate_result[0] or not gate_result[0]["success"]:
             message = gate_result[0]["message"] if gate_result[0] else "missing result"
             raise RuntimeError(f"initial LoRA source zero-B gate failed: {message}")
+
+    def _run_initial_lora_sender_manifest_gate(
+        self, *, checksums, driver: bool, is_sender: bool
+    ) -> None:
+        """Fail before commit unless every sender exported rank 0's adapter."""
+        payload = build_lora_sender_manifest_payload(
+            dist.get_rank(), is_sender, checksums
+        )
+        gathered = [None] * dist.get_world_size() if driver else None
+        dist.gather_object(
+            payload,
+            object_gather_list=gathered,
+            dst=0,
+            group=get_gloo_group(),
+        )
+        gate_result = [None]
+        if driver:
+            try:
+                report = validate_lora_sender_manifest_payloads(gathered)
+                logger.info(
+                    "[LORA-SENDER-MANIFEST] %s",
+                    json.dumps(report, sort_keys=True, separators=(",", ":")),
+                )
+                gate_result[0] = {"success": True, "message": "Success"}
+            except (RuntimeError, TypeError, ValueError) as exc:
+                gate_result[0] = {"success": False, "message": str(exc)}
+        dist.broadcast_object_list(gate_result, src=0, group=get_gloo_group())
+        if not gate_result[0] or not gate_result[0]["success"]:
+            message = gate_result[0]["message"] if gate_result[0] else "missing result"
+            raise RuntimeError(f"initial LoRA sender manifest gate failed: {message}")
 
     def _require_initial_lora_zero_b(self) -> bool:
         """Require the zero-effect proof only for the first LoRA publication."""

@@ -26,8 +26,10 @@ from miles.backends.training_utils.weight_update.session import (
 )
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.backends.training_utils.weight_update.utils import (
+    build_lora_sender_manifest_payload,
     record_initial_lora_zero_b_evidence,
     validate_initial_lora_zero_b_evidence,
+    validate_lora_sender_manifest_payloads,
 )
 from miles.utils.lora import is_lora_weight_name
 
@@ -308,6 +310,34 @@ class TestInitialLoraSourceZeroB:
         updater.is_lora = True
         updater.args.check_initial_lora_zero_effect = False
         assert updater._require_initial_lora_zero_b() is False
+
+
+class TestLoraSenderManifestGate:
+    @staticmethod
+    def _payload(rank, value):
+        return build_lora_sender_manifest_payload(
+            rank,
+            True,
+            {"adapter": {"model.layer.lora_A.weight": value}},
+        )
+
+    def test_identical_sender_manifests_pass(self):
+        report = validate_lora_sender_manifest_payloads(
+            [self._payload(0, "same"), self._payload(1, "same")]
+        )
+
+        assert report["sender_count"] == 2
+        assert report["tensor_count"] == 1
+        assert len(report["manifest_sha256"]) == 64
+
+    def test_sender_manifest_divergence_names_first_rank_and_tensor(self):
+        with pytest.raises(
+            RuntimeError,
+            match=r"rank=1.*first_differing_tensor='adapter:model.layer.lora_A.weight'",
+        ):
+            validate_lora_sender_manifest_payloads(
+                [self._payload(0, "rank-0"), self._payload(1, "rank-1")]
+            )
 
 
 class TestUpdateWeightsEmptyBaseIteration:

@@ -144,7 +144,11 @@ class WeightUpdater:
         with timer("finalize_and_resume_engines"):
             protocol.finalize(self.weight_version)
             if protocol.use_weight_update_session and driver:
-                end_weight_update(protocol.rollout_engines, expected_lora_checksums=checksums)
+                end_weight_update(
+                    protocol.rollout_engines,
+                    expected_lora_checksums=checksums,
+                    expected_tp_ranks=self.args.rollout_num_gpus_per_engine,
+                )
                 set_weight_version(protocol.rollout_engines, self.weight_version)
                 resume_engines(protocol.rollout_engines)
             dist.barrier(group=get_gloo_group())

@@ -16,13 +16,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from miles.backends.training_utils.weight_update.session import (
-    check_weight_sync_results,
-    end_weight_update,
-)
 from miles.backends.training_utils.weight_update.protocols.cuda_ipc import (
     _IPC_TRANSFER_BUFFERS,
     _copy_into_persistent_transfer_buffer,
+)
+from miles.backends.training_utils.weight_update.session import (
+    check_weight_sync_results,
+    end_weight_update,
 )
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
 from miles.utils.lora import is_lora_weight_name
@@ -106,14 +106,14 @@ class TestCheckWeightSyncResults:
 
 
 class TestEndWeightUpdateChecksumAcks:
-    def test_rank_addressed_checksum_acks_pass(self, capsys):
+    def test_exact_32_rank_checksum_acks_pass(self, capsys):
         engine = MagicMock()
         results = [
             {
                 "success": True,
                 "message": " | ".join(
                     f"[LORA-CHECK] rank={rank} PASS adapters=1 tensors=4"
-                    for rank in range(2)
+                    for rank in range(32)
                 ),
             }
         ]
@@ -121,7 +121,11 @@ class TestEndWeightUpdateChecksumAcks:
             "miles.backends.training_utils.weight_update.session.ray.get",
             return_value=results,
         ):
-            end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
+            end_weight_update(
+                [engine],
+                expected_lora_checksums={"a": {"x": "y"}},
+                expected_tp_ranks=32,
+            )
         assert "[E006-LORA-END-ACK]" in capsys.readouterr().out
 
     def test_missing_rank_addressed_ack_fails(self):
@@ -130,8 +134,12 @@ class TestEndWeightUpdateChecksumAcks:
             "miles.backends.training_utils.weight_update.session.ray.get",
             return_value=[{"success": True, "message": "Success"}],
         ):
-            with pytest.raises(RuntimeError, match="omitted rank-addressed"):
-                end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
+            with pytest.raises(RuntimeError, match="TP-rank ACK coverage mismatch"):
+                end_weight_update(
+                    [engine],
+                    expected_lora_checksums={"a": {"x": "y"}},
+                    expected_tp_ranks=32,
+                )
 
     def test_duplicate_rank_ack_fails(self):
         engine = MagicMock()
@@ -145,8 +153,37 @@ class TestEndWeightUpdateChecksumAcks:
             "miles.backends.training_utils.weight_update.session.ray.get",
             return_value=[{"success": True, "message": message}],
         ):
-            with pytest.raises(RuntimeError, match="duplicate or malformed"):
-                end_weight_update([engine], expected_lora_checksums={"a": {"x": "y"}})
+            with pytest.raises(RuntimeError, match="TP-rank ACK coverage mismatch"):
+                end_weight_update(
+                    [engine],
+                    expected_lora_checksums={"a": {"x": "y"}},
+                    expected_tp_ranks=2,
+                )
+
+    def test_failed_rank_ack_fails_even_if_engine_reports_success(self):
+        engine = MagicMock()
+        message = " | ".join(
+            [
+                "[LORA-CHECK] rank=0 PASS adapters=1 tensors=4",
+                "[LORA-CHECK] rank=1 FAIL checksum mismatch",
+            ]
+        )
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=[{"success": True, "message": message}],
+        ):
+            with pytest.raises(RuntimeError, match="failed checksum ACKs"):
+                end_weight_update(
+                    [engine],
+                    expected_lora_checksums={"a": {"x": "y"}},
+                    expected_tp_ranks=2,
+                )
+
+    def test_checksum_validation_requires_expected_tp_size(self):
+        with pytest.raises(ValueError, match="expected_tp_ranks"):
+            end_weight_update(
+                [MagicMock()], expected_lora_checksums={"a": {"x": "y"}}
+            )
 
 
 class TestUpdateWeightsEmptyBaseIteration:

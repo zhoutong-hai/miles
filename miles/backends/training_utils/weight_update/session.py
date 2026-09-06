@@ -11,8 +11,11 @@ from collections.abc import Mapping, Sequence
 import ray
 from ray.actor import ActorHandle
 
-_LORA_CHECKSUM_ACK_PATTERN = re.compile(
-    r"\[LORA-CHECK\]\s+rank=(\d+)\s+(PASS|FAIL)\b"
+_LORA_CHECKSUM_ACK_PATTERN = re.compile(r"\[LORA-CHECK\]\s+rank=(\d+)\s+(PASS|FAIL)\b")
+_LORA_ZERO_B_ACK_PATTERN = re.compile(
+    r"\[LORA-CHECK\]\s+rank=(\d+)\s+PASS\b[^|]*"
+    r"\[LORA-ZERO-B\]\s+buffers=(\d+)\s+elements=(\d+)\s+nonzero=(\d+)\s+"
+    r"schema_sha256=([0-9a-f]{64})\b"
 )
 
 
@@ -45,42 +48,38 @@ def end_weight_update(
     *,
     expected_lora_checksums: Mapping | None = None,
     expected_tp_ranks: int | None = None,
+    require_lora_zero_b: bool = False,
 ) -> None:
     """Close the session: re-finalize base weights (sync_base sessions) and apply
     the streamed LoRA stash (optionally verified against a sha256 manifest)."""
-    if expected_lora_checksums is not None and (
-        type(expected_tp_ranks) is not int or expected_tp_ranks <= 0
-    ):
-        raise ValueError(
-            "expected_tp_ranks must be a positive integer when validating LoRA checksums"
-        )
+    if expected_lora_checksums is not None and (type(expected_tp_ranks) is not int or expected_tp_ranks <= 0):
+        raise ValueError("expected_tp_ranks must be a positive integer when validating LoRA checksums")
+    if require_lora_zero_b and expected_lora_checksums is None:
+        raise ValueError("require_lora_zero_b requires the rank-addressed LoRA checksum manifest")
     if expected_lora_checksums is not None:
         assert expected_tp_ranks is not None
     results = ray.get(
         [
-            engine.end_weight_update.remote(expected_lora_checksums=expected_lora_checksums)
+            engine.end_weight_update.remote(
+                expected_lora_checksums=expected_lora_checksums,
+                require_lora_zero_b=require_lora_zero_b,
+            )
             for engine in rollout_engines
         ]
     )
     if len(results) != len(rollout_engines):
-        raise RuntimeError(
-            "end_weight_update did not return exactly one result per rollout engine"
-        )
+        raise RuntimeError("end_weight_update did not return exactly one result per rollout engine")
     checksum_ack_engines = 0
     for engine_index, result in enumerate(results):
         if isinstance(result, Mapping) and result.get("success") is False:
             raise RuntimeError(f"end_weight_update failed on a rollout engine: {result.get('message')}")
         if expected_lora_checksums is not None:
             if not isinstance(result, Mapping) or result.get("success") is not True:
-                raise RuntimeError(
-                    f"end_weight_update engine {engine_index} omitted a successful checksum result"
-                )
+                raise RuntimeError(f"end_weight_update engine {engine_index} omitted a successful checksum result")
             message = result.get("message", "")
             checksum_acks = _LORA_CHECKSUM_ACK_PATTERN.findall(message)
             if message.count("[LORA-CHECK]") != len(checksum_acks):
-                raise RuntimeError(
-                    f"end_weight_update engine {engine_index} returned malformed rank ACKs"
-                )
+                raise RuntimeError(f"end_weight_update engine {engine_index} returned malformed rank ACKs")
             observed_ranks = [int(rank) for rank, _ in checksum_acks]
             expected_ranks = list(range(expected_tp_ranks))
             if sorted(observed_ranks) != expected_ranks:
@@ -88,25 +87,36 @@ def end_weight_update(
                     f"end_weight_update engine {engine_index} TP-rank ACK coverage mismatch: "
                     f"expected={expected_ranks} observed={sorted(observed_ranks)}"
                 )
-            failed_ranks = [
-                int(rank) for rank, status in checksum_acks if status != "PASS"
-            ]
+            failed_ranks = [int(rank) for rank, status in checksum_acks if status != "PASS"]
             if failed_ranks:
                 raise RuntimeError(
                     f"end_weight_update engine {engine_index} returned failed checksum ACKs "
                     f"from ranks {failed_ranks}"
                 )
+            if require_lora_zero_b:
+                zero_b_acks = _LORA_ZERO_B_ACK_PATTERN.findall(message)
+                zero_b_ranks = sorted(int(rank) for rank, *_ in zero_b_acks)
+                invalid_zero_b_acks = [
+                    (int(rank), int(buffers), int(elements), int(nonzero), schema)
+                    for rank, buffers, elements, nonzero, schema in zero_b_acks
+                    if int(buffers) <= 0 or int(elements) <= 0 or int(nonzero) != 0
+                ]
+                zero_b_schemas = {
+                    (int(buffers), int(elements), schema) for _, buffers, elements, _, schema in zero_b_acks
+                }
+                if zero_b_ranks != expected_ranks or invalid_zero_b_acks or len(zero_b_schemas) != 1:
+                    raise RuntimeError(
+                        f"end_weight_update engine {engine_index} zero-B ACK mismatch: "
+                        f"expected_ranks={expected_ranks} observed_ranks={zero_b_ranks} "
+                        f"invalid={invalid_zero_b_acks} schemas={sorted(zero_b_schemas)}"
+                    )
             checksum_ack_engines += 1
             print(
                 f"[E006-LORA-END-ACK] engine={engine_index} ranks={expected_ranks} {message}",
                 flush=True,
             )
-    if expected_lora_checksums is not None and checksum_ack_engines != len(
-        rollout_engines
-    ):
-        raise RuntimeError(
-            "end_weight_update did not receive complete LoRA checksum ACKs from every engine"
-        )
+    if expected_lora_checksums is not None and checksum_ack_engines != len(rollout_engines):
+        raise RuntimeError("end_weight_update did not receive complete LoRA checksum ACKs from every engine")
 
 
 def register_lora_adapter(

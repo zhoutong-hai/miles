@@ -1,7 +1,29 @@
 import time
+from unittest.mock import Mock
 
 import pytest
 import requests
+
+
+def test_end_weight_update_forwards_initial_zero_b_requirement():
+    pytest.importorskip("sglang")
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    engine = SGLangEngine.__new__(SGLangEngine)
+    engine._make_request = Mock(return_value={"success": True})
+
+    engine.end_weight_update(
+        expected_lora_checksums={"adapter": {"tensor": "sha"}},
+        require_lora_zero_b=True,
+    )
+
+    engine._make_request.assert_called_once_with(
+        "end_weight_update",
+        {
+            "expected_lora_checksums": {"adapter": {"tensor": "sha"}},
+            "require_lora_zero_b": True,
+        },
+    )
 
 
 def test_flush_cache_sleeps_between_pending_request_retries(monkeypatch):

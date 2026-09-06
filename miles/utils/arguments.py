@@ -2241,6 +2241,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--check-initial-lora-zero-effect",
+                action="store_true",
+                default=False,
+                help=(
+                    "Before the first LoRA publication, run seeded stock generation on every "
+                    "rollout engine; after publication, repeat stock generation and compare it "
+                    "against generation through the freshly installed zero-effect adapter."
+                ),
+            )
+            parser.add_argument(
                 "--save-local-weight-checksum",
                 action="store_true",
                 help="Save per-rank local weight checksum per-step.",

@@ -25,6 +25,10 @@ from miles.backends.training_utils.weight_update.session import (
     end_weight_update,
 )
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
+from miles.backends.training_utils.weight_update.utils import (
+    record_initial_lora_zero_b_evidence,
+    validate_initial_lora_zero_b_evidence,
+)
 from miles.utils.lora import is_lora_weight_name
 
 _UW_MODULE = "miles.backends.training_utils.weight_update.protocols.cuda_ipc"
@@ -111,10 +115,7 @@ class TestEndWeightUpdateChecksumAcks:
         results = [
             {
                 "success": True,
-                "message": " | ".join(
-                    f"[LORA-CHECK] rank={rank} PASS adapters=1 tensors=4"
-                    for rank in range(32)
-                ),
+                "message": " | ".join(f"[LORA-CHECK] rank={rank} PASS adapters=1 tensors=4" for rank in range(32)),
             }
         ]
         with patch(
@@ -181,9 +182,132 @@ class TestEndWeightUpdateChecksumAcks:
 
     def test_checksum_validation_requires_expected_tp_size(self):
         with pytest.raises(ValueError, match="expected_tp_ranks"):
+            end_weight_update([MagicMock()], expected_lora_checksums={"a": {"x": "y"}})
+
+    def test_initial_zero_b_requirement_is_forwarded_to_engine(self):
+        engine = MagicMock()
+        message = (
+            "[LORA-CHECK] rank=0 PASS adapters=1 tensors=4 "
+            f"[LORA-ZERO-B] buffers=2 elements=16 nonzero=0 schema_sha256={'a' * 64}"
+        )
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=[{"success": True, "message": message}],
+        ):
             end_weight_update(
-                [MagicMock()], expected_lora_checksums={"a": {"x": "y"}}
+                [engine],
+                expected_lora_checksums={"adapter": {"tensor": "sha"}},
+                expected_tp_ranks=1,
+                require_lora_zero_b=True,
             )
+
+        engine.end_weight_update.remote.assert_called_once_with(
+            expected_lora_checksums={"adapter": {"tensor": "sha"}},
+            require_lora_zero_b=True,
+        )
+
+    def test_initial_zero_b_requirement_rejects_generic_checksum_pass(self):
+        engine = MagicMock()
+        with patch(
+            "miles.backends.training_utils.weight_update.session.ray.get",
+            return_value=[
+                {
+                    "success": True,
+                    "message": "[LORA-CHECK] rank=0 PASS adapters=1 tensors=4",
+                }
+            ],
+        ):
+            with pytest.raises(RuntimeError, match="zero-B ACK mismatch"):
+                end_weight_update(
+                    [engine],
+                    expected_lora_checksums={"adapter": {"tensor": "sha"}},
+                    expected_tp_ranks=1,
+                    require_lora_zero_b=True,
+                )
+
+
+class TestInitialLoraSourceZeroB:
+    @staticmethod
+    def _pair(name: str, b_tensor: torch.Tensor):
+        return [
+            (f"adapter:{name}.lora_A.weight", torch.ones(2, 3)),
+            (f"adapter:{name}.lora_B.weight", b_tensor),
+        ]
+
+    def test_complete_finite_zero_inventory_records_deterministic_evidence(self):
+        inventory = {"a_names": [], "b_tensors": []}
+        record_initial_lora_zero_b_evidence(self._pair("model.layers.1.q_proj", torch.zeros(3, 2)), inventory)
+        record_initial_lora_zero_b_evidence(self._pair("model.layers.0.q_proj", torch.zeros(4, 2)), inventory)
+
+        report = validate_initial_lora_zero_b_evidence(inventory)
+
+        assert report["tensor_count"] == 2
+        assert report["total_numel"] == 14
+        assert len(report["manifest_sha256"]) == 64
+        assert [entry["name"] for entry in report["tensors"]] == sorted(entry["name"] for entry in report["tensors"])
+        assert set(report["tensors"][0]) == {
+            "name",
+            "shape",
+            "dtype",
+            "numel",
+            "sha256",
+            "finite",
+            "zero",
+        }
+
+    @pytest.mark.parametrize(
+        ("b_tensor", "error"),
+        [
+            (torch.tensor([[0.0, 1.0]]), "nonzero lora_B"),
+            (torch.tensor([[0.0, float("nan")]]), "non-finite lora_B"),
+        ],
+    )
+    def test_nonzero_or_nonfinite_b_fails(self, b_tensor, error):
+        inventory = {"a_names": [], "b_tensors": []}
+        record_initial_lora_zero_b_evidence(self._pair("model.layers.0.q_proj", b_tensor), inventory)
+
+        with pytest.raises(RuntimeError, match=error):
+            validate_initial_lora_zero_b_evidence(inventory)
+
+    def test_incomplete_a_b_coverage_fails(self):
+        inventory = {"a_names": [], "b_tensors": []}
+        record_initial_lora_zero_b_evidence(
+            [
+                (
+                    "adapter:model.layers.0.q_proj.lora_A.weight",
+                    torch.ones(2, 3),
+                ),
+                (
+                    "adapter:model.layers.1.q_proj.lora_B.weight",
+                    torch.zeros(3, 2),
+                ),
+            ],
+            inventory,
+        )
+
+        with pytest.raises(RuntimeError, match="A/B coverage mismatch"):
+            validate_initial_lora_zero_b_evidence(inventory)
+
+    def test_receiver_requirement_is_initial_lora_publication_only(self):
+        updater = WeightUpdater.__new__(WeightUpdater)
+        updater.is_lora = True
+        updater.args = Namespace(check_initial_lora_zero_effect=True)
+        updater._initial_lora_publication_verified = False
+        assert updater._require_initial_lora_zero_b() is True
+
+        updater.weight_version = 2
+        assert updater._require_initial_lora_zero_b() is True
+
+        updater._initial_lora_publication_verified = True
+        assert updater._require_initial_lora_zero_b() is False
+
+        updater.is_lora = False
+        updater._initial_lora_publication_verified = False
+        assert updater._require_initial_lora_zero_b() is False
+
+        updater.is_lora = True
+        updater.args.check_initial_lora_zero_effect = False
+        assert updater._require_initial_lora_zero_b() is False
 
 
 class TestUpdateWeightsEmptyBaseIteration:
@@ -342,21 +466,13 @@ class TestPersistentIpcTransferBuffer:
         _IPC_TRANSFER_BUFFERS.clear()
 
     def test_reuses_storage_after_ack_boundary(self):
-        first = _copy_into_persistent_transfer_buffer(
-            torch.arange(6, dtype=torch.float32), minimum_bytes=64
-        )
+        first = _copy_into_persistent_transfer_buffer(torch.arange(6, dtype=torch.float32), minimum_bytes=64)
         ptr = first.untyped_storage().data_ptr()
-        second = _copy_into_persistent_transfer_buffer(
-            torch.full((4,), 7.0, dtype=torch.float32), minimum_bytes=64
-        )
+        second = _copy_into_persistent_transfer_buffer(torch.full((4,), 7.0, dtype=torch.float32), minimum_bytes=64)
         assert second.untyped_storage().data_ptr() == ptr
         torch.testing.assert_close(second, torch.full((4,), 7.0))
 
     def test_refuses_to_rotate_exported_storage(self):
-        _copy_into_persistent_transfer_buffer(
-            torch.zeros(4, dtype=torch.float32), minimum_bytes=16
-        )
+        _copy_into_persistent_transfer_buffer(torch.zeros(4, dtype=torch.float32), minimum_bytes=16)
         with pytest.raises(RuntimeError, match="exceeds the persistent"):
-            _copy_into_persistent_transfer_buffer(
-                torch.zeros(5, dtype=torch.float32), minimum_bytes=16
-            )
+            _copy_into_persistent_transfer_buffer(torch.zeros(5, dtype=torch.float32), minimum_bytes=16)

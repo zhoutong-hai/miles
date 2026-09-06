@@ -364,6 +364,41 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return True
 
+    def initial_lora_zero_effect_probe(self, phase: str):
+        """Exercise stock and, after publication, zero-effect LoRA generation."""
+        if self.node_rank != 0:
+            return None
+        if phase not in ("before", "after"):
+            raise ValueError(f"unknown zero-effect probe phase: {phase!r}")
+
+        from miles.backends.sglang_utils.lora_zero_effect_probe import (
+            build_probe_payload,
+            summarize_probe_response,
+        )
+        from miles.utils.lora import LORA_ADAPTER_NAME
+
+        cases = {}
+        for mode, stochastic in (("greedy", False), ("stochastic", True)):
+            for batch_size in (1, 8):
+                case = {}
+                variants = (("base", None),)
+                if phase == "after":
+                    variants += (("lora", LORA_ADAPTER_NAME),)
+                for variant, lora_path in variants:
+                    response = requests.post(
+                        f"http://{self.server_host}:{self.server_port}/generate",
+                        json=build_probe_payload(
+                            batch_size=batch_size,
+                            lora_path=lora_path,
+                            stochastic=stochastic,
+                        ),
+                        timeout=300,
+                    )
+                    response.raise_for_status()
+                    case[variant] = summarize_probe_response(response.json(), expected_batch_size=batch_size)
+                cases[f"{mode}_batch{batch_size}"] = case
+        return {"schema_version": 1, "phase": phase, "engine_rank": self.rank, "cases": cases}
+
     def update_weights_from_tensor(
         self,
         serialized_named_tensors: list[str],
@@ -702,10 +737,16 @@ class SGLangEngine(RayActor):
         adapter-only session (no quant unpack; base tensors rejected)."""
         return self._make_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
 
-    def end_weight_update(self, expected_lora_checksums=None):
+    def end_weight_update(self, expected_lora_checksums=None, require_lora_zero_b: bool = False):
         """Close the weight-update session: re-finalize base weights (sync_base
         sessions) and apply the streamed LoRA stash."""
-        return self._make_request("end_weight_update", {"expected_lora_checksums": expected_lora_checksums})
+        return self._make_request(
+            "end_weight_update",
+            {
+                "expected_lora_checksums": expected_lora_checksums,
+                "require_lora_zero_b": require_lora_zero_b,
+            },
+        )
 
     def update_weight_version(self, weight_version: str):
         return self._make_request(

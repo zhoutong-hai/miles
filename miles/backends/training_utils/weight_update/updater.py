@@ -6,6 +6,7 @@ buckets (senders transmit, other ranks join the gathers), and orchestrates
 LoRA adapter pushes.
 """
 
+import json
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
@@ -25,7 +26,11 @@ from miles.backends.training_utils.weight_update.session import (
     resume_engines,
     set_weight_version,
 )
-from miles.backends.training_utils.weight_update.utils import record_lora_checksums
+from miles.backends.training_utils.weight_update.utils import (
+    record_initial_lora_zero_b_evidence,
+    record_lora_checksums,
+    validate_initial_lora_zero_b_evidence,
+)
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora import LORA_ADAPTER_NAME
 from miles.utils.multi_lora import is_multi_lora_enabled, slot_lora_name
@@ -68,6 +73,7 @@ class WeightUpdater:
             assert lora_sync_config is not None
         self._lora_sync_config = lora_sync_config
         self._registered_adapters: set[str] = set()
+        self._initial_lora_publication_verified = False
         # Set by the actor before each update_weights call (loaded map at reconcile).
         self.multi_lora_adapters = None
 
@@ -110,6 +116,8 @@ class WeightUpdater:
 
         sync_base = not self.is_lora or protocol.needs_base_resync_for_lora
         adapters = self._get_updated_adapters()
+        weights = self.weights_getter()
+        require_lora_zero_b = self._require_initial_lora_zero_b()
 
         driver = dist.get_rank() == 0
         if protocol.use_weight_update_session and driver:
@@ -125,10 +133,18 @@ class WeightUpdater:
             assert (
                 self._hf_weight_iterator.placement.gather_pp
             ), "the LoRA checksum manifest is recorded on one rank, which must hold the full adapter"
+        if require_lora_zero_b:
+            if checksums is None:
+                raise RuntimeError("the initial LoRA zero-effect gate requires --check-lora-weight-equal")
+            self._run_initial_lora_source_gate(
+                adapters=adapters,
+                driver=driver,
+                weights=weights,
+            )
         with timer("update_weights_implementation"):
             pbar = tqdm(desc=f"[{protocol.group_name}] Update weights", total=0) if protocol.is_sender else None
             for bucket in self._hf_weight_iterator.iter_hf_weights(
-                self.weights_getter(),
+                weights,
                 include_base=sync_base,
                 adapters=adapters,
                 materialize=protocol.is_sender,
@@ -148,10 +164,63 @@ class WeightUpdater:
                     protocol.rollout_engines,
                     expected_lora_checksums=checksums,
                     expected_tp_ranks=self.args.rollout_num_gpus_per_engine,
+                    require_lora_zero_b=require_lora_zero_b,
                 )
                 set_weight_version(protocol.rollout_engines, self.weight_version)
                 resume_engines(protocol.rollout_engines)
+            if require_lora_zero_b:
+                self._initial_lora_publication_verified = True
             dist.barrier(group=get_gloo_group())
+
+    def _run_initial_lora_source_gate(self, *, adapters, driver: bool, weights) -> None:
+        """Prove the complete initial exported LoRA-B inventory is finite and zero."""
+        inventory: dict[str, list] = {"a_names": [], "b_tensors": []}
+        error = None
+        for bucket in self._hf_weight_iterator.iter_hf_weights(
+            weights,
+            include_base=False,
+            adapters=adapters,
+            materialize=self.protocol.is_sender,
+        ):
+            if not driver or error is not None:
+                continue
+            if not self.protocol.is_sender:
+                error = "global rank 0 is not a materialized weight-update sender"
+                continue
+            try:
+                record_initial_lora_zero_b_evidence(bucket, inventory)
+            except (RuntimeError, TypeError, ValueError) as exc:
+                error = f"failed to inspect initial LoRA export: {exc}"
+
+        gate_result = [None]
+        if driver:
+            try:
+                if error is not None:
+                    raise RuntimeError(error)
+                report = validate_initial_lora_zero_b_evidence(inventory)
+                logger.info(
+                    "[LORA-SOURCE-ZERO-B] %s",
+                    json.dumps(report, sort_keys=True, separators=(",", ":")),
+                )
+                gate_result[0] = {"success": True, "message": "Success"}
+            except (RuntimeError, TypeError, ValueError) as exc:
+                gate_result[0] = {"success": False, "message": str(exc)}
+        dist.broadcast_object_list(
+            gate_result,
+            src=0,
+            group=get_gloo_group(),
+        )
+        if not gate_result[0] or not gate_result[0]["success"]:
+            message = gate_result[0]["message"] if gate_result[0] else "missing result"
+            raise RuntimeError(f"initial LoRA source zero-B gate failed: {message}")
+
+    def _require_initial_lora_zero_b(self) -> bool:
+        """Require the zero-effect proof only for the first LoRA publication."""
+        return (
+            self.is_lora
+            and getattr(self.args, "check_initial_lora_zero_effect", False)
+            and not self._initial_lora_publication_verified
+        )
 
     def _iter_base_buckets(self, *, materialize: bool):
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)

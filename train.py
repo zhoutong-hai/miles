@@ -56,8 +56,23 @@ async def train(args):
     if args.offload_rollout and args.colocate_memory_peak_device != "gpu":
         await rollout_manager.onload_weights.remote()
 
+    initial_lora_probe = None
+    initial_lora_probe_kv_loaded = False
+    if args.check_initial_lora_zero_effect:
+        assert is_lora_enabled(args), "--check-initial-lora-zero-effect requires LoRA"
+        assert args.check_lora_weight_equal, "--check-initial-lora-zero-effect requires --check-lora-weight-equal"
+        await rollout_manager.onload_kv.remote()
+        initial_lora_probe = await rollout_manager.initial_lora_zero_effect_probe.remote("before")
+        if args.offload_rollout:
+            await rollout_manager.offload_kv.remote()
+
     # always update weight first so that sglang has the loaded weights from training.
     await actor_model.update_weights()
+
+    if args.check_initial_lora_zero_effect:
+        await rollout_manager.onload_kv.remote()
+        await rollout_manager.initial_lora_zero_effect_probe.remote("after", initial_lora_probe)
+        initial_lora_probe_kv_loaded = True
 
     if args.check_weight_update_equal:
         await rollout_manager.check_weights.remote(
@@ -67,7 +82,7 @@ async def train(args):
             skip_list=args.check_weight_update_skip_list,
         )
 
-    if args.offload_rollout:
+    if args.offload_rollout and not initial_lora_probe_kv_loaded:
         await rollout_manager.onload_kv.remote()
 
     # special case for eval-only

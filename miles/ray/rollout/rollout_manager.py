@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from dataclasses import dataclass
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from miles.backends.sglang_utils.lora_zero_effect_probe import validate_initial_zero_effect_probes
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
@@ -404,6 +406,32 @@ class RolloutManager:
         return await srv.check_weights(
             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
         )
+
+    async def initial_lora_zero_effect_probe(self, phase: str, before_results=None):
+        """Run the initial publication decode ladder on every updatable engine."""
+        srv = self._get_updatable_server()
+        if srv is None:
+            raise RuntimeError("zero-effect probe requires an updatable rollout server")
+        refs = [engine.actor_handle.initial_lora_zero_effect_probe.remote(phase) for engine in srv.engines]
+        results = list(await asyncio.gather(*refs))
+        if any(result is None for result in results):
+            raise RuntimeError("zero-effect probe omitted an engine result")
+        receipt = {"schema_version": 1, "phase": phase, "engines": results}
+        if phase == "after":
+            if before_results is None:
+                raise RuntimeError("post-publication probe requires pre-publication evidence")
+            expected_engine_ranks = [
+                group.rank_offset + index * group.nodes_per_engine
+                for group in srv.server_groups
+                for index, _ in enumerate(group.engines)
+            ]
+            receipt["comparison"] = validate_initial_zero_effect_probes(
+                before_results,
+                results,
+                expected_engine_ranks=expected_engine_ranks,
+            )
+        logger.info("[LORA-ZERO-EFFECT-PROBE] %s", json.dumps(receipt, sort_keys=True))
+        return results
 
     def set_weight_version(self, weight_version: int):
         # warning instead of assert when use indep_dp ft

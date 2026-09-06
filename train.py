@@ -43,6 +43,35 @@ async def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    if args.debug_startup_finite_probe_only:
+        await rollout_manager.onload_weights.remote()
+        await rollout_manager.onload_kv.remote()
+        probe = await rollout_manager.startup_finite_probe.remote()
+        receipt_path = os.environ.get("MILES_STARTUP_FINITE_PROBE_RECEIPT")
+        if not receipt_path:
+            raise RuntimeError("MILES_STARTUP_FINITE_PROBE_RECEIPT is required")
+        result = {
+            "schema_version": 1,
+            "status": "PASS",
+            "run_id": args.run_id,
+            "case": "greedy_batch8_base",
+            "publication_events": 0,
+            "rollouts": 0,
+            "optimizer_updates": 0,
+            "probe": probe,
+        }
+        target = Path(receipt_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        temporary.replace(target)
+        logger.info(
+            "[STARTUP-FINITE-PROBE-TERMINAL] status=PASS engines=%d publication=0 rollouts=0 updates=0",
+            len(probe["engines"]),
+        )
+        await rollout_manager.dispose.remote()
+        return
+
     integrated_pre_trainer_probe = None
     integrated_pre_trainer_checksums = None
     if args.debug_integrated_base_probe_only:

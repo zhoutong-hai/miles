@@ -464,6 +464,38 @@ class RolloutManager:
         logger.info("[INTEGRATED-BASE-PROBE] %s", json.dumps(receipt, sort_keys=True))
         return receipt
 
+    async def startup_finite_probe(self):
+        """Run the narrowed greedy batch-8 stock-base case on every engine."""
+        srv = self._get_updatable_server()
+        if srv is None:
+            raise RuntimeError("startup finite probe requires an updatable rollout server")
+        engine_ranks = [
+            group.rank_offset + index * group.nodes_per_engine
+            for group in srv.server_groups
+            for index, _ in enumerate(group.engines)
+        ]
+        refs = [engine.actor_handle.startup_finite_probe.remote() for engine in srv.engines]
+        raw_results = list(await asyncio.gather(*refs, return_exceptions=True))
+        outcomes = []
+        failures = []
+        for engine_rank, result in zip(engine_ranks, raw_results, strict=True):
+            if isinstance(result, BaseException):
+                error = f"{type(result).__name__}: {result}"
+                outcomes.append({"engine_rank": engine_rank, "status": "FAIL", "error": error})
+                failures.append((engine_rank, error))
+            elif result is None:
+                error = "engine omitted startup finite probe result"
+                outcomes.append({"engine_rank": engine_rank, "status": "FAIL", "error": error})
+                failures.append((engine_rank, error))
+            else:
+                outcomes.append({"engine_rank": engine_rank, "status": "PASS", "result": result})
+        receipt = {"schema_version": 1, "case": "greedy_batch8_base", "engines": outcomes}
+        logger.info("[STARTUP-FINITE-PROBE] %s", json.dumps(receipt, sort_keys=True))
+        if failures:
+            failed_ranks = [rank for rank, _ in failures]
+            raise RuntimeError(f"startup finite probe failed on engine ranks {failed_ranks}")
+        return receipt
+
     def set_weight_version(self, weight_version: int):
         # warning instead of assert when use indep_dp ft
         if self.weight_version is not None and weight_version < self.weight_version:

@@ -1032,6 +1032,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--debug-startup-finite-probe-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Start every configured rollout engine, run only the stock-base greedy "
+                    "batch-8 finite probe, and exit before trainer creation, publication, "
+                    "rollout, or training."
+                ),
+            )
+            parser.add_argument(
                 "--num-epoch",
                 type=int,
                 default=None,
@@ -3414,6 +3424,16 @@ def miles_validate_args(args):
         assert args.offload_rollout, "--debug-integrated-base-probe-only requires rollout offload"
         assert not args.debug_train_only and not args.debug_rollout_only, (
             "--debug-integrated-base-probe-only requires both trainer and rollout runtimes"
+        )
+
+    if args.debug_startup_finite_probe_only:
+        assert not args.debug_integrated_base_probe_only, (
+            "--debug-startup-finite-probe-only and --debug-integrated-base-probe-only are mutually exclusive"
+        )
+        assert args.colocate, "--debug-startup-finite-probe-only requires --colocate"
+        assert args.offload_rollout, "--debug-startup-finite-probe-only requires rollout offload"
+        assert not args.debug_train_only and not args.debug_rollout_only, (
+            "--debug-startup-finite-probe-only uses the production colocated rollout topology"
         )
 
     _validate_rematerialize_param_from_master_weight(args)

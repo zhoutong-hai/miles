@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import ipaddress
 import logging
 import multiprocessing
@@ -405,6 +406,34 @@ class SGLangEngine(RayActor):
                     )
                 cases[f"{mode}_batch{batch_size}"] = case
         return {"schema_version": 1, "phase": phase, "engine_rank": self.rank, "cases": cases}
+
+    def startup_finite_probe(self):
+        """Run only the production CUDA-graph greedy batch-8 base case."""
+        if self.node_rank != 0:
+            return None
+
+        from miles.backends.sglang_utils.lora_zero_effect_probe import (
+            build_probe_payload,
+            summarize_probe_response,
+        )
+
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/generate",
+            json=build_probe_payload(batch_size=8, lora_path=None, stochastic=False),
+            timeout=300,
+        )
+        response.raise_for_status()
+        return {
+            "schema_version": 1,
+            "engine_rank": self.rank,
+            "case": "greedy_batch8_base",
+            "response_sha256": hashlib.sha256(response.content).hexdigest(),
+            "summary": summarize_probe_response(
+                response.json(),
+                expected_batch_size=8,
+                context=f"engine_rank={self.rank} startup finite probe greedy batch_size=8 base",
+            ),
+        }
 
     def update_weights_from_tensor(
         self,

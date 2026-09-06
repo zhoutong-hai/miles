@@ -211,3 +211,67 @@ def validate_initial_zero_effect_probes(
         "stochastic_smoke_count": sum(item["mode"] == "production_stochastic_smoke" for item in comparisons),
         "comparisons": comparisons,
     }
+
+
+def validate_integrated_base_probes(
+    pre_trainer_results: Sequence[Mapping[str, Any]],
+    post_trainer_results: Sequence[Mapping[str, Any]],
+    *,
+    expected_engine_ranks: Sequence[int],
+) -> dict[str, Any]:
+    """Require stable, finite stock-base probes across trainer load/offload."""
+    expected_ranks = {int(rank) for rank in expected_engine_ranks}
+    if not expected_ranks or len(expected_ranks) != len(expected_engine_ranks):
+        raise RuntimeError("integrated base probe expected engine ranks are empty or duplicated")
+
+    def index_results(label: str, results: Sequence[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
+        for item in results:
+            if item.get("schema_version") != 1 or item.get("phase") != "before":
+                raise RuntimeError(
+                    f"integrated base probe invalid {label} receipt: "
+                    f"schema={item.get('schema_version')} phase={item.get('phase')!r}"
+                )
+        indexed = {int(item["engine_rank"]): item for item in results}
+        if len(indexed) != len(results) or set(indexed) != expected_ranks:
+            raise RuntimeError(
+                f"integrated base probe engine coverage mismatch for {label}: "
+                f"expected={sorted(expected_ranks)} observed={sorted(indexed)}"
+            )
+        return indexed
+
+    before_by_engine = index_results("pre_trainer", pre_trainer_results)
+    after_by_engine = index_results("post_trainer", post_trainer_results)
+    comparisons = []
+    for engine_rank in sorted(expected_ranks):
+        before = before_by_engine[engine_rank]
+        after = after_by_engine[engine_rank]
+        for batch_size in (1, 8):
+            case = f"greedy_batch{batch_size}"
+            max_abs_logprob_diff = _compare_case(
+                before["cases"][case]["base"],
+                after["cases"][case]["base"],
+                label=f"engine={engine_rank} {case} pre-trainer/post-trainer",
+            )
+            comparisons.append(
+                {
+                    "engine_rank": engine_rank,
+                    "batch_size": batch_size,
+                    "max_abs_logprob_diff": max_abs_logprob_diff,
+                }
+            )
+            for stage, receipt in (
+                ("pre_trainer", before),
+                ("post_trainer", after),
+            ):
+                smoke = receipt["cases"][f"stochastic_batch{batch_size}"]["base"]
+                if smoke.get("batch_size") != batch_size or not smoke.get("outputs"):
+                    raise RuntimeError(
+                        f"engine={engine_rank} stochastic_batch{batch_size} {stage}: incomplete smoke result"
+                    )
+    return {
+        "status": "PASS",
+        "engine_count": len(expected_ranks),
+        "greedy_comparison_count": len(comparisons),
+        "stochastic_smoke_count": len(expected_ranks) * 2 * 2,
+        "comparisons": comparisons,
+    }

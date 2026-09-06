@@ -1022,6 +1022,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Exit training after this many rollouts (for testing checkpoint resume with consistent scheduler params).",
             )
             parser.add_argument(
+                "--debug-integrated-base-probe-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "With colocated trainer and rollout offload enabled, probe every base rollout "
+                    "engine before trainer initialization and again after trainer load/offload, "
+                    "verify exact rollout-weight checksums, then exit before publication or training."
+                ),
+            )
+            parser.add_argument(
                 "--num-epoch",
                 type=int,
                 default=None,
@@ -3397,6 +3407,14 @@ def miles_validate_args(args):
     if args.offload_train:
         args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = True
+
+    if args.debug_integrated_base_probe_only:
+        assert args.colocate, "--debug-integrated-base-probe-only requires --colocate"
+        assert args.offload_train, "--debug-integrated-base-probe-only requires trainer offload"
+        assert args.offload_rollout, "--debug-integrated-base-probe-only requires rollout offload"
+        assert not args.debug_train_only and not args.debug_rollout_only, (
+            "--debug-integrated-base-probe-only requires both trainer and rollout runtimes"
+        )
 
     _validate_rematerialize_param_from_master_weight(args)
 

@@ -7,7 +7,10 @@ from dataclasses import dataclass
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from miles.backends.sglang_utils.lora_zero_effect_probe import validate_initial_zero_effect_probes
+from miles.backends.sglang_utils.lora_zero_effect_probe import (
+    validate_initial_zero_effect_probes,
+    validate_integrated_base_probes,
+)
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.addr_allocator import PortCursors
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
@@ -432,6 +435,34 @@ class RolloutManager:
             )
         logger.info("[LORA-ZERO-EFFECT-PROBE] %s", json.dumps(receipt, sort_keys=True))
         return results
+
+    async def integrated_base_probe(self, stage: str, pre_trainer_results=None):
+        """Probe all stock-base engines around the real trainer load/offload."""
+        if stage not in {"pre_trainer", "post_trainer"}:
+            raise ValueError(f"unknown integrated base probe stage: {stage!r}")
+        srv = self._get_updatable_server()
+        if srv is None:
+            raise RuntimeError("integrated base probe requires an updatable rollout server")
+        refs = [engine.actor_handle.initial_lora_zero_effect_probe.remote("before") for engine in srv.engines]
+        results = list(await asyncio.gather(*refs))
+        if any(result is None for result in results):
+            raise RuntimeError("integrated base probe omitted an engine result")
+        receipt = {"schema_version": 1, "stage": stage, "engines": results}
+        if stage == "post_trainer":
+            if pre_trainer_results is None:
+                raise RuntimeError("post-trainer integrated probe requires pre-trainer evidence")
+            expected_engine_ranks = [
+                group.rank_offset + index * group.nodes_per_engine
+                for group in srv.server_groups
+                for index, _ in enumerate(group.engines)
+            ]
+            receipt["comparison"] = validate_integrated_base_probes(
+                pre_trainer_results,
+                results,
+                expected_engine_ranks=expected_engine_ranks,
+            )
+        logger.info("[INTEGRATED-BASE-PROBE] %s", json.dumps(receipt, sort_keys=True))
+        return receipt
 
     def set_weight_version(self, weight_version: int):
         # warning instead of assert when use indep_dp ft

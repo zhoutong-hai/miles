@@ -6,6 +6,7 @@ from miles.backends.sglang_utils.lora_zero_effect_probe import (
     build_probe_payload,
     summarize_probe_response,
     validate_initial_zero_effect_probes,
+    validate_integrated_base_probes,
 )
 
 
@@ -118,3 +119,29 @@ def test_initial_zero_effect_probe_rejects_invalid_phase():
     after = [_engine_receipt(0, "after")]
     with pytest.raises(RuntimeError, match="invalid before receipt"):
         validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+
+
+def test_integrated_base_probe_accepts_exact_four_engine_match():
+    expected_ranks = [0, 4, 8, 12]
+    before = [_engine_receipt(rank, "before") for rank in expected_ranks]
+    after = deepcopy(before)
+    result = validate_integrated_base_probes(before, after, expected_engine_ranks=expected_ranks)
+    assert result["status"] == "PASS"
+    assert result["engine_count"] == 4
+    assert result["greedy_comparison_count"] == 8
+    assert result["stochastic_smoke_count"] == 16
+
+
+def test_integrated_base_probe_rejects_post_trainer_token_change():
+    before = [_engine_receipt(0, "before")]
+    after = deepcopy(before)
+    after[0]["cases"]["greedy_batch8"]["base"]["outputs"][0]["token_ids"][0] += 1
+    with pytest.raises(RuntimeError, match="token IDs changed"):
+        validate_integrated_base_probes(before, after, expected_engine_ranks=[0])
+
+
+def test_integrated_base_probe_rejects_incomplete_engine_set():
+    before = [_engine_receipt(0, "before")]
+    after = [_engine_receipt(0, "before")]
+    with pytest.raises(RuntimeError, match="engine coverage mismatch"):
+        validate_integrated_base_probes(before, after, expected_engine_ranks=[0, 4])

@@ -1,11 +1,14 @@
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from miles.ray.rollout.rollout_manager import get_rollout_offload_tags
 from miles.utils import object_store
 from miles.utils.arguments import parse_args
+from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
 from miles.utils.data import remove_rollout_data_refs
 from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_dump
@@ -40,8 +43,69 @@ async def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    integrated_pre_trainer_probe = None
+    integrated_pre_trainer_checksums = None
+    if args.debug_integrated_base_probe_only:
+        await rollout_manager.onload_weights.remote()
+        await rollout_manager.onload_kv.remote()
+        integrated_pre_trainer_probe = await rollout_manager.integrated_base_probe.remote("pre_trainer")
+        integrated_pre_trainer_checksums = flatten_inference_engine_checksums(
+            await rollout_manager.check_weights.remote("checksum", selector="target")
+        )
+        await rollout_manager.offload.remote(tags=get_rollout_offload_tags(args))
+
     # create the actor and critic models
     actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
+
+    if args.debug_integrated_base_probe_only:
+        await rollout_manager.onload_weights.remote()
+        await rollout_manager.onload_kv.remote()
+        integrated_post_trainer_probes = []
+        integrated_post_trainer_checksums = []
+        for _ in range(3):
+            integrated_post_trainer_probes.append(
+                await rollout_manager.integrated_base_probe.remote(
+                    "post_trainer", integrated_pre_trainer_probe["engines"]
+                )
+            )
+            integrated_post_trainer_checksums.append(
+                flatten_inference_engine_checksums(
+                    await rollout_manager.check_weights.remote("checksum", selector="target")
+                )
+            )
+        if any(
+            integrated_pre_trainer_checksums != post_checksums
+            for post_checksums in integrated_post_trainer_checksums
+        ):
+            raise RuntimeError("rollout weight checksums changed across trainer load/offload")
+        receipt_path = os.environ.get("MILES_INTEGRATED_BASE_PROBE_RECEIPT")
+        if not receipt_path:
+            raise RuntimeError("MILES_INTEGRATED_BASE_PROBE_RECEIPT is required")
+        result = {
+            "schema_version": 1,
+            "status": "PASS",
+            "run_id": args.run_id,
+            "publication_events": 0,
+            "rollouts": 0,
+            "optimizer_updates": 0,
+            "pre_trainer_probe": integrated_pre_trainer_probe,
+            "post_trainer_probe_repetitions": 3,
+            "post_trainer_probes": integrated_post_trainer_probes,
+            "pre_trainer_weight_checksums": integrated_pre_trainer_checksums,
+            "post_trainer_weight_checksums": integrated_post_trainer_checksums,
+            "weight_checksums_equal": True,
+        }
+        target = Path(receipt_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        temporary.replace(target)
+        logger.info(
+            "[INTEGRATED-BASE-PROBE-TERMINAL] status=PASS engines=%d publication=0 rollouts=0 updates=0",
+            integrated_post_trainer_probes[-1]["comparison"]["engine_count"],
+        )
+        await rollout_manager.dispose.remote()
+        return
 
     if args.control_server_port:
         start_control_server(

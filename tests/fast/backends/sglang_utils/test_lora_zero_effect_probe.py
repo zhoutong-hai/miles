@@ -59,6 +59,27 @@ def test_probe_response_rejects_nonfinite_logprob():
         summarize_probe_response(response, expected_batch_size=1)
 
 
+def test_probe_response_rejects_null_output_logprob_with_context():
+    response = _response(1)
+    response[0]["meta_info"]["output_token_logprobs"][0][0] = None
+    with pytest.raises(
+        RuntimeError,
+        match=r"engine_rank=12 phase=before mode=greedy batch_size=8 variant=base: .*null output logprob",
+    ):
+        summarize_probe_response(
+            response,
+            expected_batch_size=1,
+            context="engine_rank=12 phase=before mode=greedy batch_size=8 variant=base",
+        )
+
+
+def test_probe_response_rejects_non_numeric_logprob():
+    response = _response(1)
+    response[0]["meta_info"]["output_token_logprobs"][0][0] = "not-a-number"
+    with pytest.raises(RuntimeError, match="non-numeric"):
+        summarize_probe_response(response, expected_batch_size=1)
+
+
 def test_initial_zero_effect_probe_accepts_exact_four_engine_match():
     expected_ranks = [0, 4, 8, 12]
     before = [_engine_receipt(rank, "before") for rank in expected_ranks]

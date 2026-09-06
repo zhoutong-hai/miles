@@ -33,38 +33,61 @@ def build_probe_payload(*, batch_size: int, lora_path: str | None, stochastic: b
     return payload
 
 
-def summarize_probe_response(response: Any, *, expected_batch_size: int) -> dict[str, Any]:
+def summarize_probe_response(
+    response: Any,
+    *,
+    expected_batch_size: int,
+    context: str | None = None,
+) -> dict[str, Any]:
     """Validate one /generate response and retain compact deterministic evidence."""
+    prefix = f"{context}: " if context else ""
     outputs = response if isinstance(response, list) else [response]
     if len(outputs) != expected_batch_size:
-        raise RuntimeError(f"probe response batch mismatch: expected={expected_batch_size} observed={len(outputs)}")
+        raise RuntimeError(
+            f"{prefix}probe response batch mismatch: expected={expected_batch_size} observed={len(outputs)}"
+        )
 
     summaries = []
     for output_index, output in enumerate(outputs):
         if not isinstance(output, Mapping):
-            raise RuntimeError(f"probe output {output_index} is not a mapping")
+            raise RuntimeError(f"{prefix}probe output {output_index} is not a mapping")
         meta = output.get("meta_info")
         if not isinstance(meta, Mapping):
-            raise RuntimeError(f"probe output {output_index} omitted meta_info")
+            raise RuntimeError(f"{prefix}probe output {output_index} omitted meta_info")
         raw_logprobs = meta.get("output_token_logprobs")
         if not isinstance(raw_logprobs, Sequence) or not raw_logprobs:
-            raise RuntimeError(f"probe output {output_index} omitted output token logprobs")
+            raise RuntimeError(f"{prefix}probe output {output_index} omitted output token logprobs")
 
         token_ids: list[int] = []
         logprobs: list[float] = []
         for token_index, item in enumerate(raw_logprobs):
             if not isinstance(item, Sequence) or len(item) < 2:
-                raise RuntimeError(f"probe output {output_index} token {token_index} has malformed logprob data")
-            logprob = float(item[0])
-            token_id = int(item[1])
+                raise RuntimeError(
+                    f"{prefix}probe output {output_index} token {token_index} has malformed logprob data"
+                )
+            raw_logprob, raw_token_id = item[0], item[1]
+            if raw_logprob is None:
+                raise RuntimeError(
+                    f"{prefix}probe output {output_index} token {token_index} has null output logprob; "
+                    "the server likely serialized a non-finite value"
+                )
+            try:
+                logprob = float(raw_logprob)
+                token_id = int(raw_token_id)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{prefix}probe output {output_index} token {token_index} has non-numeric logprob/token data"
+                ) from exc
             if not math.isfinite(logprob):
-                raise RuntimeError(f"probe output {output_index} token {token_index} has non-finite logprob")
+                raise RuntimeError(
+                    f"{prefix}probe output {output_index} token {token_index} has non-finite logprob"
+                )
             logprobs.append(logprob)
             token_ids.append(token_id)
 
         routed = meta.get("routed_experts")
         if not isinstance(routed, str) or not routed:
-            raise RuntimeError(f"probe output {output_index} omitted routed-expert evidence")
+            raise RuntimeError(f"{prefix}probe output {output_index} omitted routed-expert evidence")
         summaries.append(
             {
                 "text": str(output.get("text", "")),

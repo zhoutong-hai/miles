@@ -395,7 +395,14 @@ class SGLangEngine(RayActor):
                         timeout=300,
                     )
                     response.raise_for_status()
-                    case[variant] = summarize_probe_response(response.json(), expected_batch_size=batch_size)
+                    case[variant] = summarize_probe_response(
+                        response.json(),
+                        expected_batch_size=batch_size,
+                        context=(
+                            f"engine_rank={self.rank} phase={phase} mode={mode} "
+                            f"batch_size={batch_size} variant={variant}"
+                        ),
+                    )
                 cases[f"{mode}_batch{batch_size}"] = case
         return {"schema_version": 1, "phase": phase, "engine_rank": self.rank, "cases": cases}
 

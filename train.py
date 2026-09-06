@@ -9,6 +9,7 @@ from miles.ray.rollout.rollout_manager import get_rollout_offload_tags
 from miles.utils import object_store
 from miles.utils.arguments import parse_args
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
+from miles.utils.audit_utils.experiment_receipt import resolve_experiment_run_id
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
 from miles.utils.data import remove_rollout_data_refs
 from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_dump
@@ -53,7 +54,7 @@ async def train(args):
         result = {
             "schema_version": 1,
             "status": "PASS",
-            "run_id": args.run_id,
+            "run_id": resolve_experiment_run_id(args, receipt_path),
             "case": "greedy_batch8_base",
             "publication_events": 0,
             "rollouts": 0,
@@ -113,7 +114,7 @@ async def train(args):
         result = {
             "schema_version": 1,
             "status": "PASS",
-            "run_id": args.run_id,
+            "run_id": resolve_experiment_run_id(args, receipt_path),
             "publication_events": 0,
             "rollouts": 0,
             "optimizer_updates": 0,

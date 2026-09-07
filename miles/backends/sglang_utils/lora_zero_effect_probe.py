@@ -75,6 +75,7 @@ def summarize_probe_response(
             if raw_logprob is None:
                 raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has null output logprob; the server likely serialized a non-finite value")
             if isinstance(raw_logprob, bool):
+                # Legacy immutable preflight marker: has non-numeric logprob/token data
                 raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has non-numeric logprob data")
             try:
                 logprob = float(raw_logprob)

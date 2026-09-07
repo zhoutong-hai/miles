@@ -385,25 +385,43 @@ class SGLangEngine(RayActor):
                 variants = (("base", None),)
                 if phase == "after":
                     variants += (("lora", LORA_ADAPTER_NAME),)
-                for variant, lora_path in variants:
-                    response = requests.post(
-                        f"http://{self.server_host}:{self.server_port}/generate",
-                        json=build_probe_payload(
+                repeats = 3 if not stochastic else 1
+                summaries_by_variant = {variant: [] for variant, _ in variants}
+                for repeat in range(repeats):
+                    for variant, lora_path in variants:
+                        flush = requests.get(
+                            f"http://{self.server_host}:{self.server_port}/flush_cache",
+                            timeout=300,
+                        )
+                        flush.raise_for_status()
+                        payload = build_probe_payload(
                             batch_size=batch_size,
                             lora_path=lora_path,
                             stochastic=stochastic,
-                        ),
-                        timeout=300,
-                    )
-                    response.raise_for_status()
-                    case[variant] = summarize_probe_response(
-                        response.json(),
-                        expected_batch_size=batch_size,
-                        context=(
-                            f"engine_rank={self.rank} phase={phase} mode={mode} "
-                            f"batch_size={batch_size} variant={variant}"
-                        ),
-                    )
+                        )
+                        response = requests.post(
+                            f"http://{self.server_host}:{self.server_port}/generate",
+                            json=payload,
+                            timeout=300,
+                        )
+                        response.raise_for_status()
+                        summaries_by_variant[variant].append(
+                            summarize_probe_response(
+                                response.json(),
+                                expected_batch_size=batch_size,
+                                input_texts=payload["text"],
+                                num_layers=self.args.num_layers,
+                                context=(
+                                    f"engine_rank={self.rank} phase={phase} mode={mode} "
+                                    f"batch_size={batch_size} variant={variant} repeat={repeat}"
+                                ),
+                            )
+                        )
+                for variant, _ in variants:
+                    summaries = summaries_by_variant[variant]
+                    case[variant] = summaries[0]
+                    if repeats > 1:
+                        case[f"{variant}_repeats"] = summaries
                 cases[f"{mode}_batch{batch_size}"] = case
         return {"schema_version": 1, "phase": phase, "engine_rank": self.rank, "cases": cases}
 
@@ -429,9 +447,10 @@ class SGLangEngine(RayActor):
             "case": "greedy_batch8_base",
             "response_sha256": hashlib.sha256(response.content).hexdigest(),
             "summary": summarize_probe_response(
-                response.json(),
-                expected_batch_size=8,
-                context=f"engine_rank={self.rank} startup finite probe greedy batch_size=8 base",
+            response.json(),
+            expected_batch_size=8,
+            num_layers=self.args.num_layers,
+            context=f"engine_rank={self.rank} startup finite probe greedy batch_size=8 base",
             ),
         }
 

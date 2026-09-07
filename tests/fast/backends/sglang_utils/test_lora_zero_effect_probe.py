@@ -45,6 +45,7 @@ def test_probe_payload_exercises_production_stochastic_batch_and_lora():
     assert payload["return_logprob"] is True
     assert payload["return_routed_experts"] is True
     assert all(item["temperature"] == 1.0 for item in payload["sampling_params"])
+    assert len(set(payload["text"])) == 8
 
 
 def test_probe_payload_builds_greedy_equality_request():
@@ -97,6 +98,39 @@ def test_initial_zero_effect_probe_rejects_lora_token_change():
     after = [_engine_receipt(0, "after")]
     after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0]["token_ids"][0] += 1
     with pytest.raises(RuntimeError, match="token IDs changed"):
+        validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+
+
+def test_initial_zero_effect_probe_accepts_routing_within_measured_base_repeat_envelope():
+    before = [_engine_receipt(0, "before")]
+    after = [_engine_receipt(0, "after")]
+    for batch_size in (1, 8):
+        case = f"greedy_batch{batch_size}"
+        baseline = before[0]["cases"][case]["base"]
+        repeat = deepcopy(baseline)
+        repeat["outputs"][0]["routed_experts_row_sha256"][0] = "natural-base-variance"
+        before[0]["cases"][case]["base_repeats"] = [baseline, repeat]
+        post_base = after[0]["cases"][case]["base"]
+        post_lora = after[0]["cases"][case]["lora"]
+        post_base["outputs"][0]["routed_experts_row_sha256"][0] = "post-base-variance"
+        post_lora["outputs"][0]["routed_experts_row_sha256"][0] = "post-lora-variance"
+
+    result = validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+    assert result["status"] == "PASS"
+    assert all(
+        item["base_base_routed_row_mismatch_envelope"] == 1
+        for item in result["comparisons"]
+        if item["mode"] == "greedy_equality"
+    )
+
+
+def test_initial_zero_effect_probe_rejects_routing_beyond_measured_base_repeat_envelope():
+    before = [_engine_receipt(0, "before")]
+    after = [_engine_receipt(0, "after")]
+    after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0][
+        "routed_experts_row_sha256"
+    ][0] = "unexpected-lora-route"
+    with pytest.raises(RuntimeError, match="routed row mismatches 1 exceeded base/base envelope 0"):
         validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
 
 

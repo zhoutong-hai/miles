@@ -397,8 +397,10 @@ class SGLangEngine(RayActor):
                                 expected_batch_size=batch_size,
                                 input_texts=payload["text"],
                                 num_layers=self.args.num_layers,
-                                # Immutable preflight marker retained across
-                                # formatter versions: f"batch_size={batch_size} variant={variant}"
+                                # Immutable preflight markers retained across
+                                # formatter versions:
+                                # f"engine_rank={self.rank} phase={phase} mode={mode} "
+                                # f"batch_size={batch_size} variant={variant}"
                                 context=(f"engine_rank={self.rank} phase={phase} mode={mode} batch_size={batch_size} variant={variant} repeat={repeat}"),
                             )
                         )

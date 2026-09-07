@@ -423,14 +423,60 @@ class SGLangEngine(RayActor):
         return {"engine_rank": self.rank, **result}
 
     def startup_finite_probe(self):
-        """Run only the production CUDA-graph greedy batch-8 base case."""
+        """Run the selected startup-only stock-base finite probe."""
         if self.node_rank != 0:
             return None
 
         from miles.backends.sglang_utils.lora_zero_effect_probe import (
+            build_dynamic_shrink_probe_payload,
             build_probe_payload,
             summarize_probe_response,
         )
+
+        profile = os.getenv("MILES_STARTUP_FINITE_PROBE_PROFILE", "greedy_batch8")
+        if profile == "dynamic_shrink":
+            repeats = int(os.getenv("MILES_STARTUP_FINITE_PROBE_REPEATS", "2"))
+            if not 1 <= repeats <= 4:
+                raise RuntimeError(
+                    "dynamic-shrink startup finite probe repeats must be in [1, 4]"
+                )
+            summaries = []
+            response_hashes = []
+            for repeat in range(repeats):
+                flush = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    timeout=300,
+                )
+                flush.raise_for_status()
+                payload = build_dynamic_shrink_probe_payload(repeat=repeat)
+                response = requests.post(
+                    f"http://{self.server_host}:{self.server_port}/generate",
+                    json=payload,
+                    timeout=600,
+                )
+                response.raise_for_status()
+                response_hashes.append(hashlib.sha256(response.content).hexdigest())
+                summaries.append(
+                    summarize_probe_response(
+                        response.json(),
+                        expected_batch_size=8,
+                        input_texts=payload["text"],
+                        num_layers=self.args.num_layers,
+                        context=(
+                            f"engine_rank={self.rank} startup finite probe "
+                            f"dynamic_shrink repeat={repeat}"
+                        ),
+                    )
+                )
+            return {
+                "schema_version": 1,
+                "engine_rank": self.rank,
+                "case": "stochastic_batch8_dynamic_shrink",
+                "response_sha256": response_hashes,
+                "summary": summaries,
+            }
+        if profile != "greedy_batch8":
+            raise RuntimeError(f"unknown startup finite probe profile: {profile!r}")
 
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/generate",

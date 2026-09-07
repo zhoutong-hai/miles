@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -503,7 +504,21 @@ class RolloutManager:
                 failures.append((engine_rank, error))
             else:
                 outcomes.append({"engine_rank": engine_rank, "status": "PASS", "result": result})
-        receipt = {"schema_version": 1, "case": "greedy_batch8_base", "engines": outcomes}
+        passed_cases = {
+            outcome["result"]["case"]
+            for outcome in outcomes
+            if outcome["status"] == "PASS"
+        }
+        if not failures and len(passed_cases) != 1:
+            raise RuntimeError(
+                f"startup finite probe engine case mismatch: {sorted(passed_cases)}"
+            )
+        case = (
+            next(iter(passed_cases))
+            if passed_cases
+            else os.getenv("MILES_STARTUP_FINITE_PROBE_PROFILE", "greedy_batch8")
+        )
+        receipt = {"schema_version": 1, "case": case, "engines": outcomes}
         logger.info("[STARTUP-FINITE-PROBE] %s", json.dumps(receipt, sort_keys=True))
         if failures:
             failed_ranks = [rank for rank, _ in failures]

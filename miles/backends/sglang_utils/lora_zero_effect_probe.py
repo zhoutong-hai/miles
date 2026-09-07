@@ -37,6 +37,18 @@ def build_probe_payload(*, batch_size: int, lora_path: str | None, stochastic: b
     return payload
 
 
+def build_dynamic_shrink_probe_payload(*, repeat: int) -> dict[str, Any]:
+    """Build a deterministic production-style batch that drains 8 -> 1 rows."""
+    if repeat < 0:
+        raise ValueError("repeat must be non-negative")
+    payload = build_probe_payload(batch_size=8, lora_path=None, stochastic=True)
+    for index, sampling_params in enumerate(payload["sampling_params"]):
+        sampling_params["ignore_eos"] = True
+        sampling_params["max_new_tokens"] = 32 * (index + 1)
+        sampling_params["seed"] = 4300 + repeat * 100 + index
+    return payload
+
+
 def summarize_probe_response(
     response: Any,
     *,

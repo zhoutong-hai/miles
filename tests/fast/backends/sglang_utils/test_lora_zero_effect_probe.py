@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 
 from miles.backends.sglang_utils.lora_zero_effect_probe import (
+    build_dynamic_shrink_probe_payload,
     build_probe_payload,
     summarize_probe_response,
     validate_initial_lora_slot_audits,
@@ -88,6 +89,27 @@ def test_probe_payload_builds_greedy_equality_request():
     payload = build_probe_payload(batch_size=1, lora_path=None, stochastic=False)
     assert "lora_path" not in payload
     assert payload["sampling_params"][0]["temperature"] == 0.0
+
+
+def test_dynamic_shrink_probe_payload_drains_rows_deterministically():
+    payload = build_dynamic_shrink_probe_payload(repeat=2)
+
+    assert len(payload["text"]) == 8
+    assert [item["max_new_tokens"] for item in payload["sampling_params"]] == [
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+    ]
+    assert [item["seed"] for item in payload["sampling_params"]] == list(
+        range(4500, 4508)
+    )
+    assert all(item["ignore_eos"] is True for item in payload["sampling_params"])
+    assert all(item["temperature"] == 1.0 for item in payload["sampling_params"])
 
 
 def test_probe_response_rejects_nonfinite_logprob():

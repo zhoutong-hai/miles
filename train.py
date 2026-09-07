@@ -54,7 +54,7 @@ async def train(args):
             "schema_version": 1,
             "status": "PASS",
             "run_id": resolve_experiment_run_id(args, receipt_path),
-            "case": "greedy_batch8_base",
+            "case": probe["case"],
             "publication_events": 0,
             "rollouts": 0,
             "optimizer_updates": 0,

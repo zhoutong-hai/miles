@@ -413,7 +413,8 @@ class SGLangEngine(RayActor):
                                 num_layers=self.args.num_layers,
                                 context=(
                                     f"engine_rank={self.rank} phase={phase} mode={mode} "
-                                    f"batch_size={batch_size} variant={variant} repeat={repeat}"
+                                    f"batch_size={batch_size} variant={variant}"
+                                    f" repeat={repeat}"
                                 ),
                             )
                         )

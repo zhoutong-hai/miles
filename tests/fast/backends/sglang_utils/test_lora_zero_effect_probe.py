@@ -105,7 +105,7 @@ def test_dynamic_shrink_probe_payload_drains_rows_deterministically():
         224,
         256,
     ]
-    assert [item["seed"] for item in payload["sampling_params"]] == list(
+    assert [item["sampling_seed"] for item in payload["sampling_params"]] == list(
         range(4500, 4508)
     )
     assert all(item["ignore_eos"] is True for item in payload["sampling_params"])

@@ -45,7 +45,7 @@ def build_dynamic_shrink_probe_payload(*, repeat: int) -> dict[str, Any]:
     for index, sampling_params in enumerate(payload["sampling_params"]):
         sampling_params["ignore_eos"] = True
         sampling_params["max_new_tokens"] = 32 * (index + 1)
-        sampling_params["seed"] = 4300 + repeat * 100 + index
+        sampling_params["sampling_seed"] = 4300 + repeat * 100 + index
     return payload
 
 

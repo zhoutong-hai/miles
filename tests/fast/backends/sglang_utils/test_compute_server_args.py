@@ -76,3 +76,34 @@ class TestSglangOverridePrecedence:
         assert server_args["dtype"] == "float16"
         assert server_args["enable_lora"] is True
         assert server_args["mem_fraction_static"] == 0.7
+
+
+@pytest.mark.parametrize(
+    ("no_cpu_backup", "expected_slots"),
+    [(False, 1), (True, 2)],
+)
+def test_single_lora_reserves_base_slot_when_cpu_backup_is_disabled(
+    no_cpu_backup, expected_slots
+):
+    args = make_args(
+        lora_rank=32,
+        multi_lora_n_adapters=0,
+        sglang_lora_no_cpu_backup=no_cpu_backup,
+    )
+
+    server_args = compute(args)
+
+    assert server_args["enable_lora"] is True
+    assert server_args["max_loras_per_batch"] == expected_slots
+
+
+def test_explicit_group_override_wins_over_single_lora_no_backup_slots():
+    args = make_args(
+        lora_rank=32,
+        multi_lora_n_adapters=0,
+        sglang_lora_no_cpu_backup=True,
+    )
+
+    server_args = compute(args, sglang_overrides={"max_loras_per_batch": 3})
+
+    assert server_args["max_loras_per_batch"] == 3

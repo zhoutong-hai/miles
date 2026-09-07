@@ -913,7 +913,13 @@ def _compute_server_args(
         kwargs["lora_target_modules"] = convert_target_modules_to_hf(args.target_modules)
     elif lora_rollout_enabled(args):
         kwargs["enable_lora"] = True
-        kwargs["max_loras_per_batch"] = 1
+        # A no-CPU-backup streamed adapter cannot be evicted and reconstructed.
+        # Keep one slot for the base-model sentinel and one for the resident
+        # single LoRA so base/LoRA requests (including the zero-effect gate) can
+        # coexist.  The ordinary backed-up path can retain its single-slot LRU.
+        kwargs["max_loras_per_batch"] = (
+            2 if getattr(args, "sglang_lora_no_cpu_backup", False) else 1
+        )
         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
         if sglang_lora_target_all_sentinel(args):
             kwargs["lora_target_modules"] = ["all"]

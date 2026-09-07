@@ -8,9 +8,10 @@ import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.backends.sglang_utils.lora_zero_effect_probe import (
-    validate_initial_zero_effect_probes,
     validate_initial_lora_slot_audits,
+    validate_initial_zero_effect_probes,
     validate_integrated_base_probes,
+    validate_operational_probe_results,
 )
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.addr_allocator import PortCursors
@@ -414,8 +415,11 @@ class RolloutManager:
         logger.info("[LORA-ZERO-EFFECT-PROBE] %s", json.dumps(receipt, sort_keys=True))
         return results
 
-    async def initial_lora_slot_audit(self):
-        """Prove all TP slots remain intact after the paired inference probes."""
+    async def initial_lora_slot_audit(self, phase: str):
+        """Prove all TP slots remain intact around the paired inference probes."""
+
+        if phase not in {"before_decode", "after_decode"}:
+            raise ValueError(f"unknown initial LoRA slot-audit phase: {phase!r}")
 
         srv = self._get_updatable_server()
         if srv is None:
@@ -430,7 +434,28 @@ class RolloutManager:
             expected_engine_ranks=expected_engine_ranks,
             expected_tp_size=self.args.rollout_num_gpus_per_engine,
         )
+        receipt["phase"] = phase
         logger.info("[LORA-SLOT-AUDIT] %s", json.dumps(receipt, sort_keys=True))
+        return receipt
+
+    async def canary_post_update_operational_probe(self):
+        """Run a finite base/LoRA smoke on every engine after update 1."""
+
+        srv = self._get_updatable_server()
+        if srv is None:
+            raise RuntimeError("post-update operational probe requires an updatable rollout server")
+        refs = [engine.actor_handle.initial_lora_zero_effect_probe.remote("after") for engine in srv.engines]
+        results = list(await asyncio.gather(*refs))
+        if any(result is None for result in results):
+            raise RuntimeError("post-update operational probe omitted an engine result")
+        expected_engine_ranks = [group.rank_offset + index * group.nodes_per_engine for group in srv.server_groups for index, _ in enumerate(group.engines)]
+        receipt = validate_operational_probe_results(
+            results,
+            expected_engine_ranks=expected_engine_ranks,
+            phase="after",
+        )
+        receipt["stage"] = "post_update_1"
+        logger.info("[CANARY-POST-UPDATE-SMOKE] %s", json.dumps(receipt, sort_keys=True))
         return receipt
 
     async def integrated_base_probe(self, stage: str, pre_trainer_results=None):

@@ -11,6 +11,7 @@ from miles.utils.arguments import parse_args
 from miles.utils.audit_utils.checksum_utils import flatten_inference_engine_checksums
 from miles.utils.audit_utils.experiment_receipt import resolve_experiment_run_id
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
+from miles.utils.canary_update_gate import GATE_PATH_ENV, validate_and_write_update1_gate
 from miles.utils.data import remove_rollout_data_refs
 from miles.utils.debug_utils.periodic_py_spy import maybe_start_periodic_pyspy_dump
 from miles.utils.ft_utils.control_server.server import start_control_server
@@ -150,8 +151,9 @@ async def train(args):
 
     if args.check_initial_lora_zero_effect:
         await rollout_manager.onload_kv.remote()
+        await rollout_manager.initial_lora_slot_audit.remote("before_decode")
         await rollout_manager.initial_lora_zero_effect_probe.remote("after", initial_lora_probe)
-        await rollout_manager.initial_lora_slot_audit.remote()
+        await rollout_manager.initial_lora_slot_audit.remote("after_decode")
         initial_lora_probe_kv_loaded = True
 
     if args.check_weight_update_equal:
@@ -240,6 +242,10 @@ async def train(args):
             await actor_model.update_weights(rollout_id=rollout_id)
             if args.offload_rollout:
                 await rollout_manager.onload_kv.remote()
+            if os.environ.get(GATE_PATH_ENV) and rollout_id == 0:
+                smoke_receipt = await rollout_manager.canary_post_update_operational_probe.remote()
+                gate_receipt = validate_and_write_update1_gate(args, smoke_receipt)
+                logger.info("[CANARY-UPDATE1-GATE] %s", json.dumps(gate_receipt, sort_keys=True))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             await rollout_manager.eval.remote(rollout_id)

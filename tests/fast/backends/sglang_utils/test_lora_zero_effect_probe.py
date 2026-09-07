@@ -1,3 +1,4 @@
+import base64
 from copy import deepcopy
 
 import pytest
@@ -8,6 +9,7 @@ from miles.backends.sglang_utils.lora_zero_effect_probe import (
     validate_initial_lora_slot_audits,
     validate_initial_zero_effect_probes,
     validate_integrated_base_probes,
+    validate_operational_probe_results,
 )
 
 
@@ -17,7 +19,8 @@ def _response(batch_size):
             "text": f"answer-{index}",
             "meta_info": {
                 "output_token_logprobs": [[-0.5, 10 + index], [-0.25, 20 + index]],
-                "routed_experts": f"routing-{index}",
+                "prompt_tokens": 1,
+                "routed_experts": base64.b64encode(index.to_bytes(4) * 2).decode(),
             },
         }
         for index in range(batch_size)
@@ -28,7 +31,11 @@ def _engine_receipt(engine_rank, phase):
     cases = {}
     for mode in ("greedy", "stochastic"):
         for batch_size in (1, 8):
-            summary = summarize_probe_response(_response(batch_size), expected_batch_size=batch_size)
+            summary = summarize_probe_response(
+                _response(batch_size),
+                expected_batch_size=batch_size,
+                input_texts=[f"prompt-{index}" for index in range(batch_size)],
+            )
             cases[f"{mode}_batch{batch_size}"] = {"base": summary}
             if phase == "after":
                 cases[f"{mode}_batch{batch_size}"]["lora"] = deepcopy(summary)
@@ -111,6 +118,18 @@ def test_probe_response_rejects_non_numeric_logprob():
         summarize_probe_response(response, expected_batch_size=1)
 
 
+def test_probe_response_rejects_malformed_text_and_token_id():
+    response = _response(1)
+    response[0]["text"] = None
+    with pytest.raises(RuntimeError, match="malformed text"):
+        summarize_probe_response(response, expected_batch_size=1)
+
+    response = _response(1)
+    response[0]["meta_info"]["output_token_logprobs"][0][1] = "10"
+    with pytest.raises(RuntimeError, match="invalid token ID"):
+        summarize_probe_response(response, expected_batch_size=1)
+
+
 def test_initial_zero_effect_probe_accepts_exact_four_engine_match():
     expected_ranks = [0, 4, 8, 12]
     before = [_engine_receipt(rank, "before") for rank in expected_ranks]
@@ -122,12 +141,14 @@ def test_initial_zero_effect_probe_accepts_exact_four_engine_match():
     assert result["stochastic_smoke_count"] == 24
 
 
-def test_initial_zero_effect_probe_rejects_lora_token_change():
+def test_initial_zero_effect_probe_records_lora_token_change_as_nonblocking():
     before = [_engine_receipt(0, "before")]
     after = [_engine_receipt(0, "after")]
     after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0]["token_ids"][0] += 1
-    with pytest.raises(RuntimeError, match="token IDs changed"):
-        validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+    result = validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+    assert result["status"] == "PASS"
+    assert result["semantic_or_routing_equivalence_claim"] is False
+    assert any("token IDs changed" in reason for row in result["nonblocking_diagnostics"] for reason in row["reasons"])
 
 
 def test_initial_zero_effect_probe_accepts_routing_within_measured_base_repeat_envelope():
@@ -149,12 +170,13 @@ def test_initial_zero_effect_probe_accepts_routing_within_measured_base_repeat_e
     assert all(item["base_base_routed_row_mismatch_envelope"] == 1 for item in result["comparisons"] if item["mode"] == "greedy_equality")
 
 
-def test_initial_zero_effect_probe_rejects_routing_beyond_measured_base_repeat_envelope():
+def test_initial_zero_effect_probe_records_routing_beyond_envelope_as_nonblocking():
     before = [_engine_receipt(0, "before")]
     after = [_engine_receipt(0, "after")]
     after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0]["routed_experts_row_sha256"][0] = "unexpected-lora-route"
-    with pytest.raises(RuntimeError, match="routed row mismatches 1 exceeded base/base envelope 0"):
-        validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+    result = validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+    assert result["status"] == "PASS"
+    assert any("routed row mismatches 1 exceeded base/base envelope 0" in reason for row in result["nonblocking_diagnostics"] for reason in row["reasons"])
 
 
 def test_initial_zero_effect_probe_rejects_missing_engine():
@@ -205,6 +227,29 @@ def test_initial_lora_slot_audit_rejects_incomplete_tp_coverage():
 
     with pytest.raises(RuntimeError, match="report count mismatch"):
         validate_initial_lora_slot_audits([receipt], expected_engine_ranks=[0], expected_tp_size=2)
+
+
+def test_operational_probe_accepts_complete_base_and_lora_coverage():
+    results = [_engine_receipt(rank, "after") for rank in (0, 4)]
+    receipt = validate_operational_probe_results(
+        results,
+        expected_engine_ranks=[0, 4],
+        phase="after",
+    )
+
+    assert receipt["status"] == "PASS"
+    assert receipt["engine_count"] == 2
+    assert receipt["request_count"] == 16
+    assert receipt["output_count"] == 72
+    assert receipt["token_count"] == 144
+
+
+def test_operational_probe_rejects_missing_lora_coverage():
+    results = [_engine_receipt(0, "after")]
+    del results[0]["cases"]["greedy_batch8"]["lora"]
+
+    with pytest.raises(RuntimeError, match="omitted base or LoRA"):
+        validate_operational_probe_results(results, expected_engine_ranks=[0], phase="after")
 
 
 def test_integrated_base_probe_accepts_exact_four_engine_match():

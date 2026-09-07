@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
 # are the actor (role="actor") form with no role prefix.
 TARGET_METRIC_KEYS: tuple[str, ...] = (
     "train/grad_norm",
+    "train/loss",
     "train/ppo_kl",
+    "train/tis_clipfrac",
     "train/train_rollout_logprob_abs_diff",
     "train/train_rollout_kl",
     "rollout/raw_reward",

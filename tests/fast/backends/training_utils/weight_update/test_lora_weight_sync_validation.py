@@ -19,6 +19,7 @@ import torch
 from miles.backends.training_utils.weight_update.protocols.cuda_ipc import (
     _IPC_TRANSFER_BUFFERS,
     _copy_into_persistent_transfer_buffer,
+    _wait_for_colocated_transfer_ack,
 )
 from miles.backends.training_utils.weight_update.session import (
     check_weight_sync_results,
@@ -574,3 +575,93 @@ class TestPersistentIpcTransferBuffer:
         _copy_into_persistent_transfer_buffer(torch.zeros(4, dtype=torch.float32), minimum_bytes=16)
         with pytest.raises(RuntimeError, match="exceeds the persistent"):
             _copy_into_persistent_transfer_buffer(torch.zeros(5, dtype=torch.float32), minimum_bytes=16)
+
+
+class TestColocatedTransferAckFence:
+    def test_non_source_waits_for_receiver_ack_before_reuse(self):
+        events = []
+
+        def receive_ack(status, *, src, group):
+            events.append(("broadcast", src, group))
+            status[0] = {"success": True}
+
+        with (
+            patch(f"{_UW_MODULE}.dist.get_rank", return_value=1),
+            patch(f"{_UW_MODULE}.dist.broadcast_object_list", side_effect=receive_ack),
+            patch(f"{_UW_MODULE}.ray.get") as ray_get,
+        ):
+            _wait_for_colocated_transfer_ack(
+                refs=[], ipc_gather_src=0, ipc_gather_group="group"
+            )
+
+        ray_get.assert_not_called()
+        assert events == [("broadcast", 0, "group")]
+
+    def test_source_broadcasts_ack_only_after_delayed_receiver_completes(self):
+        events = []
+
+        def delayed_receiver_ack(refs):
+            events.append(("receiver_ack", refs))
+            return [(True, "Success")]
+
+        def publish_ack(status, *, src, group):
+            events.append(("broadcast", status[0].copy(), src, group))
+
+        with (
+            patch(f"{_UW_MODULE}.dist.get_rank", return_value=0),
+            patch(f"{_UW_MODULE}.dist.broadcast_object_list", side_effect=publish_ack),
+            patch(f"{_UW_MODULE}.ray.get", side_effect=delayed_receiver_ack),
+        ):
+            _wait_for_colocated_transfer_ack(
+                refs=["receiver-ref"], ipc_gather_src=0, ipc_gather_group="group"
+            )
+
+        assert events == [
+            ("receiver_ack", ["receiver-ref"]),
+            ("broadcast", {"success": True}, 0, "group"),
+        ]
+
+    def test_source_broadcasts_failure_before_all_ranks_raise(self):
+        published = []
+
+        def publish_failure(status, *, src, group):
+            published.append((status[0].copy(), src, group))
+
+        with (
+            patch(f"{_UW_MODULE}.dist.get_rank", return_value=0),
+            patch(f"{_UW_MODULE}.dist.broadcast_object_list", side_effect=publish_failure),
+            patch(f"{_UW_MODULE}.ray.get", side_effect=ValueError("receiver rejected bucket")),
+            pytest.raises(RuntimeError, match="ValueError: receiver rejected bucket"),
+        ):
+            _wait_for_colocated_transfer_ack(
+                refs=["receiver-ref"], ipc_gather_src=0, ipc_gather_group="group"
+            )
+
+        assert published == [
+            (
+                {
+                    "success": False,
+                    "error_type": "ValueError",
+                    "message": "receiver rejected bucket",
+                },
+                0,
+                "group",
+            )
+        ]
+
+    def test_non_source_raises_broadcast_receiver_failure(self):
+        def receive_failure(status, *, src, group):
+            status[0] = {
+                "success": False,
+                "error_type": "HTTPError",
+                "message": "400 checksum mismatch",
+            }
+
+        with (
+            patch(f"{_UW_MODULE}.dist.get_rank", return_value=7),
+            patch(f"{_UW_MODULE}.dist.broadcast_object_list", side_effect=receive_failure),
+            pytest.raises(RuntimeError, match="HTTPError: 400 checksum mismatch"),
+        ):
+            _wait_for_colocated_transfer_ack(
+                refs=[], ipc_gather_src=0, ipc_gather_group="group"
+            )

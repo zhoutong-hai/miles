@@ -226,8 +226,54 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
                 refs = (refs or []) + refs_distributed
         # This is the transfer-buffer reuse boundary: every receiver has copied
         # the bucket into memory it owns before its RPC can acknowledge here.
-        check_weight_sync_results(ray.get(refs or []), is_lora=False)
+        # Only the gather source owns the Ray ref, but every rank contributed a
+        # process-local persistent CUDA-IPC buffer.  Broadcast the ACK before
+        # any contributor can return and refresh that buffer for the next
+        # bucket.  The source also broadcasts failures so peers do not hang or
+        # race ahead after a rejected transfer.
+        _wait_for_colocated_transfer_ack(
+            refs=refs,
+            ipc_gather_src=self._ipc_gather_src,
+            ipc_gather_group=self._ipc_gather_group,
+        )
         del long_lived_tensors
+
+
+def _wait_for_colocated_transfer_ack(
+    *,
+    refs: list[ObjectRef] | None,
+    ipc_gather_src: int,
+    ipc_gather_group,
+) -> None:
+    """Fence group-wide CUDA-IPC buffer reuse on the receiver's copy ACK."""
+    is_gather_src = dist.get_rank() == ipc_gather_src
+    status = [None]
+    if is_gather_src:
+        try:
+            check_weight_sync_results(ray.get(refs or []), is_lora=False)
+            status[0] = {"success": True}
+        except Exception as exc:
+            status[0] = {
+                "success": False,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+
+    dist.broadcast_object_list(
+        status,
+        src=ipc_gather_src,
+        group=ipc_gather_group,
+    )
+    result = status[0]
+    if not isinstance(result, dict) or type(result.get("success")) is not bool:
+        raise RuntimeError(
+            "colocated weight-sync source broadcast a malformed transfer ACK"
+        )
+    if not result["success"]:
+        raise RuntimeError(
+            "colocated weight-sync receiver rejected the transfer: "
+            f"{result.get('error_type', 'Error')}: {result.get('message', '')}"
+        )
 
 
 def _send_to_colocated_engine(

@@ -33,9 +33,7 @@ async def train(args):
     init_tracking(args)
 
     if args.colocate_memory_peak_device == "gpu":
-        assert (
-            args.offload_train and args.offload_rollout
-        ), "--colocate-memory-peak-device gpu requires --offload-train and --offload-rollout"
+        assert args.offload_train and args.offload_rollout, "--colocate-memory-peak-device gpu requires --offload-train and --offload-rollout"
         assert not args.use_critic, "--colocate-memory-peak-device gpu is not wired for the critic path"
         if is_lora_enabled(args):
             raise NotImplementedError("--colocate-memory-peak-device gpu only supports full-parameter training")
@@ -79,9 +77,7 @@ async def train(args):
         await rollout_manager.onload_weights.remote()
         await rollout_manager.onload_kv.remote()
         integrated_pre_trainer_probe = await rollout_manager.integrated_base_probe.remote("pre_trainer")
-        integrated_pre_trainer_checksums = flatten_inference_engine_checksums(
-            await rollout_manager.check_weights.remote("checksum", selector="target")
-        )
+        integrated_pre_trainer_checksums = flatten_inference_engine_checksums(await rollout_manager.check_weights.remote("checksum", selector="target"))
         await rollout_manager.offload.remote(tags=get_rollout_offload_tags(args))
 
     # create the actor and critic models
@@ -93,20 +89,9 @@ async def train(args):
         integrated_post_trainer_probes = []
         integrated_post_trainer_checksums = []
         for _ in range(3):
-            integrated_post_trainer_probes.append(
-                await rollout_manager.integrated_base_probe.remote(
-                    "post_trainer", integrated_pre_trainer_probe["engines"]
-                )
-            )
-            integrated_post_trainer_checksums.append(
-                flatten_inference_engine_checksums(
-                    await rollout_manager.check_weights.remote("checksum", selector="target")
-                )
-            )
-        if any(
-            integrated_pre_trainer_checksums != post_checksums
-            for post_checksums in integrated_post_trainer_checksums
-        ):
+            integrated_post_trainer_probes.append(await rollout_manager.integrated_base_probe.remote("post_trainer", integrated_pre_trainer_probe["engines"]))
+            integrated_post_trainer_checksums.append(flatten_inference_engine_checksums(await rollout_manager.check_weights.remote("checksum", selector="target")))
+        if any(integrated_pre_trainer_checksums != post_checksums for post_checksums in integrated_post_trainer_checksums):
             raise RuntimeError("rollout weight checksums changed across trainer load/offload")
         receipt_path = os.environ.get("MILES_INTEGRATED_BASE_PROBE_RECEIPT")
         if not receipt_path:
@@ -166,6 +151,7 @@ async def train(args):
     if args.check_initial_lora_zero_effect:
         await rollout_manager.onload_kv.remote()
         await rollout_manager.initial_lora_zero_effect_probe.remote("after", initial_lora_probe)
+        await rollout_manager.initial_lora_slot_audit.remote()
         initial_lora_probe_kv_loaded = True
 
     if args.check_weight_update_equal:
@@ -236,17 +222,13 @@ async def train(args):
         remove_rollout_data_refs(args, rollout_data_pack)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
-        if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        ):
+        if external_save or should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             await save(rollout_id, force_sync=external_save)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
         # nothing generates after the last rollout, so its offload/reload/update only serves a final eval
-        if rollout_id + 1 < args.num_rollout or should_run_periodic_action(
-            rollout_id, args.eval_interval, num_rollout_per_epoch
-        ):
+        if rollout_id + 1 < args.num_rollout or should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             if args.colocate_memory_peak_device == "gpu":
                 await actor_model.clear_memory()
                 await rollout_manager.onload_weights.remote()
@@ -262,10 +244,7 @@ async def train(args):
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             await rollout_manager.eval.remote(rollout_id)
 
-        if (
-            args.debug_exit_after_rollout is not None
-            and (rollout_id - args.start_rollout_id + 1) >= args.debug_exit_after_rollout
-        ):
+        if args.debug_exit_after_rollout is not None and (rollout_id - args.start_rollout_id + 1) >= args.debug_exit_after_rollout:
             logger.info(
                 "debug_exit_after_rollout=%d reached at rollout_id=%d, exiting",
                 args.debug_exit_after_rollout,

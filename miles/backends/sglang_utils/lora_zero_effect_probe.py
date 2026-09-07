@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -48,13 +49,9 @@ def summarize_probe_response(
     prefix = f"{context}: " if context else ""
     outputs = response if isinstance(response, list) else [response]
     if len(outputs) != expected_batch_size:
-        raise RuntimeError(
-            f"{prefix}probe response batch mismatch: expected={expected_batch_size} observed={len(outputs)}"
-        )
+        raise RuntimeError(f"{prefix}probe response batch mismatch: expected={expected_batch_size} observed={len(outputs)}")
     if input_texts is not None and len(input_texts) != expected_batch_size:
-        raise RuntimeError(
-            f"{prefix}probe input batch mismatch: expected={expected_batch_size} observed={len(input_texts)}"
-        )
+        raise RuntimeError(f"{prefix}probe input batch mismatch: expected={expected_batch_size} observed={len(input_texts)}")
 
     summaries = []
     for output_index, output in enumerate(outputs):
@@ -71,26 +68,17 @@ def summarize_probe_response(
         logprobs: list[float] = []
         for token_index, item in enumerate(raw_logprobs):
             if not isinstance(item, Sequence) or len(item) < 2:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} token {token_index} has malformed logprob data"
-                )
+                raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has malformed logprob data")
             raw_logprob, raw_token_id = item[0], item[1]
             if raw_logprob is None:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} token {token_index} has null output logprob; "
-                    "the server likely serialized a non-finite value"
-                )
+                raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has null output logprob; the server likely serialized a non-finite value")
             try:
                 logprob = float(raw_logprob)
                 token_id = int(raw_token_id)
             except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} token {token_index} has non-numeric logprob/token data"
-                ) from exc
+                raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has non-numeric logprob/token data") from exc
             if not math.isfinite(logprob):
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} token {token_index} has non-finite logprob"
-                )
+                raise RuntimeError(f"{prefix}probe output {output_index} token {token_index} has non-finite logprob")
             logprobs.append(logprob)
             token_ids.append(token_id)
 
@@ -103,14 +91,10 @@ def summarize_probe_response(
             try:
                 raw_routed = base64.b64decode(routed.encode("ascii"), validate=True)
             except (ValueError, UnicodeEncodeError) as exc:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} has malformed routed-expert evidence"
-                ) from exc
+                raise RuntimeError(f"{prefix}probe output {output_index} has malformed routed-expert evidence") from exc
             position_count = prompt_tokens + len(token_ids) - 1
             if position_count <= 0 or len(raw_routed) % 4:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} routed-expert rows are not position aligned"
-                )
+                raise RuntimeError(f"{prefix}probe output {output_index} routed-expert rows are not position aligned")
             if num_layers is not None:
                 routed_elements = len(raw_routed) // 4
                 topk = routed_elements // max(1, position_count * num_layers)
@@ -118,18 +102,11 @@ def summarize_probe_response(
                 if routed_elements == (position_count + 1) * row_elements:
                     raw_routed = raw_routed[: position_count * row_elements * 4]
                 elif routed_elements != position_count * row_elements:
-                    raise RuntimeError(
-                        f"{prefix}probe output {output_index} routed-expert elements are not model aligned"
-                    )
+                    raise RuntimeError(f"{prefix}probe output {output_index} routed-expert elements are not model aligned")
             if len(raw_routed) % position_count:
-                raise RuntimeError(
-                    f"{prefix}probe output {output_index} routed-expert bytes are not position aligned"
-                )
+                raise RuntimeError(f"{prefix}probe output {output_index} routed-expert bytes are not position aligned")
             row_bytes = len(raw_routed) // position_count
-            routed_rows = [
-                hashlib.sha256(raw_routed[start : start + row_bytes]).hexdigest()
-                for start in range(0, len(raw_routed), row_bytes)
-            ]
+            routed_rows = [hashlib.sha256(raw_routed[start : start + row_bytes]).hexdigest() for start in range(0, len(raw_routed), row_bytes)]
         summaries.append(
             {
                 "text": str(output.get("text", "")),
@@ -137,11 +114,7 @@ def summarize_probe_response(
                 "logprobs": logprobs,
                 "routed_experts_sha256": hashlib.sha256(routed.encode()).hexdigest(),
                 "routed_experts_row_sha256": routed_rows,
-                "input_text_sha256": (
-                    hashlib.sha256(input_texts[output_index].encode()).hexdigest()
-                    if input_texts is not None
-                    else None
-                ),
+                "input_text_sha256": (hashlib.sha256(input_texts[output_index].encode()).hexdigest() if input_texts is not None else None),
             }
         )
     return {"batch_size": expected_batch_size, "outputs": summaries}
@@ -176,9 +149,7 @@ def _compare_case(left: Mapping[str, Any], right: Mapping[str, Any], *, label: s
     return max_abs_logprob_diff
 
 
-def _compare_case_diagnostics(
-    left: Mapping[str, Any], right: Mapping[str, Any], *, label: str
-) -> dict[str, Any]:
+def _compare_case_diagnostics(left: Mapping[str, Any], right: Mapping[str, Any], *, label: str) -> dict[str, Any]:
     """Collect every semantic and routed-row delta before making a gate decision."""
     if left.get("batch_size") != right.get("batch_size"):
         raise RuntimeError(f"{label}: batch size changed")
@@ -264,20 +235,13 @@ def validate_initial_zero_effect_probes(
     for expected_phase, results in (("before", before_results), ("after", after_results)):
         for item in results:
             if item.get("schema_version") != 1 or item.get("phase") != expected_phase:
-                raise RuntimeError(
-                    f"zero-effect probe invalid {expected_phase} receipt: "
-                    f"schema={item.get('schema_version')} phase={item.get('phase')!r}"
-                )
+                raise RuntimeError(f"zero-effect probe invalid {expected_phase} receipt: schema={item.get('schema_version')} phase={item.get('phase')!r}")
     before_by_engine = {int(item["engine_rank"]): item for item in before_results}
     after_by_engine = {int(item["engine_rank"]): item for item in after_results}
     if len(before_by_engine) != len(before_results) or len(after_by_engine) != len(after_results):
         raise RuntimeError("duplicate engine rank in zero-effect probe")
     if set(before_by_engine) != expected_ranks or set(after_by_engine) != expected_ranks:
-        raise RuntimeError(
-            "zero-effect probe engine coverage mismatch: "
-            f"expected={sorted(expected_ranks)} before={sorted(before_by_engine)} "
-            f"after={sorted(after_by_engine)}"
-        )
+        raise RuntimeError(f"zero-effect probe engine coverage mismatch: expected={sorted(expected_ranks)} before={sorted(before_by_engine)} after={sorted(after_by_engine)}")
 
     comparisons = []
     diagnostic_failures = []
@@ -302,12 +266,8 @@ def validate_initial_zero_effect_probes(
                 )
                 for index, repeat in enumerate(baseline_repeats[1:], start=1)
             ]
-            base_envelope_logprob = max(
-                [1e-5, *(item["max_abs_logprob_diff"] for item in baseline_deltas)]
-            )
-            base_envelope_routed_rows = max(
-                [0, *(item["routed_row_mismatches"] for item in baseline_deltas)]
-            )
+            base_envelope_logprob = max([1e-5, *(item["max_abs_logprob_diff"] for item in baseline_deltas)])
+            base_envelope_routed_rows = max([0, *(item["routed_row_mismatches"] for item in baseline_deltas)])
             base_deltas = [
                 _compare_case_diagnostics(
                     baseline_repeats[0],
@@ -322,22 +282,14 @@ def validate_initial_zero_effect_probes(
                     post_lora,
                     label=f"engine={engine_rank} {case} post-base/zero-lora repeat={index}",
                 )
-                for index, (post_base, post_lora) in enumerate(
-                    zip(post_base_repeats, post_lora_repeats, strict=True)
-                )
+                for index, (post_base, post_lora) in enumerate(zip(post_base_repeats, post_lora_repeats, strict=True))
             ]
             for delta in [*baseline_deltas, *base_deltas, *lora_deltas]:
                 reasons = list(delta["issues"])
                 if delta["max_abs_logprob_diff"] > base_envelope_logprob:
-                    reasons.append(
-                        f"max logprob difference {delta['max_abs_logprob_diff']} exceeded "
-                        f"base/base envelope {base_envelope_logprob}"
-                    )
+                    reasons.append(f"max logprob difference {delta['max_abs_logprob_diff']} exceeded base/base envelope {base_envelope_logprob}")
                 if delta["routed_row_mismatches"] > base_envelope_routed_rows:
-                    reasons.append(
-                        f"routed row mismatches {delta['routed_row_mismatches']} exceeded "
-                        f"base/base envelope {base_envelope_routed_rows}"
-                    )
+                    reasons.append(f"routed row mismatches {delta['routed_row_mismatches']} exceeded base/base envelope {base_envelope_routed_rows}")
                 if reasons:
                     diagnostic_failures.append({"label": delta["label"], "reasons": reasons, "delta": delta})
 
@@ -387,11 +339,89 @@ def validate_initial_zero_effect_probes(
     if diagnostic_failures:
         result["status"] = "FAIL"
         result["diagnostic_failures"] = diagnostic_failures
-        raise RuntimeError(
-            "zero-effect diagnostic gate failed: "
-            + json.dumps(result, sort_keys=True, separators=(",", ":"))
-        )
+        raise RuntimeError("zero-effect diagnostic gate failed: " + json.dumps(result, sort_keys=True, separators=(",", ":")))
     return result
+
+
+def validate_initial_lora_slot_audits(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    expected_engine_ranks: Sequence[int],
+    expected_tp_size: int,
+) -> dict[str, Any]:
+    """Require complete post-probe slot-integrity evidence from every TP rank."""
+
+    expected_engines = {int(rank) for rank in expected_engine_ranks}
+    if not expected_engines or len(expected_engines) != len(expected_engine_ranks):
+        raise RuntimeError("LoRA slot audit expected engine ranks are empty or duplicated")
+    if type(expected_tp_size) is not int or expected_tp_size <= 0:
+        raise RuntimeError("LoRA slot audit expected TP size must be positive")
+    by_engine = {int(item["engine_rank"]): item for item in results}
+    if len(by_engine) != len(results) or set(by_engine) != expected_engines:
+        raise RuntimeError(f"LoRA slot audit engine coverage mismatch: expected={sorted(expected_engines)} observed={sorted(by_engine)}")
+
+    hash_pattern = re.compile(r"[0-9a-f]{64}")
+    expected_tp_ranks = list(range(expected_tp_size))
+    normalized = []
+    for engine_rank in sorted(by_engine):
+        result = by_engine[engine_rank]
+        if result.get("success") is not True:
+            raise RuntimeError(f"engine={engine_rank} LoRA slot audit failed: {result.get('error_message')}")
+        reports = result.get("rank_reports")
+        if not isinstance(reports, list) or len(reports) != expected_tp_size:
+            raise RuntimeError(f"engine={engine_rank} LoRA slot audit report count mismatch")
+        observed_tp_ranks = [report.get("tp_rank") for report in reports]
+        report_by_rank = {report.get("tp_rank"): report for report in reports}
+        if any(type(rank) is not int for rank in observed_tp_ranks) or len(report_by_rank) != len(reports) or sorted(observed_tp_ranks) != expected_tp_ranks:
+            raise RuntimeError(f"engine={engine_rank} LoRA slot audit TP coverage mismatch: expected={expected_tp_ranks} observed={observed_tp_ranks}")
+        for tp_rank, report in sorted(report_by_rank.items()):
+            base_slot = report.get("base_slot_id")
+            adapter_slot = report.get("adapter_slot_id")
+            hashes = (
+                report.get("manifest_sha256"),
+                report.get("slot_schema_sha256"),
+                report.get("base_schema_sha256"),
+                report.get("adapter_b_schema_sha256"),
+            )
+            positive_counts = (
+                report.get("base_buffer_tensors"),
+                report.get("base_buffer_elements"),
+                report.get("adapter_b_buffer_tensors"),
+                report.get("adapter_b_buffer_elements"),
+            )
+            invalid = (
+                report.get("schema_version") != 1
+                or report.get("distinct_live_slots") is not True
+                or report.get("checksum_verified") is not True
+                or type(base_slot) is not int
+                or type(adapter_slot) is not int
+                or base_slot == adapter_slot
+                or any(type(value) is not int or value <= 0 for value in positive_counts)
+                or report.get("base_nonzero_elements") != 0
+                or report.get("adapter_b_nonzero_elements") != 0
+                or any(not isinstance(value, str) or hash_pattern.fullmatch(value) is None for value in hashes)
+            )
+            if invalid:
+                raise RuntimeError(f"engine={engine_rank} tp_rank={tp_rank} invalid LoRA slot audit: {report!r}")
+        normalized.append(
+            {
+                "engine_rank": engine_rank,
+                "rank_reports": [report_by_rank[rank] for rank in expected_tp_ranks],
+            }
+        )
+    manifest_hashes = {report["manifest_sha256"] for engine in normalized for report in engine["rank_reports"]}
+    if len(manifest_hashes) != 1:
+        raise RuntimeError(f"LoRA slot audit manifest disagreement: {sorted(manifest_hashes)}")
+    return {
+        "schema_version": 1,
+        "status": "PASS",
+        "interpretation": "inference-independent resident-slot integrity",
+        "engine_count": len(normalized),
+        "tp_ranks_per_engine": expected_tp_size,
+        "rank_report_count": len(normalized) * expected_tp_size,
+        "manifest_sha256": next(iter(manifest_hashes)),
+        "engines": normalized,
+    }
 
 
 def validate_integrated_base_probes(
@@ -408,16 +438,10 @@ def validate_integrated_base_probes(
     def index_results(label: str, results: Sequence[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
         for item in results:
             if item.get("schema_version") != 1 or item.get("phase") != "before":
-                raise RuntimeError(
-                    f"integrated base probe invalid {label} receipt: "
-                    f"schema={item.get('schema_version')} phase={item.get('phase')!r}"
-                )
+                raise RuntimeError(f"integrated base probe invalid {label} receipt: schema={item.get('schema_version')} phase={item.get('phase')!r}")
         indexed = {int(item["engine_rank"]): item for item in results}
         if len(indexed) != len(results) or set(indexed) != expected_ranks:
-            raise RuntimeError(
-                f"integrated base probe engine coverage mismatch for {label}: "
-                f"expected={sorted(expected_ranks)} observed={sorted(indexed)}"
-            )
+            raise RuntimeError(f"integrated base probe engine coverage mismatch for {label}: expected={sorted(expected_ranks)} observed={sorted(indexed)}")
         return indexed
 
     before_by_engine = index_results("pre_trainer", pre_trainer_results)
@@ -446,9 +470,7 @@ def validate_integrated_base_probes(
             ):
                 smoke = receipt["cases"][f"stochastic_batch{batch_size}"]["base"]
                 if smoke.get("batch_size") != batch_size or not smoke.get("outputs"):
-                    raise RuntimeError(
-                        f"engine={engine_rank} stochastic_batch{batch_size} {stage}: incomplete smoke result"
-                    )
+                    raise RuntimeError(f"engine={engine_rank} stochastic_batch{batch_size} {stage}: incomplete smoke result")
     return {
         "status": "PASS",
         "engine_count": len(expected_ranks),

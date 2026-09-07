@@ -49,10 +49,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     # If we're already getting local IDs, allow them
     if 0 <= physical_gpu_id < len(visible):
         return physical_gpu_id
-    raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
-        f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
-    )
+    raise RuntimeError(f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. Expected one of {visible} (physical) or 0..{len(visible) - 1} (local).")
 
 
 def _get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
@@ -261,9 +258,7 @@ class SGLangEngine(RayActor):
             for name in external_engine_need_check_fields:
                 expect_value = expect_server_args.get(name)
                 actual_value = actual_server_args.get(name)
-                assert (
-                    actual_value == expect_value
-                ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
+                assert actual_value == expect_value, f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
         _wait_server_healthy(
             base_url=f"http://{self.server_host}:{self.server_port}",
@@ -284,29 +279,20 @@ class SGLangEngine(RayActor):
             server_args_dict["use_ray"] = True
             server_args_dict["enable_rdt_weight_sync"] = True
             assert self.pg_bundles
-        logger.info(
-            f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
-            f"{' (use_ray=True for RDT)' if use_rdt else ''}"
-        )
+        logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}{' (use_ray=True for RDT)' if use_rdt else ''}")
         # ServerArgs refuses writes once its declarations materialise, so the ipv6
         # host loses its brackets here rather than at the launch sites. The dict
         # keeps the bracketed form, which self.server_host uses to build urls.
         server_args = ServerArgs(**{**server_args_dict, "host": server_args_dict["host"].strip("[]")})
         if use_rdt:
-            self._sglang_server_actor, self._scheduler_actors = _launch_sglang_server(
-                server_args, bundle_indices=self.pg_bundles
-            )
+            self._sglang_server_actor, self._scheduler_actors = _launch_sglang_server(server_args, bundle_indices=self.pg_bundles)
         else:
             self.process = launch_server_process(server_args)
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
-                assert (
-                    self.worker_type == "regular"
-                ), "pd disaggregation is not supported in old router or miles router."
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
-                )
+                assert self.worker_type == "regular", "pd disaggregation is not supported in old router or miles router."
+                response = requests.post(f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}")
             else:
                 payload = {
                     "url": f"http://{self.server_host}:{self.server_port}",
@@ -411,11 +397,7 @@ class SGLangEngine(RayActor):
                                 expected_batch_size=batch_size,
                                 input_texts=payload["text"],
                                 num_layers=self.args.num_layers,
-                                context=(
-                                    f"engine_rank={self.rank} phase={phase} mode={mode} "
-                                    f"batch_size={batch_size} variant={variant}"
-                                    f" repeat={repeat}"
-                                ),
+                                context=(f"engine_rank={self.rank} phase={phase} mode={mode} batch_size={batch_size} variant={variant} repeat={repeat}"),
                             )
                         )
                 for variant, _ in variants:
@@ -425,6 +407,16 @@ class SGLangEngine(RayActor):
                         case[f"{variant}_repeats"] = summaries
                 cases[f"{mode}_batch{batch_size}"] = case
         return {"schema_version": 1, "phase": phase, "engine_rank": self.rank, "cases": cases}
+
+    def initial_lora_slot_audit(self):
+        """Audit every TP rank after the paired initial base/LoRA probes."""
+
+        if self.node_rank != 0:
+            return None
+        from miles.utils.lora import LORA_ADAPTER_NAME
+
+        result = self._make_request("audit_lora_adapter", {"lora_name": LORA_ADAPTER_NAME})
+        return {"engine_rank": self.rank, **result}
 
     def startup_finite_probe(self):
         """Run only the production CUDA-graph greedy batch-8 base case."""
@@ -448,10 +440,10 @@ class SGLangEngine(RayActor):
             "case": "greedy_batch8_base",
             "response_sha256": hashlib.sha256(response.content).hexdigest(),
             "summary": summarize_probe_response(
-            response.json(),
-            expected_batch_size=8,
-            num_layers=self.args.num_layers,
-            context=f"engine_rank={self.rank} startup finite probe greedy batch_size=8 base",
+                response.json(),
+                expected_batch_size=8,
+                num_layers=self.args.num_layers,
+                context=f"engine_rank={self.rank} startup finite probe greedy batch_size=8 base",
             ),
         }
 
@@ -617,9 +609,7 @@ class SGLangEngine(RayActor):
             worker_url = f"http://{self.server_host}:{self.server_port}"
             response = None
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
-                )
+                response = requests.post(f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}")
             elif parse(sglang_router.__version__) < parse("0.3.0"):
                 worker_url = quote(worker_url, safe="")
                 response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
@@ -629,9 +619,7 @@ class SGLangEngine(RayActor):
                     for worker in all_workers:
                         if worker["url"] == worker_url:
                             worker_id = worker["id"]
-                            response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
-                            )
+                            response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}")
                             break
                     else:
                         logger.warning(f"Worker {worker_url} not found in router during shutdown.")
@@ -686,9 +674,7 @@ class SGLangEngine(RayActor):
             {"tags": tags},
         )
 
-    def check_weights(
-        self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
-    ):
+    def check_weights(self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None):
         payload = {"action": action, "allow_quant_error": allow_quant_error, "selector": selector}
         if skip_list is not None:
             # sglang's CheckWeightsReqInput names this field `skip_tensor_list`.
@@ -709,9 +695,7 @@ class SGLangEngine(RayActor):
             },
         )
 
-    def update_weights_from_disk(
-        self, model_path: str, load_format: str | None = None, weight_version: str | None = None
-    ):
+    def update_weights_from_disk(self, model_path: str, load_format: str | None = None, weight_version: str | None = None):
         """Reload weights from *model_path* without restarting the engine.
 
         Used for non-updatable (frozen) models that overlap with megatron (after offload,
@@ -909,9 +893,7 @@ def _compute_server_args(
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
         kwargs.setdefault("load_balance_method", "round_robin")
-        assert (
-            disaggregation_bootstrap_port is not None
-        ), "disaggregation_bootstrap_port must be set for prefill worker"
+        assert disaggregation_bootstrap_port is not None, "disaggregation_bootstrap_port must be set for prefill worker"
         kwargs["disaggregation_bootstrap_port"] = disaggregation_bootstrap_port
     elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
@@ -937,9 +919,7 @@ def _compute_server_args(
         # Keep one slot for the base-model sentinel and one for the resident
         # single LoRA so base/LoRA requests (including the zero-effect gate) can
         # coexist.  The ordinary backed-up path can retain its single-slot LRU.
-        kwargs["max_loras_per_batch"] = (
-            2 if getattr(args, "sglang_lora_no_cpu_backup", False) else 1
-        )
+        kwargs["max_loras_per_batch"] = 2 if getattr(args, "sglang_lora_no_cpu_backup", False) else 1
         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
         if sglang_lora_target_all_sentinel(args):
             kwargs["lora_target_modules"] = ["all"]
@@ -960,10 +940,7 @@ def _compute_server_args(
             # this by skipping the base weight sync entirely (see
             # UpdateWeightFromTensor.update_weights).
             kwargs["enable_weights_cpu_backup"] = True
-            logger.info(
-                "LoRA + colocate: enabling SGLang enable_weights_cpu_backup=True; "
-                "the trainer will skip per-step base weight sync."
-            )
+            logger.info("LoRA + colocate: enabling SGLang enable_weights_cpu_backup=True; the trainer will skip per-step base weight sync.")
 
     # Last, so a per-group override wins over every args-derived default above.
     if sglang_overrides:

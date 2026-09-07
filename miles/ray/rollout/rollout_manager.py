@@ -9,6 +9,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from miles.backends.sglang_utils.lora_zero_effect_probe import (
     validate_initial_zero_effect_probes,
+    validate_initial_lora_slot_audits,
     validate_integrated_base_probes,
 )
 from miles.dashboard import hooks as dashboard_hooks
@@ -199,9 +200,7 @@ class RolloutManager:
 
         with timer("eval_rollout"):
             if not self.use_legacy_rollout_v1:
-                result = await asyncio.to_thread(
-                    call_rollout_function, self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id)
-                )
+                result = await asyncio.to_thread(call_rollout_function, self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id))
             else:
                 result = await asyncio.to_thread(
                     call_rollout_fn,
@@ -217,9 +216,7 @@ class RolloutManager:
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 
-    async def _eval_checkpoint(
-        self, rollout_id: int, hf_dir: str | None, export_time_seconds: float | None, require_marker: bool
-    ):
+    async def _eval_checkpoint(self, rollout_id: int, hf_dir: str | None, export_time_seconds: float | None, require_marker: bool):
         """Evaluate a snapshot through the checkpoint eval fn (fleet or external
         backend) and log at ``rollout_id``. Every failure degrades to a skipped
         point; the lock serializes pins against a single backend."""
@@ -233,9 +230,7 @@ class RolloutManager:
             version = str(rollout_id)
             try:
                 state = await self._eval_fleet.pin(hf_dir, version) if self._eval_fleet else None
-                eval_input = RolloutFnEvalInput(
-                    rollout_id=rollout_id, weight_version=version, hf_dir=hf_dir, generate_state=state
-                )
+                eval_input = RolloutFnEvalInput(rollout_id=rollout_id, weight_version=version, hf_dir=hf_dir, generate_state=state)
                 result = await asyncio.to_thread(call_rollout_function, self.eval_generate_rollout, eval_input)
             except EvalSkip as e:
                 return self.report_eval_skip(rollout_id, e.reason)
@@ -266,20 +261,14 @@ class RolloutManager:
                     RolloutFnTrainInput(rollout_id=rollout_id, weight_version=self.weight_version),
                 )
             else:
-                data = await asyncio.to_thread(
-                    call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
-                )
+                data = await asyncio.to_thread(call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
             data = data.samples
-            data, metadata = postprocess_rollout_data(
-                self.args, data, train_parallel_config=self.train_parallel_config
-            )
+            data, metadata = postprocess_rollout_data(self.args, data, train_parallel_config=self.train_parallel_config)
             if RolloutDataInjectionUtil.should_inject(self.args, rollout_id):
                 generated_data = data
                 data, metadata = RolloutDataInjectionUtil.load(self.args, rollout_id=rollout_id)
-                RolloutDataInjectionUtil.assert_matches_generated(
-                    self.args, generated=generated_data, injected=data, rollout_id=rollout_id
-                )
+                RolloutDataInjectionUtil.assert_matches_generated(self.args, generated=generated_data, injected=data, rollout_id=rollout_id)
                 metrics = None
 
         return data, metadata, metrics
@@ -375,10 +364,7 @@ class RolloutManager:
             case [srv]:
                 return srv
             case _:
-                raise ValueError(
-                    f"Multiple servers have update_weights=True: {[srv.model_name for srv in updatable]}. "
-                    f"Only one updatable server is supported."
-                )
+                raise ValueError(f"Multiple servers have update_weights=True: {[srv.model_name for srv in updatable]}. Only one updatable server is supported.")
 
     # -------------------------- external start/stop -----------------------------
 
@@ -399,16 +385,12 @@ class RolloutManager:
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
-    async def check_weights(
-        self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None
-    ):
+    async def check_weights(self, action: str, allow_quant_error: bool = False, selector: str = "all", skip_list: list[str] | None = None):
         # Only the updatable model is re-synced; a frozen model would always mismatch.
         srv = self._get_updatable_server()
         if srv is None:
             return []
-        return await srv.check_weights(
-            action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
-        )
+        return await srv.check_weights(action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list)
 
     async def initial_lora_zero_effect_probe(self, phase: str, before_results=None):
         """Run the initial publication decode ladder on every updatable engine."""
@@ -423,11 +405,7 @@ class RolloutManager:
         if phase == "after":
             if before_results is None:
                 raise RuntimeError("post-publication probe requires pre-publication evidence")
-            expected_engine_ranks = [
-                group.rank_offset + index * group.nodes_per_engine
-                for group in srv.server_groups
-                for index, _ in enumerate(group.engines)
-            ]
+            expected_engine_ranks = [group.rank_offset + index * group.nodes_per_engine for group in srv.server_groups for index, _ in enumerate(group.engines)]
             receipt["comparison"] = validate_initial_zero_effect_probes(
                 before_results,
                 results,
@@ -435,6 +413,25 @@ class RolloutManager:
             )
         logger.info("[LORA-ZERO-EFFECT-PROBE] %s", json.dumps(receipt, sort_keys=True))
         return results
+
+    async def initial_lora_slot_audit(self):
+        """Prove all TP slots remain intact after the paired inference probes."""
+
+        srv = self._get_updatable_server()
+        if srv is None:
+            raise RuntimeError("initial LoRA slot audit requires an updatable rollout server")
+        refs = [engine.actor_handle.initial_lora_slot_audit.remote() for engine in srv.engines]
+        results = list(await asyncio.gather(*refs))
+        if any(result is None for result in results):
+            raise RuntimeError("initial LoRA slot audit omitted an engine result")
+        expected_engine_ranks = [group.rank_offset + index * group.nodes_per_engine for group in srv.server_groups for index, _ in enumerate(group.engines)]
+        receipt = validate_initial_lora_slot_audits(
+            results,
+            expected_engine_ranks=expected_engine_ranks,
+            expected_tp_size=self.args.rollout_num_gpus_per_engine,
+        )
+        logger.info("[LORA-SLOT-AUDIT] %s", json.dumps(receipt, sort_keys=True))
+        return receipt
 
     async def integrated_base_probe(self, stage: str, pre_trainer_results=None):
         """Probe all stock-base engines around the real trainer load/offload."""
@@ -451,11 +448,7 @@ class RolloutManager:
         if stage == "post_trainer":
             if pre_trainer_results is None:
                 raise RuntimeError("post-trainer integrated probe requires pre-trainer evidence")
-            expected_engine_ranks = [
-                group.rank_offset + index * group.nodes_per_engine
-                for group in srv.server_groups
-                for index, _ in enumerate(group.engines)
-            ]
+            expected_engine_ranks = [group.rank_offset + index * group.nodes_per_engine for group in srv.server_groups for index, _ in enumerate(group.engines)]
             receipt["comparison"] = validate_integrated_base_probes(
                 pre_trainer_results,
                 results,
@@ -469,11 +462,7 @@ class RolloutManager:
         srv = self._get_updatable_server()
         if srv is None:
             raise RuntimeError("startup finite probe requires an updatable rollout server")
-        engine_ranks = [
-            group.rank_offset + index * group.nodes_per_engine
-            for group in srv.server_groups
-            for index, _ in enumerate(group.engines)
-        ]
+        engine_ranks = [group.rank_offset + index * group.nodes_per_engine for group in srv.server_groups for index, _ in enumerate(group.engines)]
         refs = [engine.actor_handle.startup_finite_probe.remote() for engine in srv.engines]
         raw_results = list(await asyncio.gather(*refs, return_exceptions=True))
         outcomes = []
@@ -533,11 +522,7 @@ class RolloutManager:
         # Only inject fault once
         self._ci_fault_injection_pending = False
 
-        if (
-            self._server
-            and self._server.server_groups[0].all_engines
-            and self._server.server_groups[0].all_engines[0].is_allocated
-        ):
+        if self._server and self._server.server_groups[0].all_engines and self._server.server_groups[0].all_engines[0].is_allocated:
             logger.info("CI Fault Injection: Simulating crash on engine 0 during generate")
             try:
                 # This will cause the ray actor to exit

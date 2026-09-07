@@ -5,6 +5,7 @@ import pytest
 from miles.backends.sglang_utils.lora_zero_effect_probe import (
     build_probe_payload,
     summarize_probe_response,
+    validate_initial_lora_slot_audits,
     validate_initial_zero_effect_probes,
     validate_integrated_base_probes,
 )
@@ -37,6 +38,34 @@ def _engine_receipt(engine_rank, phase):
         "phase": phase,
         "cases": cases,
     }
+
+
+def _slot_audit(engine_rank, tp_size=2):
+    reports = []
+    for tp_rank in range(tp_size):
+        reports.append(
+            {
+                "schema_version": 1,
+                "tp_rank": tp_rank,
+                "lora_name": "miles_lora",
+                "lora_uid": f"engine-{engine_rank}-uid",
+                "base_slot_id": 0,
+                "adapter_slot_id": 1,
+                "distinct_live_slots": True,
+                "checksum_verified": True,
+                "manifest_sha256": "a" * 64,
+                "slot_schema_sha256": "b" * 64,
+                "base_buffer_tensors": 2,
+                "base_buffer_elements": 8,
+                "base_nonzero_elements": 0,
+                "base_schema_sha256": "c" * 64,
+                "adapter_b_buffer_tensors": 1,
+                "adapter_b_buffer_elements": 4,
+                "adapter_b_nonzero_elements": 0,
+                "adapter_b_schema_sha256": "d" * 64,
+            }
+        )
+    return {"engine_rank": engine_rank, "success": True, "rank_reports": reports}
 
 
 def test_probe_payload_exercises_production_stochastic_batch_and_lora():
@@ -117,19 +146,13 @@ def test_initial_zero_effect_probe_accepts_routing_within_measured_base_repeat_e
 
     result = validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
     assert result["status"] == "PASS"
-    assert all(
-        item["base_base_routed_row_mismatch_envelope"] == 1
-        for item in result["comparisons"]
-        if item["mode"] == "greedy_equality"
-    )
+    assert all(item["base_base_routed_row_mismatch_envelope"] == 1 for item in result["comparisons"] if item["mode"] == "greedy_equality")
 
 
 def test_initial_zero_effect_probe_rejects_routing_beyond_measured_base_repeat_envelope():
     before = [_engine_receipt(0, "before")]
     after = [_engine_receipt(0, "after")]
-    after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0][
-        "routed_experts_row_sha256"
-    ][0] = "unexpected-lora-route"
+    after[0]["cases"]["greedy_batch8"]["lora"]["outputs"][0]["routed_experts_row_sha256"][0] = "unexpected-lora-route"
     with pytest.raises(RuntimeError, match="routed row mismatches 1 exceeded base/base envelope 0"):
         validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
 
@@ -153,6 +176,35 @@ def test_initial_zero_effect_probe_rejects_invalid_phase():
     after = [_engine_receipt(0, "after")]
     with pytest.raises(RuntimeError, match="invalid before receipt"):
         validate_initial_zero_effect_probes(before, after, expected_engine_ranks=[0])
+
+
+def test_initial_lora_slot_audit_accepts_complete_all_rank_proof():
+    result = validate_initial_lora_slot_audits(
+        [_slot_audit(0), _slot_audit(4)],
+        expected_engine_ranks=[0, 4],
+        expected_tp_size=2,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["interpretation"] == "inference-independent resident-slot integrity"
+    assert result["rank_report_count"] == 4
+    assert len(result["engines"]) == 2
+
+
+def test_initial_lora_slot_audit_rejects_base_sentinel_contamination():
+    receipt = _slot_audit(0)
+    receipt["rank_reports"][1]["base_nonzero_elements"] = 1
+
+    with pytest.raises(RuntimeError, match="invalid LoRA slot audit"):
+        validate_initial_lora_slot_audits([receipt], expected_engine_ranks=[0], expected_tp_size=2)
+
+
+def test_initial_lora_slot_audit_rejects_incomplete_tp_coverage():
+    receipt = _slot_audit(0)
+    receipt["rank_reports"].pop()
+
+    with pytest.raises(RuntimeError, match="report count mismatch"):
+        validate_initial_lora_slot_audits([receipt], expected_engine_ranks=[0], expected_tp_size=2)
 
 
 def test_integrated_base_probe_accepts_exact_four_engine_match():

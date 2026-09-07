@@ -203,19 +203,6 @@ class WeightUpdater:
 
         gate_result = [None]
         if driver:
-            observed = [
-                {
-                    "rank": item.get("rank"),
-                    "is_sender": item.get("is_sender"),
-                    "manifest_sha256": item.get("manifest_sha256"),
-                    "tensor_count": item.get("tensor_count"),
-                }
-                for item in gathered
-            ]
-            logger.info(
-                "[LORA-SENDER-MANIFEST-OBSERVED] %s",
-                json.dumps(observed, sort_keys=True, separators=(",", ":")),
-            )
             try:
                 if error is not None:
                     raise RuntimeError(error)
@@ -252,6 +239,19 @@ class WeightUpdater:
         )
         gate_result = [None]
         if driver:
+            observed = [
+                {
+                    "rank": item.get("rank") if isinstance(item, dict) else None,
+                    "is_sender": item.get("is_sender") if isinstance(item, dict) else None,
+                    "manifest_sha256": item.get("manifest_sha256") if isinstance(item, dict) else None,
+                    "tensor_count": item.get("tensor_count") if isinstance(item, dict) else None,
+                }
+                for item in gathered
+            ]
+            logger.info(
+                "[LORA-SENDER-MANIFEST-OBSERVED] %s",
+                json.dumps(observed, sort_keys=True, separators=(",", ":")),
+            )
             try:
                 report = validate_lora_sender_manifest_payloads(gathered)
                 logger.info(

@@ -59,8 +59,24 @@ def build_lora_sender_manifest_payload(
 
 def validate_lora_sender_manifest_payloads(payloads: list[dict]) -> dict:
     """Prove every materialized sender produced rank 0's complete adapter."""
+    if not isinstance(payloads, list) or not payloads:
+        raise RuntimeError("LoRA sender manifest payloads must be a non-empty list")
+    invalid_payloads = [
+        index for index, payload in enumerate(payloads) if not isinstance(payload, dict)
+    ]
+    if invalid_payloads:
+        raise RuntimeError(
+            "LoRA sender manifest payload type mismatch: "
+            f"non_mapping_indices={invalid_payloads}"
+        )
+
     ranks = [payload.get("rank") for payload in payloads]
     expected_ranks = list(range(len(payloads)))
+    if any(type(rank) is not int for rank in ranks):
+        raise RuntimeError(
+            "LoRA sender manifest rank type mismatch: "
+            f"expected_integer_ranks={expected_ranks} observed={ranks}"
+        )
     if sorted(ranks) != expected_ranks:
         raise RuntimeError(
             "LoRA sender manifest rank coverage mismatch: "
@@ -82,7 +98,12 @@ def validate_lora_sender_manifest_payloads(payloads: list[dict]) -> dict:
     ]
     if mismatches:
         mismatch = min(mismatches, key=lambda payload: payload["rank"])
-        actual_checksums = mismatch.get("checksums") or {}
+        actual_checksums = mismatch.get("checksums")
+        if not isinstance(actual_checksums, dict):
+            raise RuntimeError(
+                "LoRA sender manifest checksum payload type mismatch: "
+                f"rank={mismatch['rank']}"
+            )
         source_flat = {
             f"{adapter}:{name}": digest
             for adapter, tensors in source_checksums.items()

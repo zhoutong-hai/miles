@@ -257,6 +257,29 @@ class TestInitialLoraSourceZeroB:
             "zero",
         }
 
+    def test_source_gate_executes_without_sender_gather_state(self):
+        updater = WeightUpdater.__new__(WeightUpdater)
+        updater.protocol = Namespace(is_sender=True)
+        updater._hf_weight_iterator = MagicMock()
+        updater._hf_weight_iterator.iter_hf_weights.return_value = iter(
+            [self._pair("model.layers.0.q_proj", torch.zeros(3, 2))]
+        )
+
+        with (
+            patch(f"{_UPDATER_MODULE}.dist") as mock_dist,
+            patch(f"{_UPDATER_MODULE}.get_gloo_group", return_value=MagicMock()),
+        ):
+            updater._run_initial_lora_source_gate(
+                adapters=[("adapter", None)],
+                driver=True,
+                weights={},
+            )
+
+        mock_dist.broadcast_object_list.assert_called_once()
+        assert mock_dist.broadcast_object_list.call_args.args[0] == [
+            {"success": True, "message": "Success"}
+        ]
+
     @pytest.mark.parametrize(
         ("b_tensor", "error"),
         [
@@ -329,6 +352,51 @@ class TestLoraSenderManifestGate:
         assert report["sender_count"] == 2
         assert report["tensor_count"] == 1
         assert len(report["manifest_sha256"]) == 64
+
+    def test_gather_gate_validates_and_broadcasts_identical_manifests(self):
+        updater = WeightUpdater.__new__(WeightUpdater)
+        payloads = [self._payload(0, "same"), self._payload(1, "same")]
+
+        def gather_object(_payload, object_gather_list, **_kwargs):
+            object_gather_list[:] = payloads
+
+        with (
+            patch(f"{_UPDATER_MODULE}.dist") as mock_dist,
+            patch(f"{_UPDATER_MODULE}.get_gloo_group", return_value=MagicMock()),
+        ):
+            mock_dist.get_rank.return_value = 0
+            mock_dist.get_world_size.return_value = 2
+            mock_dist.gather_object.side_effect = gather_object
+            updater._run_initial_lora_sender_manifest_gate(
+                checksums={"adapter": {"model.layer.lora_A.weight": "same"}},
+                driver=True,
+                is_sender=True,
+            )
+
+        mock_dist.broadcast_object_list.assert_called_once()
+        assert mock_dist.broadcast_object_list.call_args.args[0] == [
+            {"success": True, "message": "Success"}
+        ]
+
+    def test_gather_gate_rejects_malformed_payload_with_bounded_error(self):
+        updater = WeightUpdater.__new__(WeightUpdater)
+
+        def gather_object(payload, object_gather_list, **_kwargs):
+            object_gather_list[:] = [payload, None]
+
+        with (
+            patch(f"{_UPDATER_MODULE}.dist") as mock_dist,
+            patch(f"{_UPDATER_MODULE}.get_gloo_group", return_value=MagicMock()),
+        ):
+            mock_dist.get_rank.return_value = 0
+            mock_dist.get_world_size.return_value = 2
+            mock_dist.gather_object.side_effect = gather_object
+            with pytest.raises(RuntimeError, match="payload type mismatch"):
+                updater._run_initial_lora_sender_manifest_gate(
+                    checksums={"adapter": {"model.layer.lora_A.weight": "same"}},
+                    driver=True,
+                    is_sender=True,
+                )
 
     def test_sender_manifest_divergence_names_first_rank_and_tensor(self):
         with pytest.raises(

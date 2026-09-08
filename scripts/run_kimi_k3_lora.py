@@ -424,6 +424,14 @@ def _execute_train(args: ScriptArgs) -> None:
         # sglang's membind pins the whole TMS host backup to one NUMA node, which cannot hold it
         "SGLANG_NUMA_BIND_V2": os.environ.get("SGLANG_NUMA_BIND_V2", "0"),
     }
+    if args.model_variant == "full":
+        extra_env_vars.update(
+            {
+                "CUDA_HOME": "/usr/local/cuda",
+                "CUDA_PATH": "/usr/local/cuda",
+                "MILES_KIMI_K3_KDA_BACKWARD_PREFLIGHT": "1",
+            }
+        )
     # Ray's runtime_env replaces the actor env; without the JIT cache dirs the KDA kernels recompile every run
     for cache_var in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
         cache_dir = os.environ.get(cache_var)

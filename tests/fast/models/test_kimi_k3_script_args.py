@@ -71,3 +71,19 @@ def test_e006_full_model_uses_hopper_decode_backend(monkeypatch):
     assert "--sglang-decode-attention-backend flashmla" in train_args
     assert "--sglang-decode-attention-backend trtllm_mla" not in train_args
     assert "--sglang-lora-no-cpu-backup" in train_args
+    assert captured["extra_env_vars"]["CUDA_HOME"] == "/usr/local/cuda"
+    assert captured["extra_env_vars"]["CUDA_PATH"] == "/usr/local/cuda"
+    assert captured["extra_env_vars"]["MILES_KIMI_K3_KDA_BACKWARD_PREFLIGHT"] == "1"
+
+
+def test_four_layer_variant_does_not_force_e006_cuda_preflight(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(run_kimi_k3_lora.U, "execute_train", lambda **kwargs: captured.update(kwargs))
+    run_kimi_k3_lora._execute_train(
+        run_kimi_k3_lora.ScriptArgs(model_variant="4layer", num_nodes=1, num_gpus_per_node=8)
+    )
+
+    assert "CUDA_HOME" not in captured["extra_env_vars"]
+    assert "CUDA_PATH" not in captured["extra_env_vars"]
+    assert "MILES_KIMI_K3_KDA_BACKWARD_PREFLIGHT" not in captured["extra_env_vars"]

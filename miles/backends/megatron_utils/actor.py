@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import random
@@ -108,6 +109,13 @@ class MegatronTrainRayActor(TrainRayActor):
             indep_dp_store_addr=self._indep_dp_store_addr,
             indep_dp_info=indep_dp_info,
         )
+
+        if os.environ.get("MILES_KIMI_K3_KDA_BACKWARD_PREFLIGHT") == "1":
+            from miles_plugins.models.kimi_k3.preflight import run_kda_backward_preflight
+
+            preflight_receipt = run_kda_backward_preflight(rank=self._rank)
+            logger.info("KIMI_K3_KDA_BACKWARD_PREFLIGHT %s", json.dumps(preflight_receipt, sort_keys=True))
+            dist.barrier(group=get_gloo_group())
 
         self._ft_test_action_executor = FTTestActionActorExecutor.from_args(
             args,

@@ -112,6 +112,10 @@ class RayTrainGroup:
         """Save actor model"""
         await self._broadcast("save_model", rollout_id, force_sync=force_sync)
 
+    async def finish_tracking(self):
+        """Flush every initialized training worker before driver completion."""
+        await self._broadcast("finish_tracking")
+
     async def export_hf(self, rollout_id: int, path: str):
         """Export current weights as an HF checkpoint (collective across all ranks)."""
         await self._broadcast("export_hf", rollout_id, path)

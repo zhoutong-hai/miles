@@ -32,7 +32,7 @@ from miles.utils.replay_base import all_replay_managers, routing_replay_manager
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils.structured_log import with_logs
-from miles.utils.tracking_utils.tracking import init_tracking
+from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 from miles.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
@@ -86,6 +86,10 @@ def _setup_disk_offload_reclaim(disk_dir: str) -> None:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    def finish_tracking(self):
+        """Flush this worker's tracking writers before scoped Ray teardown."""
+        finish_tracking()
+
     @with_logs
     @with_defer(lambda: Timer().start("train_wait"))
     def init(

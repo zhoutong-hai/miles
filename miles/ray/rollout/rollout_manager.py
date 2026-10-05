@@ -41,7 +41,7 @@ from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
 from miles.utils.misc import load_function
 from miles.utils.timer import timer
-from miles.utils.tracking_utils.tracking import init_tracking
+from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -138,6 +138,7 @@ class RolloutManager:
             self.eval_generate_rollout.dispose()
         for monitor in self._health_monitors:
             monitor.stop()
+        finish_tracking()
 
     # -------------------------- data generation -----------------------------
 

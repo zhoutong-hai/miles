@@ -25,6 +25,7 @@ from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.hf_config import load_hf_config
 from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.packing_metrics import record_actor_packing
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.ray_utils import Box
 from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -588,6 +589,15 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
+        record_actor_packing(
+            rollout_id=rollout_id,
+            args=self.args,
+            rollout_data=rollout_data,
+            data_iterator=data_iterator,
+            microbatches=num_microbatches,
+            parallel_state=get_parallel_state(),
+            timers=Timer().log_dict(),
+        )
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         for m in all_replay_managers:

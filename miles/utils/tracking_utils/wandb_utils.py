@@ -159,6 +159,10 @@ def init_wandb_secondary(args, router_addr=None):
 
 
 def _init_wandb_common():
+    wandb.define_metric("router_load/completed_updates")
+    wandb.define_metric("router_load/rollout_id")
+    wandb.define_metric("router_load/by_update/*", step_metric="router_load/completed_updates")
+    wandb.define_metric("router_load/by_rollout/*", step_metric="router_load/rollout_id")
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("rollout/step")

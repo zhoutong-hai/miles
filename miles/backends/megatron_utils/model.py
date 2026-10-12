@@ -28,6 +28,7 @@ from megatron.training.training import get_model
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
+from miles.backends.megatron_utils.router_load_observer import get_router_load_observer
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
@@ -442,6 +443,7 @@ def train_one_step(
     args = get_args()
     parallel_state = get_parallel_state()
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
+    config = get_model_config(model[0])
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
     multi_lora = is_multi_lora_enabled(args)
 
@@ -502,6 +504,9 @@ def train_one_step(
             args.qkv_format,
             allgather_cp=args.allgather_cp,
         )
+
+        if (observer := getattr(config, "router_load_observer", None)) is not None:
+            observer.record_batch(batch)
 
         if "adapter_token_counts" in batch:
             from megatron.bridge.peft.multi_lora_layers import set_tokens_per_adapter_slot
@@ -734,6 +739,7 @@ def train(
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+    router_observer = get_router_load_observer(args, config, model, optimizer)
 
     pre_hook_enabled = False
 
@@ -776,20 +782,15 @@ def train(
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm, train_step_outcome = train_one_step(
-            args,
-            rollout_id,
-            step_id,
-            data_iterator,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_microbatches[step_id],
-            num_rollouts[step_id],
-            witness_info=witness_info,
-            attempt=attempt,
-            ft_test_action_executor=ft_test_action_executor,
-        )
+        with router_observer.step() if router_observer is not None else nullcontext():
+            loss_dict, grad_norm, train_step_outcome = train_one_step(
+                args, rollout_id, step_id, data_iterator, model, optimizer,
+                opt_param_scheduler, num_microbatches[step_id], num_rollouts[step_id],
+                witness_info=witness_info, attempt=attempt,
+                ft_test_action_executor=ft_test_action_executor,
+            )
+        if router_observer is not None and train_step_outcome == TrainStepOutcome.NORMAL:
+            router_observer.finish(rollout_id, step_id, num_steps_per_rollout)
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent

@@ -1466,6 +1466,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Interval (in rollout steps) to update ref model from actor. If None, ref model is not updated.",
             )
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
+            parser.add_argument("--observe-router-load", action="store_true", help="Aggregate frozen-router load observations")
+            parser.add_argument("--router-load-snapshot-interval", type=int, default=10)
+            parser.add_argument("--router-load-output", type=str, default=None, help="Private aggregate count directory, no model state")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)

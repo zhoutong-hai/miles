@@ -3,6 +3,8 @@ import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+import json
+import sys
 
 import pytest
 import torch
@@ -173,3 +175,28 @@ def test_actual_native_constructed_gate_freeze(frozen):
 @pytest.mark.parametrize("rollout,step,due", [(8,1,False),(9,0,False),(9,1,True),(19,0,False),(19,1,True)])
 def test_snapshot_policy_completed_rollouts_only(rollout, step, due):
     assert (step == 1 and (rollout + 1) % 10 == 0) == due
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_publish_private_counts_only_and_invalid_accounting_degrades_metrics(monkeypatch, tmp_path, valid):
+    logged = []
+    monkeypatch.setitem(sys.modules, "miles.utils.tracking_utils",
+        SimpleNamespace(tracking=SimpleNamespace(log=lambda args, metrics, step_key: logged.append(metrics))))
+    obj = observer.RouterLoadObserver.__new__(observer.RouterLoadObserver)
+    obj.args = SimpleNamespace(router_load_output=str(tmp_path))
+    obj.first_check, obj.accounting_valid = True, None
+    obj.rank_experts = [list(range(16 * rank, 16 * (rank + 1))) for rank in range(16)]
+    counts = [1] * 256
+    layers = [{"layer": layer, "metrics": observer.summarize_counts(torch.tensor(counts), obj.rank_experts),
+               "accounting": {"counts_match_packed_work": valid}, "counts": counts} for layer in range(4, 79)]
+    obj._publish(layers, 9, 1, 20, True)
+    assert logged[0]["router_load/accounting_passed"] == int(valid)
+    assert any("by_update" in key for key in logged[0]) == valid
+    assert not any(isinstance(value, (dict, list, torch.Tensor)) for value in logged[0].values())
+    path = tmp_path / "rollout_0010.json"
+    assert path.exists() == valid
+    if valid:
+        payload = json.loads(path.read_text())
+        assert len(payload["counts"]) == 75 and all(len(row) == 256 for row in payload["counts"])
+        assert "weights" not in payload
+    assert (tmp_path / "first-update-accounting.json").exists()

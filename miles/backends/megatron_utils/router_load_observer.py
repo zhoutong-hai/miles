@@ -22,7 +22,7 @@ def summarize_counts(counts, rank_experts):
     if not torch.isfinite(counts).all() or (counts < 0).any():
         raise ValueError("Invalid reduced router counts")
     mean = counts.mean().item()
-    rank_load = torch.tensor([counts[indices].sum().item() for indices in rank_experts])
+    rank_load = torch.tensor([counts[indices].sum().item() for indices in rank_experts], dtype=torch.float64)
     return {
         "expert_max_mean": counts.max().item() / mean if mean else 0.0,
         "expert_cv": counts.std(correction=0).item() / mean if mean else 0.0,
@@ -81,6 +81,7 @@ class RouterLoadObserver:
         self.finalize = importlib.import_module("megatron.core.distributed.finalize_model_grads")
         self.original = self.finalize.get_updated_expert_bias
         self.first_check = True
+        self.accounting_valid = None
         self.pending = None
         self.real_positions = self.packed_positions = 0
 
@@ -146,11 +147,17 @@ class RouterLoadObserver:
         layers.sort(key=lambda item: item["layer"])
         if len(layers) != 75 or len({item["layer"] for item in layers}) != 75:
             raise RuntimeError("Pipeline assembly did not cover the 75 GLM MoE layers exactly once")
-        metrics = {"router_load/completed_updates": completed, "router_load/rollout_id": rollout_id}
-        for item in layers:
-            for name, value in item["metrics"].items():
-                for axis in ("by_update", "by_rollout"):
-                    metrics[f"router_load/{axis}/layer_{item['layer']}/{name}"] = value
+        if self.first_check:
+            self.accounting_valid = all(item["accounting"]["counts_match_packed_work"] for item in layers)
+        metrics = {"router_load/completed_updates": completed, "router_load/rollout_id": rollout_id,
+                   "router_load/accounting_passed": int(self.accounting_valid)}
+        # Bad count accounting degrades observations, not a scientific balance threshold.
+        # Do not publish misleading ratios or snapshots if the one-time check failed.
+        if self.accounting_valid:
+            for item in layers:
+                for name, value in item["metrics"].items():
+                    for axis in ("by_update", "by_rollout"):
+                        metrics[f"router_load/{axis}/layer_{item['layer']}/{name}"] = value
         tracking.log(self.args, metrics, step_key="router_load/completed_updates")
         output = Path(self.args.router_load_output)
         output.mkdir(parents=True, exist_ok=True)
@@ -161,7 +168,7 @@ class RouterLoadObserver:
                        "reduction": "one existing stacked TP/CP/DP reduction; one representative per PP stage",
                        "layers": layers, "expert_rank_mapping": self.rank_experts}
             (output / "first-update-accounting.json").write_text(json.dumps(receipt, allow_nan=False) + "\n")
-        if snapshot_due:
+        if snapshot_due and self.accounting_valid:
             payload = {"completed_updates": completed, "completed_rollouts": rollout_id + 1,
                        "counts": [item["counts"] for item in layers],
                        "layer_ids": [item["layer"] for item in layers], "expert_rank_mapping": self.rank_experts,

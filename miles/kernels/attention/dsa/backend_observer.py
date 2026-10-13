@@ -3,9 +3,11 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import torch
 
@@ -16,7 +18,18 @@ def package_identity(name):
     except importlib.metadata.PackageNotFoundError:
         return {"version": None, "direct_url": None}
     direct = distribution.read_text("direct_url.json")
-    return {"version": distribution.version, "direct_url": json.loads(direct) if direct else None}
+    return {"version": distribution.version, "direct_url": safe_direct_url(json.loads(direct)) if direct else None}
+
+
+def safe_direct_url(value):
+    """Retain immutable source identity, never URL credentials/query tokens."""
+    url = urlsplit(value.get("url", ""))
+    authority = (url.hostname or "") + (f":{url.port}" if url.port else "")
+    result = {"url": urlunsplit((url.scheme, authority, url.path, "", ""))}
+    commit = value.get("vcs_info", {}).get("commit_id", "")
+    if re.fullmatch(r"[0-9a-f]{7,64}", commit):
+        result["commit_id"] = commit
+    return result
 
 
 def module_identity(name):

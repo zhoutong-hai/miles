@@ -52,12 +52,12 @@ def benchmark(kv_length, iterations):
     for name in ("legacy_tilelang", "candidate_flashmla_tilelang"):
         qg, kvg = q.clone().requires_grad_(), kv.clone().requires_grad_()
 
-        def forward():
+        def forward(name=name, qg=qg, kvg=kvg):
             if name == "legacy_tilelang":
                 return SparseMLA.apply(qg, kvg, indices, 576**-.5)[0]
             return sparse_attention(qg[None], kvg[None], indices[None], 576**-.5, d_v=512)[0]
 
-        def forward_backward():
+        def forward_backward(qg=qg, kvg=kvg, forward=forward):
             qg.grad = kvg.grad = None
             forward().backward(grad)
 

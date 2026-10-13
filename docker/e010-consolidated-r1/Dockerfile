@@ -13,7 +13,7 @@ RUN git init /opt/e010-flash-mla && cd /opt/e010-flash-mla && \
     git submodule update --init csrc/cutlass && \
     test "$(git -C csrc/cutlass rev-parse HEAD)" = 147f5673d0c1c3dcf66f78d677fd647e4a020219 && \
     FLASH_MLA_DISABLE_SM100=1 FLASH_MLA_DISABLE_SM90=0 MAX_JOBS=8 pip wheel --no-deps --no-build-isolation . -w /opt/e010-kernel-wheels && \
-    pip install --no-deps /opt/e010-kernel-wheels/flash_mla-*.whl && \
+    pip install --force-reinstall --no-deps /opt/e010-kernel-wheels/flash_mla-*.whl && \
     sha256sum /opt/e010-kernel-wheels/flash_mla-*.whl > /opt/e010-kernel-wheels/SHA256SUMS
 COPY docker/e010-consolidated-r1/verify_runtime.py /opt/e010-verify-runtime.py
 RUN python /opt/e010-verify-runtime.py

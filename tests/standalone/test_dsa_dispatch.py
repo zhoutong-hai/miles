@@ -5,9 +5,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from miles.kernels.attention.dsa.backend_observer import BackendObserver
+from miles.kernels.attention.dsa.backend_observer import BackendObserver, safe_direct_url
 
 sparse = importlib.import_module("miles.kernels.attention.dsa.sparse_attention")
+
+
+def test_source_metadata_does_not_capture_url_credentials_or_queries():
+    value = safe_direct_url({"url": "https://user:secret@example.test/pkg?token=secret#secret",
+                             "vcs_info": {"commit_id": "a" * 40, "requested_revision": "secret"}})
+    assert value == {"url": "https://example.test/pkg", "commit_id": "a" * 40}
+    assert "secret" not in json.dumps(value)
 
 
 @pytest.mark.parametrize("available,arch,heads,groups,d_v,dim,backend", [

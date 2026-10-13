@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from miles.utils.reloadable_process_group import ReloadableProcessGroup
+
 
 def summarize_counts(counts, rank_experts):
     """Summarize actual reduced dispatch counts using validated expert ownership."""
@@ -132,6 +134,9 @@ class RouterLoadObserver:
                 item["counts"] = counts.tolist()
             layers.append(item)
         group = self.mpu.get_pipeline_model_parallel_group()
+        if isinstance(group, ReloadableProcessGroup):
+            # gather_object bypasses Miles' patched collective wrappers.
+            group = group.group
         ranks = dist.get_process_group_ranks(group)
         writer = dist.get_rank() == ranks[-1]
         gathered = [None] * len(ranks) if writer else None

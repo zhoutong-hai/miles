@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -45,15 +46,19 @@ class BackendObserver:
     still belongs to qualification; this does not synchronize GPU execution.
     """
 
-    def __init__(self, directory=None, require_forward=None):
+    def __init__(self, directory=None, require_forward=None, *, build_receipt=None):
         self.directory = Path(directory) if directory else None
         self.require_forward = require_forward
         self.seen = set()
         self.packages = None
+        self.process_identity = uuid.uuid4().hex if self.directory else None
+        self.build_receipt = Path(build_receipt) if build_receipt else None
+        self.binary_provenance = None
 
     @classmethod
     def from_environment(cls):
-        return cls(os.environ.get("MILES_DSA_DISPATCH_RECEIPT_DIR"), os.environ.get("MILES_DSA_REQUIRE_FORWARD_BACKEND"))
+        return cls(os.environ.get("MILES_DSA_DISPATCH_RECEIPT_DIR"), os.environ.get("MILES_DSA_REQUIRE_FORWARD_BACKEND"),
+                   build_receipt=os.environ.get("MILES_DSA_BUILD_RECEIPT"))
 
     def require(self, config):
         if self.require_forward and config.forward_backend != self.require_forward:
@@ -66,7 +71,14 @@ class BackendObserver:
         if key in self.seen:
             return
         if self.packages is None:
-            self.packages = {name: package_identity(name) for name in ("torch", "tilelang", "apache-tvm-ffi", "flash-mla")}
+            packages = {name: package_identity(name) for name in ("torch", "tilelang", "apache-tvm-ffi", "flash-mla")}
+            provenance = None
+            if self.build_receipt:
+                provenance = json.loads(self.build_receipt.read_text())
+                actual = module_identity("flash_mla.cuda")["file"]
+                if provenance["binary_file"] != actual:
+                    raise RuntimeError("FlashMLA extension import differs from selected image build receipt")
+            self.packages, self.binary_provenance = packages, provenance
         packet = {
             "status": "KERNEL_RETURNED_NOT_NUMERIC_ACCEPTANCE", "phase": phase,
             "backend": config.forward_backend if phase == "forward" else "tilelang",
@@ -74,13 +86,14 @@ class BackendObserver:
             "device_name": torch.cuda.get_device_name(q.device), "q_shape": list(q.shape),
             "kv_shape": list(kv.shape), "indices_shape": list(indices.shape), "dtype": str(q.dtype),
             "d_v": d_v, "tuning": asdict(config), "packages": self.packages,
+            "process_identity": self.process_identity, "binary_provenance": self.binary_provenance,
             "imports": {name: module_identity(name) for name in (
                 "miles.kernels.attention.dsa.sparse_attention", "flash_mla", "flash_mla.flash_mla_interface",
-                "flash_mla_cuda", "miles.kernels.attention.dsa.tilelang.sparse_attention_fwd",
+                "flash_mla.cuda", "miles.kernels.attention.dsa.tilelang.sparse_attention_fwd",
                 "miles.kernels.attention.dsa.tilelang.sparse_attention_bwd")},
         }
         self.directory.mkdir(parents=True, exist_ok=True)
-        target = self.directory / f"dispatch-{os.getpid()}-{len(self.seen)}.json"
+        target = self.directory / f"dispatch-{self.process_identity}-{os.getpid()}-{len(self.seen)}.json"
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
             json.dump(packet, stream, indent=2, sort_keys=True)

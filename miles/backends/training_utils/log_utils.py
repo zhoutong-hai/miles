@@ -484,6 +484,11 @@ def aggregate_train_losses(
         num_samples_or_tokens = values[0]
         cp_factor = parallel_state.cp.size
 
+    if num_samples_or_tokens == 0:
+        if any(value != 0 for value in values[1:]):
+            raise ValueError("Zero valid-token count with nonzero masked loss metrics")
+        return dict.fromkeys(keys, 0.0)
+
     for key, value in zip(keys, values[1:], strict=False):
         loss_reduced[key] = value * cp_factor / num_samples_or_tokens
 

@@ -221,3 +221,9 @@ def test_empty_response_has_zero_valid_tokens_and_gradient():
     assert count.item() == 0 and loss.item() == 0
     loss.backward()
     assert torch.equal(x.grad, torch.zeros_like(x))
+    ns["get_parallel_state"] = lambda: SimpleNamespace(cp=SimpleNamespace(size=4), effective_dp_cp=SimpleNamespace(groups_inner_to_outer=[]))
+    functions(ROOT / "miles/backends/training_utils/log_utils.py", {"aggregate_train_losses"}, ns)
+    row = {"keys": ["loss"], "values": torch.tensor([0.0, 0.0])}
+    assert ns["aggregate_train_losses"]([row]) == {"loss": 0.0}
+    with pytest.raises(ValueError, match="Zero valid-token"):
+        ns["aggregate_train_losses"]([{"keys": ["loss"], "values": torch.tensor([0.0, 1.0])}])

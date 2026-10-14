@@ -45,7 +45,10 @@ def _worker(rank, rendezvous, output, wrapped):
     obj.representative = True
     obj.mpu = SimpleNamespace(get_pipeline_model_parallel_group=lambda: group)
     layer_ids = range(1, 38) if rank == 0 else range(38, 76)
-    obj.routers = [SimpleNamespace(layer_number=layer) for layer in layer_ids]
+    obj.routers = [SimpleNamespace(layer_number=layer, local_tokens_per_expert=torch.zeros(256))
+                   for layer in layer_ids]
+    obj.counter_dtypes = ("torch.bfloat16",) * len(obj.routers)
+    obj.pending_dtype = "torch.float32"
     obj.pending = torch.ones((len(obj.routers), 256), dtype=torch.int64)
     obj.real_positions, obj.packed_positions = 28, 32
     obj.config = SimpleNamespace(moe_router_topk=8)
@@ -73,6 +76,8 @@ def _worker(rank, rendezvous, output, wrapped):
         assert len(receipt["layers"]) == 75
         assert {row["layer"] for row in receipt["layers"]} == set(range(1, 76))
         assert all(row["accounting"]["counts_match_packed_work"] for row in receipt["layers"])
+        assert all(row["accounting"]["local_counter_dtype"] == "torch.float32" for row in receipt["layers"])
+        assert all(row["accounting"]["reduced_counter_dtype"] == "torch.float32" for row in receipt["layers"])
     dist.destroy_process_group()
 
 

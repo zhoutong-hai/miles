@@ -1,7 +1,8 @@
 """Opt-in, aggregate-only router observations for the held E010 learning screen.
 
 Tap the existing stacked TP/CP/DP reduction, then assemble pipeline-stage
-summaries once per accepted update. Never change routing, counts or bias values.
+summaries once per accepted update. Restore the empty count buffer's native FP32
+dtype after Float16Module conversion; never change routing or bias values.
 """
 
 import importlib
@@ -46,6 +47,21 @@ def check_unchanged(snapshot):
     return all(torch.equal(param.detach().cpu(), before) for param, before in snapshot)
 
 
+def prepare_router_count_buffer(router):
+    """Restore native accumulator precision once, before any dispatch is counted."""
+    counter = dict(router.named_buffers(recurse=False)).get("local_tokens_per_expert")
+    if counter is None or counter.shape != (router.num_experts,) or counter.requires_grad:
+        raise ValueError("Router count accumulator must be its registered per-expert buffer")
+    if counter.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("Unexpected router count accumulator dtype")
+    if torch.count_nonzero(counter).item():
+        # Upcasting an already-rounded histogram cannot recover lost assignments.
+        raise ValueError("Router count precision must be prepared before accumulation")
+    previous_dtype = str(counter.dtype)
+    router.local_tokens_per_expert = counter.to(dtype=torch.float32)
+    return previous_dtype
+
+
 class RouterLoadObserver:
     """Own the temporary capture and the one-time frozen-state/count checks."""
 
@@ -80,6 +96,7 @@ class RouterLoadObserver:
                     self.rank_experts = mapping
                     self.routers.append(router)
         self.snapshot = tuple(item for router in self.routers for item in require_frozen_router(router, optimizer))
+        self.counter_dtypes = tuple(prepare_router_count_buffer(router) for router in self.routers)
         self.finalize = importlib.import_module("megatron.core.distributed.finalize_model_grads")
         self.original = self.finalize.get_updated_expert_bias
         self.first_check = True
@@ -106,6 +123,7 @@ class RouterLoadObserver:
         result = self.original(tokens_per_expert, expert_bias, expert_bias_update_rate)
         if self.representative:
             # Original all_reduce has already mutated the stacked tensor; copy before reset.
+            self.pending_dtype = str(tokens_per_expert.dtype)
             self.pending = tokens_per_expert.detach().to(device="cpu", dtype=torch.int64)
         return result
 
@@ -122,10 +140,13 @@ class RouterLoadObserver:
         completed = rollout_id * num_steps + step_id + 1
         snapshot_due = step_id == num_steps - 1 and (rollout_id + 1) % self.args.router_load_snapshot_interval == 0
         layers = []
-        for router, counts in zip(self.routers, self.pending, strict=True):
+        for router, counts, before_dtype in zip(self.routers, self.pending, self.counter_dtypes, strict=True):
             item = {"layer": router.layer_number, "metrics": summarize_counts(counts, self.rank_experts)}
             if self.first_check:
                 item["accounting"] = {"routed_assignments": counts.sum().item(),
+                    "local_counter_dtype_before_preparation": before_dtype,
+                    "local_counter_dtype": str(router.local_tokens_per_expert.dtype),
+                    "reduced_counter_dtype": self.pending_dtype,
                     "expected_assignments": self.packed_positions * self.config.moe_router_topk,
                     "real_positions": self.real_positions, "packed_positions": self.packed_positions,
                     "padding_positions": self.packed_positions - self.real_positions,

@@ -270,6 +270,7 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
             denominators=batch.get("rollout_mask_sums", None),
+            fixed_response_normalizer=getattr(args, "grpo_fixed_response_normalizer", None),
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default

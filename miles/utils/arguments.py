@@ -1352,6 +1352,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
+            parser.add_argument(
+                "--grpo-fixed-response-normalizer", type=int, default=None,
+                help="Dr. GRPO fixed token budget per response, shared by policy and entropy loss. "
+                "Requires mean-only reward normalization and sample reduction; not token-mean loss.",
+            )
             reset_arg(parser, "--lr", type=float, default=1e-6)
 
             parser.add_argument(
@@ -2850,6 +2855,18 @@ def _validate_rematerialize_param_from_master_weight(args):
 
 def miles_validate_args(args):
     validate_dashboard_args(args)
+
+    fixed_normalizer = getattr(args, "grpo_fixed_response_normalizer", None)
+    if fixed_normalizer is not None:
+        if not (
+            fixed_normalizer > 0 and args.advantage_estimator == "grpo"
+            and args.rewards_normalization and not args.grpo_std_normalization
+            and not args.calculate_per_token_loss and not args.normalize_advantages
+            and args.custom_pg_loss_reducer_function_path is None
+            and args.rollout_max_response_len == fixed_normalizer
+        ):
+            raise ValueError("Dr. GRPO requires centered/no-std rewards, fixed generation budget, "
+                             "sample reduction and no additional advantage/custom loss normalization")
 
     args.ft_components = _resolve_ft_components(args)
     args.eval_datasets = _resolve_eval_datasets(args)

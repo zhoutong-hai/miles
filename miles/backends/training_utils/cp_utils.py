@@ -104,11 +104,18 @@ def get_sum_of_sample_mean(
     max_seq_lens: list[int] | None = None,
     *,
     denominators: list[torch.Tensor] | torch.Tensor | None = None,
+    fixed_response_normalizer: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP; ``denominators`` overrides each
     sample's own ``loss_mask.sum()`` (e.g. pass ``rollout_mask_sums`` for
     per-rollout means)."""
-    if denominators is None:
+    if fixed_response_normalizer is not None:
+        if calculate_per_token_loss or fixed_response_normalizer <= 0:
+            raise ValueError("Fixed response normalization requires a positive budget and sample reduction")
+        # Dr. GRPO: preserve the masks in the numerator, never normalize by
+        # generated length or a post-TIS accepted-token count.
+        denominators = [m.new_tensor(fixed_response_normalizer) for m in loss_masks]
+    elif denominators is None:
         denominators = [m.sum() for m in loss_masks]
 
     parallel_state = get_parallel_state()

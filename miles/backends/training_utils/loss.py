@@ -157,7 +157,9 @@ def loss_function(
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
     parallel_state = get_parallel_state()
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    # Megatron accumulates this count over microbatches, then reduces DP/CP
+    # and divides gradients once. Empty responses must contribute zero tokens.
+    num_tokens = sum(loss_mask.sum() for loss_mask in batch["loss_masks"])
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
@@ -168,6 +170,7 @@ def loss_function(
         args.qkv_format,
         batch.get("max_seq_lens", None),
         denominators=batch.get("rollout_mask_sums", None),
+        fixed_response_normalizer=getattr(args, "grpo_fixed_response_normalizer", None),
     )
 
     func = get_loss_function(args)
@@ -182,6 +185,15 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    if args.calculate_per_token_loss or getattr(args, "grpo_fixed_response_normalizer", None) is not None:
+        # Ordinary-update evidence from the effective parsed args, not YAML intent.
+        metric_count = (num_tokens if args.calculate_per_token_loss else num_samples) / parallel_state.cp.size
+        log["objective_token_mean"] = metric_count * int(args.calculate_per_token_loss)
+        log["objective_fixed_response_normalizer"] = metric_count * (
+            getattr(args, "grpo_fixed_response_normalizer", None) or 0
+        )
+        log["objective_reward_std"] = metric_count * int(args.grpo_std_normalization)
 
     # Forces autograd to traverse the full graph on every rank to avoid hang.
     if parallel_state.cp.size > 1 and args.allgather_cp:

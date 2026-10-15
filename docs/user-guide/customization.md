@@ -107,6 +107,87 @@ class CustomDataSource(DataSource):
 
 **Default:** `miles.rollout.data_source.RolloutDataSource`.
 
+#### Fixed-budget reward-adaptive sampling (experimental)
+
+To choose prompts using prior rollout rewards without rejection/refill sampling,
+select these two hooks together:
+
+```text
+--data-source-path miles.rollout.adaptive_sampling.rollout.AdaptiveDataSource
+--rollout-function-path miles.rollout.adaptive_sampling.rollout.AdaptiveRolloutFn
+--rollout-submission-granularity group
+--custom-config-path curriculum.yaml
+--num-rollout 20
+```
+
+The custom config owns sampler settings; merge this mapping into an existing
+custom config if one is already used:
+
+```yaml
+adaptive_sampling:
+  weights: [4, 2, 1, 1]  # informative, unseen, solved, hard
+  strata_keys: [theme, scenario]  # optional dataset metadata fields
+  reward_key: scenario_score  # dictionary field; null for scalar rewards
+  error_key: is_error  # require this field to equal zero; null if RM raises on failure
+  success_reward: 1.0
+  variation_tolerance: 1.0e-6
+  warmup_rollouts: 1
+  reward_version: my-scorer-v1
+```
+
+Set `strata_keys: []` for one pool. Every requested metadata key must be a
+nonempty string on every row. `reward_key` selects the **curriculum signal only**;
+it does not replace `--reward-key`, rewards, advantages or the training objective.
+The RM must expose reliability explicitly or raise on infrastructure errors;
+the sampler cannot distinguish a fabricated zero from a genuine failure score.
+
+The first rollout samples within strata without reward preference. Thereafter:
+
+- **Informative:** observed reward range exceeds the tolerance, excluding all-success sets.
+- **Unseen:** no trusted observation yet. After exhaustion, this lane explores
+  least-recently selected rows across all buckets.
+- **Solved:** every observed response reaches `success_reward`.
+- **Hard:** other uniform sets, including flat partial credit. No permanent retirement.
+
+The weights are soft targets: with all pools available, a 48-prompt batch aims
+for 24/12/6/6. Dataset-proportional stratum credit takes precedence, carrying
+rounding credit across batches. Empty buckets backfill without additional
+generation; least-recent selection within buckets encourages coverage. History
+is updated after a complete rollout, using the latest trusted observation.
+Missing/nonfinite/error-marked rewards leave history unchanged and increment
+`adaptive_sampling/ignored_reward_observations`. Truncation alone is not an error.
+
+Each rollout preselects exactly `--rollout-batch-size` distinct **rows**, creates
+`--n-samples-per-prompt` fresh responses per row, and trains on all returned
+responses. Duplicate prompt text in distinct dataset rows is not deduplicated.
+No pilot, oversampling, reward-based rejection, old-completion replay or entropy
+controller is added. Generation/RM failures surface rather than silently drawing
+replacement prompts. This changes the training distribution, without importance
+weighting back to the original dataset distribution.
+
+Supported scope: synchronous class-based inference rollout, rendered text-only
+prompts, at least two responses per prompt, explicit rollout count. Partial/fully
+asynchronous rollout, sample-backfill submission, buffering and custom filters/
+postprocessors are rejected. Evaluation remains the native, unchanged path.
+
+Native data-source checkpoints include RNG, stratum credit, row history, sample
+IDs and batch shape. Resume rejects a different dataset, sampler configuration
+or `reward_version`, or a missing curriculum state; it is not interchangeable
+with a sequential sampler checkpoint. Sampler state alone is **not** a resumable
+model checkpoint. A failed rollout rolls back sampler state; native generation
+recovery remains the caller's responsibility.
+
+Aggregate `adaptive_sampling/*` metrics report pool/selected counts, unique rows
+seen and total prompt presentations. Per-response private metadata identifies
+the source row and selection batch. Custom loggers must retain returned metrics
+if they replace native logging. No prompt text or verifier output is logged by
+the sampler. Repeated prompts mean rollout count is not unique-coverage epochs.
+
+Keep entropy regularization and sampling temperature as independent recipe
+settings. This sampler does not guarantee an entropy floor or learning gain.
+Interpret rewards/entropy on comparable task cohorts: changing the selected
+mixture can move batch averages even without learning.
+
 ### `--eval-function-path`
 
 Same signature as `--rollout-function-path`. Defaults to whatever rollout function is

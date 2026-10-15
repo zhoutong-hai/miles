@@ -66,6 +66,7 @@
         "group": "Agentic Environments",
         "pages": [
          "user-guide/environments",
+         "user-guide/sandbox-providers",
          "user-guide/harbor",
          "user-guide/openenv",
          "user-guide/nemo-gym",
@@ -88,6 +89,13 @@
         "group": "DeepSeek",
         "pages": [
          "models/deepseek/index",
+         {
+          "group": "DeepSeek-V4.1",
+          "pages": [
+           "models/deepseek/deepseek-v4-1-flash"
+          ],
+          "expanded": false
+         },
          {
           "group": "DeepSeek-V4",
           "pages": [
@@ -137,6 +145,7 @@
           ],
           "expanded": false
          },
+         "models/qwen/qwen3-8-flash-next",
          "models/qwen/qwen3-next",
          {
           "group": "Qwen3",
@@ -153,6 +162,8 @@
         "group": "GLM",
         "pages": [
          "models/glm/index",
+         "models/glm/glm5-3-flash",
+         "models/glm/glm5-3",
          "models/glm/glm5-2",
          "models/glm/glm5",
          "models/glm/glm4-7-flash",
@@ -195,7 +206,8 @@
         ],
         "expanded": false
        },
-       "models/gpt-oss/gpt-oss"
+       "models/gpt-oss/gpt-oss",
+       "models/mimo/mimo-v2-6-flash"
       ]
      }
     ]
@@ -210,6 +222,7 @@
        "advanced/low-precision",
        "advanced/int4-qat",
        "advanced/speculative-decoding",
+       "advanced/sampling-support-replay",
        "advanced/lora",
        "advanced/on-policy-distillation"
       ]
@@ -230,6 +243,12 @@
       "pages": [
        "advanced/miles-router"
       ]
+     },
+     {
+      "group": "Cluster & Deployment",
+      "pages": [
+       "advanced/cluster-backend"
+      ]
      }
     ]
    },
@@ -243,6 +262,7 @@
        "examples/geo3k-vlm",
        "examples/geo3k-vlm/multi-turn",
        "examples/multi-lora",
+       "examples/multi-policy",
        "examples/on-policy-distillation",
        "examples/on-policy-distillation/qwen3-5-35b-selfdistill",
        "examples/ppo",
@@ -255,9 +275,12 @@
       "pages": [
        "examples/infra-features",
        "examples/infra-features/fully-async",
+       "examples/infra-features/hot-restart",
        "examples/infra-features/low-precision",
        "examples/infra-features/p2p-weight-transfer",
        "examples/infra-features/random-async",
+       "examples/infra-features/score-centering",
+       "examples/infra-features/split-deployment",
        "examples/infra-features/train-infer-mismatch-helper",
        "examples/infra-features/true-on-policy"
       ]
@@ -270,17 +293,20 @@
      "developer/index",
      "developer/contributor-guide",
      "developer/architecture",
+     "developer/adding-a-sandbox-provider",
+     "developer/reconcile-loop",
      "developer/versions",
      "developer/debug",
      {
       "group": "CI",
       "pages": [
-       "ci/contributor-guide",
        "ci/00-stage",
        "ci/01-label",
        "ci/02-docker-build",
+       "developer/ci/06-build-wheels",
        "ci/03-metric-history-gate",
-       "ci/04-release"
+       "ci/04-release",
+       "ci/05-command-identity"
       ]
      }
     ]
@@ -343,6 +369,14 @@
      "blog/index",
      "subscribe"
     ]
+   },
+   {
+    "tab": "Hardware",
+    "pages": [
+     "hardware-platforms/overview",
+     "hardware-platforms/nvidia-gpus",
+     "hardware-platforms/amd-gpus"
+    ]
    }
   ]
  },
@@ -366,21 +400,6 @@
   {
    "source": "/developer/experimental-features",
    "destination": "/user-guide/training-backend#fsdp"
-  },
-  {
-   "source": "/platforms/index",
-   "destination": "/getting-started/installation",
-   "permanent": true
-  },
-  {
-   "source": "/platforms/nvidia",
-   "destination": "/getting-started/installation",
-   "permanent": true
-  },
-  {
-   "source": "/platforms/amd",
-   "destination": "/getting-started/installation",
-   "permanent": true
   },
   {
    "source": "/advanced/fp8-low-precision",
@@ -410,6 +429,11 @@
   {
    "source": "/user-guide/dashboard",
    "destination": "/user-guide/monitoring",
+   "permanent": true
+  },
+  {
+   "source": "/developer/ci/contributor-guide",
+   "destination": "/developer/contributor-guide#registering-a-test",
    "permanent": true
   }
  ],

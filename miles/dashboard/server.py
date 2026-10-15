@@ -103,6 +103,7 @@ def make_app(
             metric_keys=store.metric_keys() + dump_keys,
             engine_metric_keys=store.engine_metric_names(),
             step_keys=store.step_keys(),
+            step_key_of_metric_key=store.step_key_of_metric_key(),
             capabilities=dict(
                 has_metrics=store.has_stream(Stream.METRICS),
                 has_tokenizer=(reader.dump_dir / "tokenizer").is_dir(),
@@ -277,20 +278,35 @@ def make_app(
             return dict(rollout_id=rollout_id, evaluation=evaluation, **_table(df))
 
     @app.get("/api/rollout/{rollout_id}/sample/{sample_index}/messages")
-    def sample_messages(rollout_id: int, sample_index: int, evaluation: bool = Query(False, alias="eval")):
+    def sample_messages(
+        rollout_id: int,
+        sample_index: int,
+        occurrence: int = Query(0, ge=0),
+        evaluation: bool = Query(False, alias="eval"),
+    ):
         with _translate_errors():
-            return reader.trajectory_messages(rollout_id, sample_index, evaluation=evaluation)
+            return reader.trajectory_messages(
+                rollout_id, sample_index, sample_occurrence=occurrence, evaluation=evaluation
+            )
 
     @app.get("/api/rollout/{rollout_id}/sample/{sample_index}/tokens")
     def sample_tokens(
         rollout_id: int,
         sample_index: int,
+        occurrence: int = Query(0, ge=0),
         start: int = 0,
         end: int | None = None,
         evaluation: bool = Query(False, alias="eval"),
     ):
         with _translate_errors():
-            payload = reader.tokens(rollout_id, sample_index, start=start, end=end, evaluation=evaluation)
+            payload = reader.tokens(
+                rollout_id,
+                sample_index,
+                sample_occurrence=occurrence,
+                start=start,
+                end=end,
+                evaluation=evaluation,
+            )
             return _json_safe(payload)
 
     if _STATIC_DIR.is_dir():

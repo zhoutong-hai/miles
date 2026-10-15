@@ -5,27 +5,20 @@ which runs on a bare hosted runner before any dependency install; this module
 may import only the stdlib and the dependency-free registry modules.
 """
 
+import ast
 import json
 import os
 import re
 import sys
 from pathlib import Path
 
-from tests.ci.ci_register import HWBackend, collect_tests
+from tests.ci.ci_register import HWBackend, collect_tests, file_timeout
+from tests.ci.hardware import CUDA_STAGES
 
 CPU_SUITES = frozenset({"stage-a-cpu", "stage-b-cpu"})
 DISCOVERY_ROOTS = ("tests/fast", "tests/fast-gpu", "tests/e2e", "tests/ci")
 
-# Runner labels per CUDA suite, mirroring the pr-test.yml job wiring.
-# `tests/ci/test/test_file_run.py` locks the key set to
-# `run_suite.CI_SUITES[HWBackend.CUDA]` so a new suite cannot ship unmapped.
-CUDA_SUITE_RUNS_ON = {
-    "stage-b-2-gpu-h200": ["h200", "2gpu"],
-    "stage-c-8-gpu-h100": ["h100", "8gpu"],
-    "stage-c-8-gpu-h200": ["h200", "8gpu"],
-    "stage-c-4-gpu-h200": ["h200", "4gpu"],
-    "stage-c-2-gpu-h200": ["h200", "2gpu"],
-}
+CUDA_SUITE_RUNS_ON = {name: list(stage.runs_on) for name, stage in CUDA_STAGES.items()}
 
 # Same shape the pr-test.yml resolve-ci-image step enforces for a Docker tag.
 _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
@@ -87,6 +80,8 @@ def plan_file_run(all_tests, test_file: str, image_tag: str) -> dict[str, str]:
         runs_on = CUDA_SUITE_RUNS_ON.get(registration.suite)
         if runs_on is None:
             raise FileRunError(f"CUDA suite {registration.suite} has no runner mapping in CUDA_SUITE_RUNS_ON")
+        if CUDA_STAGES[registration.suite].arch == "blackwell":
+            runs_on = ["b200", f"{registration.required_gpus}gpu"]
         hw = "cuda"
         runs_on_json = json.dumps(runs_on)
     else:
@@ -96,14 +91,41 @@ def plan_file_run(all_tests, test_file: str, image_tag: str) -> dict[str, str]:
         runs_on_json = ""
     return {
         "hw": hw,
+        "num_gpus": str(registration.required_gpus if hw == "cuda" else 0),
         "suite": registration.suite,
         "runs_on": runs_on_json,
         "container_image": f"radixark/miles:{image_tag}",
-        "timeout_seconds": str(max(1800, int(registration.est_time * 1.25))),
+        "timeout_seconds": str(file_timeout(registration.est_time, registration.labels, 1800)),
     }
 
 
-def resolve_file_run(test_file: str, image_tag: str, source_root: str | Path = ".") -> dict[str, str]:
+def _read_snapshot_labels() -> dict[str, str]:
+    path = Path("tests/ci/labels.py")
+    if path.is_symlink():
+        raise FileRunError(f"CI label registry must not be a symlink: {path}")
+    try:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        definitions = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "KNOWN_LABELS"
+        ]
+        if len(definitions) != 1:
+            raise FileRunError(f"{path} must define KNOWN_LABELS once as a literal dictionary")
+        labels = ast.literal_eval(definitions[0])
+    except (OSError, SyntaxError, ValueError, TypeError) as error:
+        raise FileRunError(f"cannot read CI label registry {path}: {error}") from error
+    if not isinstance(labels, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in labels.items()
+    ):
+        raise FileRunError(f"{path}: KNOWN_LABELS must be a literal string-to-string dictionary")
+    return labels
+
+
+def collect_snapshot_tests(source_root: str | Path):
+    """Parse a source snapshot as data, without importing its Python modules."""
     try:
         root = Path(source_root).resolve(strict=True)
     except OSError as error:
@@ -114,10 +136,14 @@ def resolve_file_run(test_file: str, image_tag: str, source_root: str | Path = "
     previous_directory = Path.cwd()
     try:
         os.chdir(root)
-        tests = collect_tests(_discover_regular_ci_files(), sanity_check=True)
+        files = _discover_regular_ci_files()
+        return collect_tests(files, sanity_check=True, known_labels=_read_snapshot_labels())
     finally:
         os.chdir(previous_directory)
-    return plan_file_run(tests, test_file, image_tag)
+
+
+def resolve_file_run(test_file: str, image_tag: str, source_root: str | Path = ".") -> dict[str, str]:
+    return plan_file_run(collect_snapshot_tests(source_root), test_file, image_tag)
 
 
 def main() -> int:

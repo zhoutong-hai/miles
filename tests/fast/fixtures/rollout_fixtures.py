@@ -2,7 +2,6 @@
 Fixtures to test rollout-function
 """
 
-import copy
 import json
 from argparse import Namespace
 from collections.abc import Iterator
@@ -14,10 +13,14 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from miles.rollout.data_source import DataSource, RolloutDataSourceWithBuffer
+from miles.rollout.data_source import DataSource
+from miles.rollout.session.config import compute_session_server_config
 from miles.rollout.session.server import SessionServer
+from miles.rollout.session.types import SessionServerInstance
+from miles.router.config import compute_miles_router_config
 from miles.router.router import MilesRouter
 from miles.utils.arguments import parse_args
+from miles.utils.function_registry import load_function
 from miles.utils.http_utils import find_available_port, init_http_client
 from miles.utils.misc import SingletonMeta
 from miles.utils.test_utils.mock_sglang_server import MockSGLangServer, with_mock_server
@@ -44,6 +47,7 @@ def _build_args(*, data_path: str, router_port: int, extra_argv: list[str] | Non
         "--train-backend",
         "fsdp",
         "--ci-test",
+        "--no-enable-sample-ownership-checker",
         "--rollout-batch-size",
         "1",
         "--n-samples-per-prompt",
@@ -83,8 +87,9 @@ def _build_args(*, data_path: str, router_port: int, extra_argv: list[str] | Non
 
 @contextmanager
 def _with_miles_router(args: Namespace) -> Iterator[UvicornThreadServer]:
-    router = MilesRouter(args, verbose=False)
-    server = UvicornThreadServer(router.app, host=args.sglang_router_ip, port=args.sglang_router_port)
+    config = compute_miles_router_config(args, host=args.sglang_router_ip, port=args.sglang_router_port, num_engines=1)
+    router = MilesRouter(config, verbose=False)
+    server = UvicornThreadServer(router.app, host=config.host, port=config.port)
     try:
         server.start()
         yield server
@@ -102,15 +107,19 @@ DEFAULT_DATA_ROWS = [{"input": "What is 1+7?", "label": "8"}]
 @contextmanager
 def _with_session_server(args: Namespace, backend_url: str) -> Iterator[UvicornThreadServer]:
     """Start a SessionServer for agentic variants that need TITO session tracking."""
-    session_args = copy.copy(args)
-    session_args.miles_router_timeout = 30
-    session_server = SessionServer(session_args, backend_url=backend_url)
     port = find_available_port(31000)
+    config = compute_session_server_config(
+        args,
+        host="127.0.0.1",
+        port=port,
+        instance_id=None,
+        backend_url=backend_url,
+    )
+    session_server = SessionServer(config)
     server = UvicornThreadServer(session_server.app, host="127.0.0.1", port=port)
     try:
         server.start()
-        args.session_server_ip = "127.0.0.1"
-        args.session_server_ports = [port]
+        args.session_server_instances = [SessionServerInstance(addr=f"127.0.0.1:{port}")]
         yield server
     finally:
         server.stop()
@@ -130,12 +139,11 @@ def rollout_env(tmp_path, request) -> RolloutEnv:
     data_path = str(tmp_path / "data.jsonl")
     _write_jsonl(data_path, data_rows)
 
-    router_port = find_available_port(20000)
-    args = _build_args(data_path=data_path, router_port=router_port, extra_argv=config.extra_argv)
-
     SingletonMeta.clear_all_instances()
 
-    with with_mock_server(model_name=args.hf_checkpoint, latency=config.latency) as mock_server:
+    with with_mock_server(latency=config.latency) as mock_server:
+        router_port = find_available_port(20000)
+        args = _build_args(data_path=data_path, router_port=router_port, extra_argv=config.extra_argv)
         with _with_miles_router(args) as router_server:
             r = requests.post(
                 f"{router_server.url}/add_worker",
@@ -146,10 +154,10 @@ def rollout_env(tmp_path, request) -> RolloutEnv:
 
             if _needs_session_server(config.extra_argv):
                 with _with_session_server(args, router_server.url):
-                    data_source = RolloutDataSourceWithBuffer(args)
+                    data_source = load_function(args.data_source_path)(args)
                     yield RolloutEnv(args=args, data_source=data_source, mock_server=mock_server)
             else:
-                data_source = RolloutDataSourceWithBuffer(args)
+                data_source = load_function(args.data_source_path)(args)
                 yield RolloutEnv(args=args, data_source=data_source, mock_server=mock_server)
 
     SingletonMeta.clear_all_instances()

@@ -26,6 +26,8 @@ class TrajectoryNode:
     response_id: str  # upstream response id: the agent-branch <-> leaf join key
     record: SessionRecord
     finish_reason: str
+    # Full resolved request for this generation, held by reference: read-only once committed.
+    turn_args: dict[str, Any] = field(default_factory=dict)
     parent: "TrajectoryNode | None" = None
     children: list["TrajectoryNode"] = field(default_factory=list, repr=False)
 
@@ -76,6 +78,7 @@ class SessionTree:
         response_id: str,
         record: SessionRecord,
         finish_reason: str,
+        turn_args: dict[str, Any] | None = None,
     ) -> TrajectoryNode:
         if len(self.nodes) >= MAX_NODES:
             raise ValueError(
@@ -92,6 +95,7 @@ class SessionTree:
             response_id=response_id,
             record=record,
             finish_reason=finish_reason,
+            turn_args=turn_args or {},
             parent=parent,
         )
         self.nodes.append(node)

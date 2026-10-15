@@ -18,9 +18,9 @@ from miles.rollout.generate_utils.tool_call_utils import (
     execute_tool_calls,
     update_sample_with_tool_responses,
 )
+from miles.utils.function_registry import load_function
 from miles.utils.http_utils import post
 from miles.utils.lifecycle import TrajectoryLifecycle
-from miles.utils.misc import load_function
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
@@ -51,7 +51,13 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     for _turn in range(args.generate_max_turns):
         # ----------------------- Call inference endpoint -------------------------
 
-        payload, halt_status = compute_request_payload(args, sample.tokens, input.sampling_params)
+        payload, halt_status = compute_request_payload(
+            args,
+            sample.tokens,
+            input.sampling_params,
+            evaluation=input.evaluation,
+            kv_cache_namespace=sample.kv_cache_namespace,
+        )
         if payload is None:
             sample.status = halt_status
             break

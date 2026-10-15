@@ -25,9 +25,6 @@ Env vars:
   NEMO_GYM_RUN_TIMEOUT  hard wall-clock cap in seconds for one /run call
                  (default: 3600). SWE episodes pull per-task docker images on
                  first use, which can dominate early rollouts.
-  MILES_ROUTER_EXTERNAL_HOST  optional host rewrite for the session URL when
-                 the NeMo Gym server cannot resolve the trainer's hostname
-                 (e.g. it runs outside the trainer's docker network).
 """
 
 import asyncio
@@ -35,9 +32,10 @@ import logging
 import os
 import random
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import httpx
+
+from miles.rollout.agentic.session import openai_session_url
 
 logger = logging.getLogger(__name__)
 
@@ -65,17 +63,6 @@ async def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
                 if attempt == _POST_ATTEMPTS - 1:
                     raise
                 await asyncio.sleep(random.uniform(*_POST_BACKOFF_S))
-
-
-def _resolve_session_url(base_url: str) -> str:
-    """Build the OpenAI-compatible policy URL, rewriting host for off-cluster agents."""
-    session_url = f"{base_url}/v1"
-    external_host = os.getenv("MILES_ROUTER_EXTERNAL_HOST")
-    if external_host:
-        parsed = urlparse(session_url)
-        netloc = f"{external_host}:{parsed.port}" if parsed.port else external_host
-        session_url = urlunparse(parsed._replace(netloc=netloc))
-    return session_url
 
 
 def build_responses_create_params(request_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +110,7 @@ async def run(
     request: dict[str, Any] = {
         **metadata,
         "responses_create_params": build_responses_create_params(request_kwargs),
-        "policy_base_url": _resolve_session_url(base_url),
+        "policy_base_url": openai_session_url(base_url),
     }
 
     try:

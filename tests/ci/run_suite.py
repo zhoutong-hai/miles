@@ -12,14 +12,16 @@ from tests.ci.ci_policy import (
     registration_matches_selection,
     resolve_policy,
 )
-from tests.ci.ci_register import CIRegistry, HWBackend, collect_tests, discover_ci_files
+from tests.ci.ci_register import CIRegistry, HWBackend, collect_tests, discover_ci_files, file_timeout
 from tests.ci.ci_utils import (
     CI_GATE_RECORD_DIR_ENV,
     build_store_from_env,
     gate_provenance_from_env,
+    reaping_is_isolated,
     run_unittest_files,
 )
-from tests.ci.labels import KNOWN_LABELS
+from tests.ci.hardware import CUDA_STAGES, dispatch_targets
+from tests.ci.labels import KNOWN_LABELS, PERF_LABEL
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -30,23 +32,15 @@ HW_MAPPING = {
 # CI suites by hardware backend. Cadence is an eligibility filter within a
 # suite, not a second suite inventory.
 #
-# CUDA suites: each is served by a matching workflow job in
-# .github/workflows/pr-test.yml. `stage-c-8-gpu-h100` and `stage-c-8-gpu-h200`
-# run on full-node 8-GPU hosts; the split H200 fleet is one 8-GPU node divided
-# into 2+2+4 workers via per-runner CUDA_VISIBLE_DEVICES (see pr-test.yml
-# stage-c-4-gpu-h200 / stage-b-2-gpu-h200 / stage-c-2-gpu-h200 job comments).
+# CUDA suites derive from `hardware.CUDA_STAGES`, which also carries each
+# stage's arch, GPU count and runner labels; each has a matching workflow job in
+# .github/workflows/pr-test.yml or its B200 child workflow.
 CI_SUITES = {
     HWBackend.CPU: [
         "stage-a-cpu",
         "stage-b-cpu",
     ],
-    HWBackend.CUDA: [
-        "stage-b-2-gpu-h200",
-        "stage-c-8-gpu-h100",
-        "stage-c-8-gpu-h200",
-        "stage-c-4-gpu-h200",
-        "stage-c-2-gpu-h200",
-    ],
+    HWBackend.CUDA: list(CUDA_STAGES),
     HWBackend.ROCM: [
         # Consumed by pr-test-rocm.yml.
         "stage-c-4-gpu-mi350",
@@ -58,12 +52,38 @@ CI_SUITES = {
 }
 
 
+def runs_in_stage(
+    registration: CIRegistry,
+    suite: str,
+    *,
+    dispatch_arches: frozenset[str] = frozenset(),
+    absorb: bool = False,
+) -> bool:
+    """Whether `registration` executes in `suite`, ignoring label selection.
+
+    CPU and ROCm registrations have no arch, so their home suite is the only
+    answer. A CUDA registration's home stage is where AUTO sends it; an explicit
+    `run-on-*` can send it to another arch's stage instead. Shared with
+    `stage_selection` so runner allocation and test collection cannot disagree.
+    """
+    if registration.backend is not HWBackend.CUDA:
+        return registration.suite == suite
+    return suite in dispatch_targets(
+        registration.suite,
+        registration.hardware,
+        dispatch_arches=dispatch_arches,
+        absorb=absorb,
+    )
+
+
 def filter_tests(
     ci_tests: list[CIRegistry],
     hw: HWBackend,
     suite: str,
     admit_nightly_tests: bool = False,
     labels: set[str] | None = None,
+    dispatch_arches: frozenset[str] = frozenset(),
+    absorb: bool = False,
 ) -> tuple[list[CIRegistry], list[CIRegistry]]:
     """Filter registered tests down to the set that should run.
 
@@ -86,7 +106,7 @@ def filter_tests(
         t
         for t in ci_tests
         if t.backend == hw
-        and t.suite == suite
+        and runs_in_stage(t, suite, dispatch_arches=dispatch_arches, absorb=absorb)
         and registration_matches_selection(
             t.labels,
             t.nightly,
@@ -179,10 +199,35 @@ def build_cpu_pytest_cmd(filenames: list[str], continue_on_error: bool) -> list[
     `-x` so every file runs; pytest still exits non-zero if any failed, so the
     stage stays red.
     """
-    cmd = ["pytest", *filenames, "-v"]
+    # sorted so every directory is named in one run of arguments: pytest loads a directory's
+    # conftest once, and an argument list that returns to a directory after naming its parent
+    # leaves the tests of that second visit without the fixtures their own conftest defines
+    cmd = ["pytest", *sorted(filenames), "-v"]
     if not continue_on_error:
         cmd.append("-x")
     return cmd
+
+
+def run_cpu_tests(ci_tests: list[CIRegistry], timeout_per_file: float, continue_on_error: bool) -> int:
+    """Run a CPU suite in one pytest, except that each `perf` file runs alone within its file timeout."""
+    shared = [t.filename for t in ci_tests if PERF_LABEL not in t.labels]
+    runs = [(build_cpu_pytest_cmd(shared, continue_on_error), None)] if shared else []
+    for test in ci_tests:
+        if PERF_LABEL in test.labels:
+            timeout = file_timeout(test.est_time, test.labels, timeout_per_file)
+            # The bound of a /rerun-test file run: TERM the process group, KILL it 30 s later.
+            bound = ["timeout", "--signal=TERM", "--kill-after=30s", f"{timeout}s"]
+            runs.append((bound + build_cpu_pytest_cmd([test.filename], continue_on_error), (test.filename, timeout)))
+    status = 0
+    for cmd, bounded in runs:
+        print(f"Running: {' '.join(cmd)}", flush=True)
+        returncode = subprocess.call(cmd)
+        if bounded is not None and returncode == 124:  # coreutils `timeout` expired
+            print(f"TIMEOUT: {bounded[0]} after {bounded[1]} seconds", flush=True)
+        status = status or returncode
+        if status and not continue_on_error:
+            break
+    return status
 
 
 def run_a_suite(args):
@@ -209,12 +254,22 @@ def run_a_suite(args):
         suite,
         policy.admit_nightly_tests,
         labels=include_labels,
+        dispatch_arches=policy.dispatch_arches,
+        absorb=policy.absorb,
     )
+
+    if args.test_file:
+        ci_tests = [test for test in ci_tests if test.filename == args.test_file]
+        assert len(ci_tests) == 1, f"Selected test is not enabled in this suite: {args.test_file}"
 
     if auto_partition_size:
         ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
 
     pretty_print_tests(args, policy, continue_on_error, ci_tests, skipped_tests)
+
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as output:
+            output.write(f"has_tests={str(bool(ci_tests)).lower()}\n")
 
     if len(ci_tests) == 0:
         print("No tests to run. Exiting with success.", flush=True)
@@ -225,9 +280,7 @@ def run_a_suite(args):
 
     # CPU tests (fast/) use pytest; CUDA tests use python3 per-file
     if hw == HWBackend.CPU:
-        cmd = build_cpu_pytest_cmd([t.filename for t in ci_tests], continue_on_error)
-        print(f"Running: {' '.join(cmd)}", flush=True)
-        return subprocess.call(cmd)
+        return run_cpu_tests(ci_tests, args.timeout_per_file, continue_on_error)
 
     # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
@@ -255,8 +308,10 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         gate_store=gate_store,
+        gate_executing_suite=suite,
         gate_write_baseline=policy.write_baseline,
         gate_provenance=gate_provenance,
+        reap_leftovers=reaping_is_isolated(),
     )
 
 
@@ -270,6 +325,7 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument("--test-file", help="Execute one file from the selected suite and policy.")
     cadence_group = parser.add_mutually_exclusive_group()
     cadence_group.add_argument(
         "--cadence",
@@ -349,6 +405,10 @@ def main():
         ),
     )
     parser.add_argument(
+        "--github-output",
+        help="Append has_tests for the selected shard to a GitHub Actions output file; requires --list-only.",
+    )
+    parser.add_argument(
         "--match-all-labels",
         action="store_true",
         default=False,
@@ -360,6 +420,9 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    if args.github_output and not args.list_only:
+        parser.error("--github-output requires --list-only.")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):

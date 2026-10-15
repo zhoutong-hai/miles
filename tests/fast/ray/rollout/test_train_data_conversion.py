@@ -9,6 +9,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from tests.fast.ray.rollout.conftest import make_args, make_sample, make_samples_grouped
 
+from miles.ray.rollout import train_data_conversion
 from miles.ray.rollout.train_data_conversion import (
     _post_process_rewards,
     can_schedule_on_rollout_side,
@@ -18,14 +19,13 @@ from miles.ray.rollout.train_data_conversion import (
     split_train_data_by_dp_scheduled_raw,
 )
 from miles.utils import object_store
-from miles.utils.types import Sample
+from miles.utils.sampling_mask import RolloutSamplingMask
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _ray_minicluster():
+def _ray_minicluster(ray_local_mode):
     """split_train_data_by_dp uses ray.put(...) so we need Ray."""
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
     yield
 
 
@@ -33,6 +33,38 @@ def _ray_minicluster():
 
 
 class TestConvertSamplesToTrainData:
+    def test_disabled_checker_leaves_custom_converter_output_untouched(self) -> None:
+        """An unaudited converter does not need to supply witness identity columns."""
+        converted = {"custom_payload": [1, 2]}
+
+        out = convert_samples_to_train_data(
+            make_args(enable_sample_ownership_checker=False),
+            [make_sample()],
+            metadata={},
+            custom_convert_samples_to_train_data_func=lambda args, samples: converted,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out is converted
+        assert out == {"custom_payload": [1, 2]}
+
+    def test_repeated_unstamped_sample_index_remains_duplicate_identity(self):
+        """Unstamped duplicate indices remain visible as duplicate rows."""
+        args = make_args(advantage_estimator="grpo", rewards_normalization=False, enable_sample_ownership_checker=True)
+        samples = [make_sample(index=7), make_sample(index=7), make_sample(index=8)]
+
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["lineage_source_sample_indices"] == [7, 7, 8]
+        assert out["lineage_output_indices"] == [0, 0, 0]
+        assert out["lineage_output_counts"] == [1, 1, 1]
+
     def test_default_path_produces_required_keys(self):
         args = make_args(advantage_estimator="grpo", rewards_normalization=False)
         samples = make_samples_grouped(n_groups=2, group_size=4)
@@ -120,6 +152,43 @@ class TestConvertSamplesToTrainData:
         )
         assert out["rollout_log_probs"][0] == [-0.1, -0.2, -0.3, -0.4]
 
+    def test_sampling_mask_passed_through(self):
+        args = make_args(rewards_normalization=False)
+        s = make_sample()
+        s.rollout_sampling_mask = RolloutSamplingMask(
+            ids=[0, 7, 1, 8, 2, 9, 3, 10],
+            offsets=[0, 2, 4, 6, 8],
+        )
+        out = convert_samples_to_train_data(
+            args,
+            [s],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert out["rollout_sampling_mask_ids"][0].tolist() == [0, 7, 1, 8, 2, 9, 3, 10]
+        assert out["rollout_sampling_mask_offsets"][0].tolist() == [0, 2, 4, 6, 8]
+
+    def test_sampling_mask_requires_complete_batch(self):
+        args = make_args(rewards_normalization=False)
+        captured = make_sample(index=8)
+        captured.rollout_sampling_mask = RolloutSamplingMask(
+            ids=[0, 7, 1, 8, 2, 9, 3, 10],
+            offsets=[0, 2, 4, 6, 8],
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"must be present for every training sample.*sample_index=9",
+        ):
+            convert_samples_to_train_data(
+                args,
+                [captured, make_sample(index=9)],
+                metadata={},
+                custom_convert_samples_to_train_data_func=None,
+                custom_reward_post_process_func=None,
+            )
+
     def test_optional_field_round_number_from_metadata(self):
         args = make_args(rewards_normalization=False)
         s = make_sample()
@@ -172,17 +241,102 @@ class TestConvertSamplesToTrainData:
         )
         assert out["rollout_ids"] == [0, 1, 1, 3]
 
-    def test_custom_convert_func_short_circuits(self):
-        args = make_args()
-        sentinel = {"foo": "bar"}
+    def test_weight_versions_are_converted_to_serializable_dicts(self):
+        """Weight version spans cross the object-store boundary as plain msgpack values."""
+        args = make_args(rewards_normalization=False)
+        sample = make_sample()
+        sample.weight_versions = [
+            WeightVersionsPerCall(spans=[WeightVersionSpan(version="v1", abs_start=2, abs_end=4)])
+        ]
+
         out = convert_samples_to_train_data(
             args,
-            [make_sample()],
+            [sample],
             metadata={},
-            custom_convert_samples_to_train_data_func=lambda a, s: sentinel,
+            custom_convert_samples_to_train_data_func=None,
             custom_reward_post_process_func=None,
         )
-        assert out is sentinel
+
+        assert out["weight_versions"] == [
+            [
+                {
+                    "spans": [{"version": "v1", "abs_start": 2, "abs_end": 4}],
+                    "prefill_spans": [],
+                    "output_start": None,
+                    "prompt_tokens": None,
+                }
+            ]
+        ]
+
+    def test_weight_version_serialization_preserves_empty_samples_and_calls(self):
+        """A sample without calls and a call without spans keep their slots, so rows and turn counts stay aligned."""
+        args = make_args(rewards_normalization=False)
+        stamped = make_sample(index=0)
+        stamped.weight_versions = [
+            WeightVersionsPerCall(spans=[]),
+            WeightVersionsPerCall(spans=[WeightVersionSpan(version="v1", abs_start=2, abs_end=4)]),
+        ]
+        unstamped = make_sample(index=1)
+        unstamped.weight_versions = []
+
+        out = convert_samples_to_train_data(
+            args,
+            [stamped, unstamped],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["weight_versions"] == [
+            [
+                {"spans": [], "prefill_spans": [], "output_start": None, "prompt_tokens": None},
+                {
+                    "spans": [{"version": "v1", "abs_start": 2, "abs_end": 4}],
+                    "prefill_spans": [],
+                    "output_start": None,
+                    "prompt_tokens": None,
+                },
+            ],
+            [],
+        ]
+
+    def test_weight_version_serialization_round_trips_prefill_spans(self):
+        """Prompt KV spans reach the train data as plain values and read back as the same typed calls."""
+        args = make_args(rewards_normalization=False)
+        sample = make_sample()
+        sample.weight_versions = [
+            WeightVersionsPerCall(
+                spans=[WeightVersionSpan(version="2", abs_start=2, abs_end=4)],
+                prefill_spans=[
+                    WeightVersionSpan(version="1", abs_start=0, abs_end=1),
+                    WeightVersionSpan(version="2", abs_start=1, abs_end=2),
+                ],
+                output_start=2,
+            )
+        ]
+
+        out = convert_samples_to_train_data(
+            args,
+            [sample],
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["weight_versions"] == [
+            [
+                {
+                    "spans": [{"version": "2", "abs_start": 2, "abs_end": 4}],
+                    "prefill_spans": [
+                        {"version": "1", "abs_start": 0, "abs_end": 1},
+                        {"version": "2", "abs_start": 1, "abs_end": 2},
+                    ],
+                    "output_start": 2,
+                    "prompt_tokens": None,
+                }
+            ]
+        ]
+        assert [WeightVersionsPerCall.from_dict(call) for call in out["weight_versions"][0]] == sample.weight_versions
 
     def test_dynamic_global_batch_size_metadata_must_match(self):
         args = make_args(use_dynamic_global_batch_size=True, rewards_normalization=False)
@@ -621,7 +775,7 @@ class TestSplitTrainDataByDp:
             "sample_indices": [0, 1, 2, 3],
         }
         refs = split_train_data_by_dp(args, data, {"dp_size": 2})
-        parts = [ray.get(r.inner) for r in refs]
+        parts = [ray.get(r.payload) for r in refs]
         # stride: dp=0 takes [0, 2], dp=1 takes [1, 3]
         assert list(parts[0]["partition"]) == [0, 2]
         assert list(parts[1]["partition"]) == [1, 3]
@@ -639,7 +793,7 @@ class TestSplitTrainDataByDp:
             "sample_indices": [0, 1, 2, 3],
         }
         refs = split_train_data_by_dp(args, data, {"dp_size": 2})
-        parts = [ray.get(r.inner) for r in refs]
+        parts = [ray.get(r.payload) for r in refs]
         sizes = [len(p["tokens"]) for p in parts]
         assert max(sizes) - min(sizes) <= 1
 
@@ -656,7 +810,7 @@ class TestSplitTrainDataByDp:
             "round_number": [1, 2],
         }
         refs = split_train_data_by_dp(args, data, {"dp_size": 2})
-        parts = [ray.get(r.inner) for r in refs]
+        parts = [ray.get(r.payload) for r in refs]
         assert "rollout_log_probs" in parts[0]
         assert "round_number" in parts[0]
 
@@ -674,10 +828,44 @@ class TestSplitTrainDataByDp:
             "dynamic_global_batch_size": 4,
         }
         refs = split_train_data_by_dp(args, data, {"dp_size": 2})
-        parts = [ray.get(r.inner) for r in refs]
+        parts = [ray.get(r.payload) for r in refs]
         for p in parts:
             assert p["raw_reward"] == [9.0, 8.0, 7.0, 6.0]
             assert p["dynamic_global_batch_size"] == 4
+
+    def test_weight_versions_survive_the_object_store_with_their_prefill_spans(self):
+        """Per-call prefill spans reach a DP shard through the store and read back as the same typed calls."""
+        args = make_args(balance_data=False)
+        calls = [
+            WeightVersionsPerCall(
+                spans=[WeightVersionSpan(version="2", abs_start=2, abs_end=4)],
+                prefill_spans=[WeightVersionSpan(version="1", abs_start=0, abs_end=2)],
+                output_start=2,
+            ),
+            WeightVersionsPerCall(
+                spans=[WeightVersionSpan(version="3", abs_start=6, abs_end=7)],
+                prefill_spans=[
+                    WeightVersionSpan(version="1", abs_start=0, abs_end=2),
+                    WeightVersionSpan(version="3", abs_start=2, abs_end=6),
+                ],
+                output_start=6,
+            ),
+        ]
+        Sample(tokens=[1, 2, 3, 4, 5, 6, 7], response_length=5, weight_versions=calls).validate()
+        data = {
+            "tokens": [[1, 2, 3, 4, 5, 6, 7]],
+            "response_lengths": [5],
+            "rewards": [0],
+            "truncated": [0],
+            "loss_masks": [[1, 1, 0, 0, 1]],
+            "sample_indices": [0],
+            "weight_versions": [[call.to_dict() for call in calls]],
+        }
+
+        refs = split_train_data_by_dp(args, data, {"dp_size": 1})
+        (part,) = [ray.get(r.payload) for r in refs]
+
+        assert [WeightVersionsPerCall.from_dict(call) for call in part["weight_versions"][0]] == calls
 
     def test_partition_indices_form_a_partition(self):
         """All partition indices together cover [0, N) exactly once."""
@@ -692,7 +880,7 @@ class TestSplitTrainDataByDp:
             "sample_indices": list(range(n)),
         }
         refs = split_train_data_by_dp(args, data, {"dp_size": 4})
-        parts = [ray.get(r.inner) for r in refs]
+        parts = [ray.get(r.payload) for r in refs]
         all_indices = sorted(i for p in parts for i in p["partition"])
         assert all_indices == list(range(n))
 
@@ -778,6 +966,9 @@ def _make_split_data(n: int, *, lengths: list[int] | None = None, rollout_ids: l
         "truncated": [0] * n,
         "loss_masks": [[1] * length for length in lengths],
         "sample_indices": list(range(n)),
+        "lineage_source_sample_indices": list(range(n)),
+        "lineage_output_indices": [0] * n,
+        "lineage_output_counts": [1] * n,
         "rollout_ids": rollout_ids if rollout_ids is not None else list(range(n)),
     }
 
@@ -821,6 +1012,36 @@ class TestCanScheduleOnRolloutSide:
 
 
 class TestSplitTrainDataByDpScheduled:
+    def test_disabled_checker_schedules_without_witness_identity_columns(self) -> None:
+        """Ordinary scheduling does not require model companion info metadata."""
+        args = make_args(
+            balance_data=False, micro_batch_size=2, use_dynamic_batch_size=False, enable_sample_ownership_checker=False
+        )
+        data = _make_split_data(8)
+        del data["lineage_source_sample_indices"]
+        del data["lineage_output_indices"]
+        del data["lineage_output_counts"]
+
+        shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=FULL_SCHEDULE_CONFIG)
+
+        assert sum(len(shard["tokens"]) for shard in shards) == 8
+
+    def test_schedule_trim_resolves_only_the_rows_it_leaves_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Rows the DP schedule cannot place receive one terminal drop outcome."""
+        args = make_args(
+            balance_data=False, micro_batch_size=2, use_dynamic_batch_size=False, enable_sample_ownership_checker=True
+        )
+        calls: list[tuple[list[int], str]] = []
+        monkeypatch.setattr(
+            train_data_conversion.SampleOwnershipRecorder,
+            "log_dropped_source_sample_indices",
+            lambda *, args, source_sample_indices, reason: calls.append((list(source_sample_indices), reason)),
+        )
+
+        split_train_data_by_dp_scheduled_raw(args, _make_split_data(10), train_parallel_config=FULL_SCHEDULE_CONFIG)
+
+        assert calls == [([8, 9], "dp_schedule_trim")]
+
     def test_static_shards_cover_all_samples(self):
         """Static path: every sample lands in exactly one shard row, the schedule
         tiles each shard's rows exactly, and shard rows match their partition."""
@@ -885,3 +1106,21 @@ class TestSplitTrainDataByDpScheduled:
         assert shards[0]["num_microbatches"] == [2, 2]
         assert shards[0]["dynamic_global_batch_size"] == 8
         assert shards[0]["num_rollouts"] == [8, 8]
+
+
+def test_delayed_dp_split_preserves_the_tinker_loss_vectors():
+    """The tinker losses zip loss_weights / advantages / rollout_log_probs per
+    datum; a key missing from the shard whitelist disappears silently and only
+    fails inside the trainer."""
+    from miles.ray.rollout.train_data_conversion import _package_shards
+
+    data = {
+        "tokens": [[1], [2], [3], [4]],
+        "loss_weights": [[1.0]] * 4,
+        "advantages": [[0.5]] * 4,
+        "rollout_log_probs": [[-0.1]] * 4,
+    }
+    shards = _package_shards(None, data, [[0, 2], [1, 3]])
+    for shard in shards:
+        assert shard["loss_weights"] and shard["advantages"] and shard["rollout_log_probs"]
+    assert shards[0]["advantages"] == [[0.5], [0.5]]

@@ -1,4 +1,4 @@
-# doc-dev: docs/ci/03-metric-history-gate.md
+# doc-dev: docs/developer/ci/03-metric-history-gate.md
 """The band constraint for the CI regression gate.
 
 * A constraint decides whether one extracted scalar `cur` passes against a
@@ -17,8 +17,8 @@
   meaningless relative percentage.
 * The declaration literal is validated against :data:`CONSTRAINT_SCHEMA` at
   parse time; `evaluate_constraint` expects the normalized dict (defaults
-  filled). The literal as written is the spec's `constraint_key`, part of the
-  stored value's identity (see register.py).
+  filled). The literal as written is the spec's `constraint_key`, stored with
+  each value as provenance of the rule that judged it (see register.py).
 """
 
 from __future__ import annotations

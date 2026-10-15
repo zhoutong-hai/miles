@@ -2,6 +2,8 @@ import re
 
 import torch
 
+from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import gdn_heads_of, qkv_group_major_to_flat
+
 
 def _convert_mtp_layer(args, name, param, layer_idx):
     """Convert MTP layer parameters from Megatron to HuggingFace format."""
@@ -14,8 +16,9 @@ def _convert_mtp_layer(args, name, param, layer_idx):
     if "eh_proj.weight" in name:
         return [("mtp.fc.weight", param)]
 
-    if "transformer_layer" in name:
-        proxy_name = name.replace(f"mtp.layers.{layer_idx}.transformer_layer", f"decoder.layers.{layer_idx}")
+    _mtp_inner = next((p for p in ("transformer_layer", "mtp_model_layer") if p in name), None)
+    if _mtp_inner is not None:
+        proxy_name = name.replace(f"mtp.layers.{layer_idx}.{_mtp_inner}", f"decoder.layers.{layer_idx}")
         mapped_params = convert_qwen3_5_to_hf(args, proxy_name, param)
 
         final_params = []
@@ -167,15 +170,15 @@ def convert_qwen3_5_to_hf(args, name, param):
             return [(f"{prefix}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"{prefix}.self_attn.k_norm.weight", param)]
+        elif rest in ("self_attention.linear_attn.in_proj_qkv.weight", "self_attention.linear_attn.conv1d.weight"):
+            hf_rest = rest[len("self_attention.") :]
+            return [(f"{prefix}.{hf_rest}", qkv_group_major_to_flat(param, gdn_heads_of(args.hf_checkpoint)))]
         elif rest.startswith("self_attention.") and rest[len("self_attention.") :] in [
             "input_layernorm.weight",
-            # linear attn (Qwen3.5 uses separate in_proj_b/in_proj_a)
             "linear_attn.A_log",
-            "linear_attn.conv1d.weight",
             "linear_attn.dt_bias",
             "linear_attn.in_proj_a.weight",
             "linear_attn.in_proj_b.weight",
-            "linear_attn.in_proj_qkv.weight",
             "linear_attn.in_proj_z.weight",
             "linear_attn.norm.weight",
             "linear_attn.out_proj.weight",

@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 
+from miles.backends.training_utils.model_companion import ModelCompanionInstallationUtils
+
 try:
     from megatron.core.utils import unwrap_model
 except ImportError:
@@ -23,7 +25,22 @@ def patch_megatron_model(model):
                 module._maintain_float32_expert_bias()
 
     try:
-        yield
+        with ModelCompanionInstallationUtils.hide(model):
+            yield
     finally:
         if attribute_was_added:
             delattr(model_config, "share_embeddings_and_output_weights")
+
+
+def apply_dsa_backend_args(provider, args) -> None:
+    """Resolve DSV4 kernel selection separately from the GLM DSA backend option."""
+    if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
+        provider.dsa_kernel_backend = getattr(args, "dsa_kernel_backend", None) or "cudnn"
+        return
+
+    backend = getattr(args, "dsa_attention_backend", "megatron")
+    if hasattr(provider, "dsa_attention_backend"):
+        provider.dsa_attention_backend = backend
+    elif hasattr(provider, "dsa_kernel_backend"):
+        explicit = getattr(args, "dsa_kernel_backend", None)
+        provider.dsa_kernel_backend = explicit or {"tilelang": "tilelang", "megatron": "none"}[backend]

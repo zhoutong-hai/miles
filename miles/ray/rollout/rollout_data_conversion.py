@@ -1,7 +1,7 @@
 import itertools
 import logging
 
-from miles.utils.multi_lora import is_multi_lora_enabled
+from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -11,15 +11,6 @@ def postprocess_rollout_data(args, data, train_parallel_config):
     metadata = {}
 
     validate_compact_rollout_ids(data)
-
-    # Multi-LoRA: record group boundaries (heterogeneous per-adapter group sizes)
-    # and lift the collection loop's batch-level step decision out of sample metadata,
-    # both before flattening.
-    if is_multi_lora_enabled(args) and isinstance(data[0], list):
-        metadata["prompt_group_sizes"] = [_nested_sample_count(group) for group in data]
-        head = _first_sample(data[0])
-        metadata["step_slots"] = list(head.metadata.pop("step_slots", []))
-        metadata["step_adapter_names"] = list(head.metadata.pop("step_adapter_names", []))
 
     # flatten the data if it is a list of lists
     while isinstance(data[0], list):
@@ -44,6 +35,7 @@ def postprocess_rollout_data(args, data, train_parallel_config):
             if trim_len == 0:
                 raise ValueError(f"Not enough samples {len(data)} for global_batch_size {global_batch_size}")
             origin_data_length = len(data)
+            SampleOwnershipRecorder.log_dropped_groups(args=args, before=data, after=data[:trim_len], reason="trim")
             data = data[:trim_len]
             logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
         logger.info(f"Final collected {len(data)} samples from rollout to train")
@@ -90,17 +82,6 @@ def _compute_dynamic_global_batch_size(args, train_parallel_config, num_samples:
     """
     dp_size = train_parallel_config["dp_size"]
     original_gbs = args.global_batch_size
-
-    if is_multi_lora_enabled(args):
-        # Batches take groups in multiples of each adapter's
-        # min_groups_per_dp_split, so this holds by construction; a violation
-        # means a generate fn's group shape broke the invariant.
-        if num_samples % dp_size != 0:
-            raise ValueError(
-                f"Multi-LoRA batch of {num_samples} samples is not divisible by dp_size={dp_size}; "
-                "the min_groups_per_dp_split invariant was violated (variable-size generate fn output?)"
-            )
-        return num_samples
 
     # Round down to a multiple of dp_size to ensure only one training step
     dynamic_gbs = (num_samples // dp_size) * dp_size

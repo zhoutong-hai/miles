@@ -1,5 +1,8 @@
+import dataclasses
 import logging
+import os
 import random
+from typing import Any
 
 import numpy as np
 import torch
@@ -7,11 +10,12 @@ import torch.distributed as dist
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.core.tensor_parallel.random import _get_all_rng_states, _set_all_rng_states
 from megatron.training.global_vars import _build_tokenizer, set_args
 
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
-from miles.utils.hf_config import register_hf_config_aliases
+from miles.utils.hf_utils.config import register_hf_config_aliases
 
 from .ft.indep_dp import create_indep_dp_group
 from .parallel import create_megatron_parallel_state
@@ -38,6 +42,33 @@ def _set_random_seed(
     tensor_parallel.model_parallel_cuda_manual_seed(seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
 
 
+def set_random_seed_from_args(args) -> None:
+    if args.rank == 0:
+        logger.info(f"> setting random seeds to {args.seed} ...")
+    _set_random_seed(
+        args.seed,
+        args.data_parallel_random_init,
+        args.te_rng_tracker,
+        args.inference_rng_tracker,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RandomState:
+    python: tuple[Any, ...]
+    numpy: dict[str, Any] | tuple[Any, ...]
+    megatron: tuple[Any, ...]
+
+    @classmethod
+    def capture(cls) -> "RandomState":
+        return cls(python=random.getstate(), numpy=np.random.get_state(), megatron=_get_all_rng_states())
+
+    def restore(self) -> None:
+        random.setstate(self.python)
+        np.random.set_state(self.numpy)
+        _set_all_rng_states(*self.megatron)
+
+
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
     """Initialize torch.distributed and core model parallel."""
     # Set the tensor model-parallel, pipeline model-parallel, and
@@ -57,7 +88,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         order="tp-cp-ep-dp-pp" if not args.use_tp_pp_dp_mapping else "tp-cp-ep-pp-dp",
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
-        create_gloo_process_groups=args.enable_gloo_process_groups,
+        create_gloo_process_groups=args.use_gloo_process_groups,
     )
 
 
@@ -91,14 +122,7 @@ def init(
         assert args.data_parallel_size == 1
 
     # Random seeds for reproducibility.
-    if args.rank == 0:
-        logger.info(f"> setting random seeds to {args.seed} ...")
-    _set_random_seed(
-        args.seed,
-        args.data_parallel_random_init,
-        args.te_rng_tracker,
-        args.inference_rng_tracker,
-    )
+    set_random_seed_from_args(args)
     register_hf_config_aliases()
     _build_tokenizer(args)
     # We won't use this. initialize to pass some validation in megatron.
@@ -117,6 +141,9 @@ def init(
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=False)
+        # deterministic mode otherwise fills every torch.empty, which only catches reads of
+        # uninitialized memory and costs ~5% of forward kernel time
+        torch.utils.deterministic.fill_uninitialized_memory = os.environ.get("MILES_FILL_UNINIT", "0") == "1"
 
     if args.debug_deterministic_collective:
         assert not args.overlap_grad_reduce, "deterministic collectives require synchronous grad sync"
@@ -127,7 +154,7 @@ def init(
         _initialize_tp_communicators()
 
     if getattr(args, "custom_megatron_init_path", None):
-        from miles.utils.misc import load_function
+        from miles.utils.function_registry import load_function
 
         custom_init = load_function(args.custom_megatron_init_path)
         custom_init(args)
@@ -139,4 +166,14 @@ def is_first_replica_megatron_main_rank():
         get_parallel_state().effective_dp_cp.rank == 0
         and get_parallel_state().tp.rank == 0
         and get_parallel_state().pp.rank == get_parallel_state().pp.size - 1
+    )
+
+
+def is_local_replica_megatron_main_rank() -> bool:
+    parallel = get_parallel_state()
+    return (
+        parallel.intra_dp.rank == 0
+        and parallel.cp.rank == 0
+        and parallel.tp.rank == 0
+        and parallel.pp.rank == parallel.pp.size - 1
     )

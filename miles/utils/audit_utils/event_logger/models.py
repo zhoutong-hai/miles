@@ -3,9 +3,49 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Discriminator
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome
+from miles.backends.training_utils.types import TrainStepOutcome
 from miles.utils.audit_utils.process_identity import ProcessIdentity
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
+
+
+class EnvReportEditablePackageInfo(FrozenStrictBaseModel):
+    name: str
+    version: str
+    location: str
+
+
+class EnvReportGitRepoInfo(FrozenStrictBaseModel):
+    package_name: str
+    location: str
+    commit: str
+    dirty: bool
+    diff_stat: str
+    uncommitted_hash: str | None
+    untracked_paths: list[str]
+    untracked_paths_truncated: bool
+    untracked_unhashed_paths: list[str]
+
+
+class EnvReportArgsDump(FrozenStrictBaseModel):
+    values: dict[str, Any]
+    skipped_names: list[str]
+
+
+class EnvReportProcessFacts(FrozenStrictBaseModel):
+    hostname: str
+    argv: list[str]
+    args: EnvReportArgsDump
+    env_vars: dict[str, str]
+    launcher_env_report: dict[str, Any] | None
+
+
+class EnvReport(FrozenStrictBaseModel):
+    process: EnvReportProcessFacts
+    key_versions: dict[str, str]
+    editable_packages: list[EnvReportEditablePackageInfo]
+    git_repos: list[EnvReportGitRepoInfo]
+    full_pip_list: list[dict[str, str]]
+    packages_probed: bool
 
 
 class EventBase(FrozenStrictBaseModel):
@@ -57,6 +97,8 @@ class WitnessAllocateIdEvent(EventBase):
 class TrainGroupStepEndEvent(EventBase):
     type: Literal["train_group_step_end"] = "train_group_step_end"
     rollout_id: int
+    attempt: int
+    role: Literal["actor", "critic"]
     cell_outcomes: dict[int, Literal["error"] | list[TrainStepOutcome]]
 
 
@@ -72,8 +114,10 @@ class CellReconfigureEvent(EventBase):
 
 class InferenceEngineWeightChecksumEvent(EventBase):
     type: Literal["inference_engine_weight_checksum"] = "inference_engine_weight_checksum"
-    # None for the initial out-of-loop weight sync (not tied to a rollout).
-    rollout_id: int | None
+    # The out-of-loop startup sync stamps start_rollout_id - 1, so -1 is a fresh run's initial sync.
+    rollout_id: int
+    # The policy whose weights were pushed, or None for a run that trains one unnamed policy.
+    trainer_model_id: str | None = None
     # One {tensor -> hash} dict per rollout engine; a TP>1 engine's ranks merge with a rank{r}/ prefix.
     engine_checksums: list[dict[str, str]]
 
@@ -84,11 +128,61 @@ class TrainAdvantageComputationEvent(_ActorTrainEventBase):
     witness_ids: list[list[int]]
 
 
+class EnvReportEvent(EventBase):
+    type: Literal["env_report"] = "env_report"
+    report: EnvReport
+
+
+class EngineEnvReportEvent(EventBase):
+    type: Literal["engine_env_report"] = "engine_env_report"
+    cell_id: str
+    server_url: str
+    server_info: dict[str, Any]
+
+
 class MetricEvent(EventBase):
     type: Literal["metric"] = "metric"
     rollout_id: int | None = None
     attempt: int | None = None
     metrics: dict[str, Any]
+
+
+class IssuedSampleGroup(FrozenStrictBaseModel):
+    group_index: int
+    sample_indices: list[int]
+
+
+class DataSourceIssuedSamplesEvent(EventBase):
+    type: Literal["data_source_issued_samples"] = "data_source_issued_samples"
+    rollout_id: int
+    groups: list[IssuedSampleGroup]
+
+
+class ExplicitlyDroppedSamplesEvent(EventBase):
+    type: Literal["explicitly_dropped_samples"] = "explicitly_dropped_samples"
+    source_sample_indices: list[int]
+    reason: str
+    rollout_id: int | None = None
+
+
+class SampleLineagePayload(FrozenStrictBaseModel):
+    source_sample_index: int
+    output_index: int
+    output_count: int
+
+
+class OutputConsumption(FrozenStrictBaseModel):
+    sample: SampleLineagePayload
+    count: int
+
+
+class TrainerModelCompanionInfoEvent(EventBase):
+    type: Literal["trainer_model_companion_info"] = "trainer_model_companion_info"
+    cell_index: int
+    rollout_id: int
+    attempt: int
+    sample_counts: list[OutputConsumption]
+    skipped_nonfinite_sample_counts: list[OutputConsumption]
 
 
 Event = Annotated[
@@ -99,7 +193,12 @@ Event = Annotated[
     | CellReconfigureEvent
     | InferenceEngineWeightChecksumEvent
     | TrainAdvantageComputationEvent
-    | MetricEvent,
+    | EnvReportEvent
+    | EngineEnvReportEvent
+    | MetricEvent
+    | DataSourceIssuedSamplesEvent
+    | ExplicitlyDroppedSamplesEvent
+    | TrainerModelCompanionInfoEvent,
     Discriminator("type"),
 ]
 

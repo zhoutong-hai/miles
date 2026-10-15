@@ -2,8 +2,6 @@
 Fixtures to test custom-generate-function
 """
 
-import copy
-import uuid
 from argparse import Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -11,10 +9,13 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+
 from miles.rollout.base_types import GenerateFnInput
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
+from miles.rollout.session.config import compute_session_server_config
 from miles.rollout.session.server import SessionServer
+from miles.rollout.session.types import SessionServerInstance
 from miles.utils.async_utils import run
 from miles.utils.http_utils import find_available_port, init_http_client
 from miles.utils.misc import SingletonMeta
@@ -63,6 +64,8 @@ def extra_argv_for_variant(
         argv += ["--generate-tool-call-parser", generate_tool_call_parser]
     elif variant == "agentic_tool_call":
         argv += ["--custom-agent-function-path", custom_agent_function_path]
+        # these tests steer the mock agent through module state, which a subproc call cannot see
+        argv += ["--custom-agent-function-mode", "inline"]
         argv += ["--use-session-server", "v2", "--tito-model", "qwen3"]
 
     return argv
@@ -159,6 +162,7 @@ def make_args(
         "--train-backend",
         "fsdp",
         "--ci-test",
+        "--no-enable-sample-ownership-checker",
         "--rollout-batch-size",
         "1",
         "--num-rollout",
@@ -233,14 +237,21 @@ def with_session_server(
     *,
     port: int,
 ):
-    # Mirror start_session_server (router_manager.py): the id is minted into the
-    # caller's per-port map, where OpenAIEndpointTracer.create reads it from.
-    instance_id = uuid.uuid4().hex
-    args.session_server_instance_ids = {port: instance_id}
-    server_args = copy.deepcopy(args)
-    server_args.miles_router_timeout = 30
-    server_args.session_server_instance_id = instance_id
-    session_server = SessionServer(server_args, backend_url=backend_url)
+    # Mirror wait_session_server_ready (router_manager.py): publish the instance record,
+    # id included, that OpenAIEndpointTracer.create picks from.
+    instance_id = f"{args.run_uuid}-0"
+    args.session_server_instances = [SessionServerInstance(addr=f"127.0.0.1:{port}", instance_id=instance_id)]
+    # Sample assembly runs inside the server, so the R3 decode shape args
+    # must reach the server config (set them via args_kwargs BEFORE the
+    # server starts; assigning to the driver args afterwards has no effect).
+    config = compute_session_server_config(
+        args,
+        host="127.0.0.1",
+        port=port,
+        instance_id=instance_id,
+        backend_url=backend_url,
+    )
+    session_server = SessionServer(config)
 
     server = UvicornThreadServer(session_server.app, host="127.0.0.1", port=port)
     server.start()
@@ -270,9 +281,10 @@ def generation_env(request, variant):
             cached_tokens=x.get("cached_tokens", 0),
             meta_info=ProcessResultMetaInfo(
                 weight_version=x.get("weight_version"),
+                prefill_weight_versions=x.get("prefill_weight_versions"),
                 routed_experts=x.get("routed_experts"),
-                spec_accept_token_num=x.get("spec_accept_token_num"),
-                spec_draft_token_num=x.get("spec_draft_token_num"),
+                spec_num_correct_drafts=x.get("spec_num_correct_drafts"),
+                spec_num_proposed_drafts=x.get("spec_num_proposed_drafts"),
                 spec_verify_ct=x.get("spec_verify_ct"),
             ),
         )
@@ -297,10 +309,6 @@ def generation_env(request, variant):
 
         with cm:
             if is_agentic:
-                # Point session server address to the SessionServer we just started,
-                # mirroring the driver-side contract set by start_session_server.
-                args.session_server_ip = "127.0.0.1"
-                args.session_server_ports = [server_port]
                 mock_tools.AGENTIC_MAX_TURNS = args_kwargs.get("generate_max_turns")
                 mock_tools.AGENTIC_RETURN_METADATA = args_kwargs.get("agentic_return_metadata")
             yield GenerateEnv(args=args, mock_server=mock_server)

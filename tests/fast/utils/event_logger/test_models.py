@@ -3,25 +3,51 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from miles.backends.megatron_utils.ft.types import TrainStepOutcome
+from miles.backends.training_utils.types import TrainStepOutcome
 from miles.utils.audit_utils.event_logger.models import (
     CellReconfigureEvent,
+    EngineEnvReportEvent,
     Event,
     InferenceEngineWeightChecksumEvent,
+    OutputConsumption,
+    SampleLineagePayload,
+    TrainerModelCompanionInfoEvent,
     TrainGroupStepEndEvent,
     WitnessAllocateIdEvent,
     WitnessSnapshotParamEvent,
 )
-from miles.utils.audit_utils.process_identity import MainProcessIdentity, TrainProcessIdentity
+from miles.utils.audit_utils.process_identity import SimpleProcessIdentity, TrainProcessIdentity
 
 _event_adapter = TypeAdapter(Event)
 
 _FIXED_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
-_FIXED_SOURCE = MainProcessIdentity()
+_FIXED_SOURCE = SimpleProcessIdentity(component="main")
 _TRAIN_SOURCE = TrainProcessIdentity(component="actor", cell_index=0, rank_within_cell=0)
 
 
 class TestEventModelsDiscriminatedUnion:
+    def test_model_companion_info_roundtrip(self) -> None:
+        """Model companion info events encode tuple identities without JSON map keys."""
+        event = TrainerModelCompanionInfoEvent(
+            timestamp=_FIXED_TS,
+            source=_TRAIN_SOURCE,
+            cell_index=2,
+            rollout_id=7,
+            attempt=2,
+            sample_counts=[
+                OutputConsumption(
+                    sample=SampleLineagePayload(source_sample_index=11, output_index=1, output_count=2),
+                    count=1,
+                )
+            ],
+            skipped_nonfinite_sample_counts=[],
+        )
+
+        parsed = _event_adapter.validate_json(event.model_dump_json())
+
+        assert isinstance(parsed, TrainerModelCompanionInfoEvent)
+        assert parsed.sample_counts == event.sample_counts
+
     def test_roundtrip_via_discriminator(self) -> None:
         event = WitnessAllocateIdEvent(
             timestamp=_FIXED_TS,
@@ -48,6 +74,8 @@ class TestEventModelsDiscriminatedUnion:
             timestamp=_FIXED_TS,
             source=_FIXED_SOURCE,
             rollout_id=0,
+            attempt=0,
+            role="actor",
             cell_outcomes={0: [TrainStepOutcome.NORMAL]},
         )
         p1 = _event_adapter.validate_json(e1.model_dump_json())
@@ -93,6 +121,8 @@ class TestTrainGroupStepEndEvent:
             timestamp=_FIXED_TS,
             source=_FIXED_SOURCE,
             rollout_id=3,
+            attempt=0,
+            role="actor",
             cell_outcomes={0: [TrainStepOutcome.NORMAL], 1: "error"},
         )
         parsed = _event_adapter.validate_json(event.model_dump_json())
@@ -159,6 +189,28 @@ class TestInferenceEngineWeightChecksumEvent:
         assert parsed.engine_checksums == engine_checksums
 
 
+class TestEngineEnvReportEvent:
+    def test_json_roundtrip(self) -> None:
+        """The engine's own report is stored as an opaque mapping, so an upstream schema change cannot break it."""
+        server_info = {
+            "model_path": "/models/qwen",
+            "version": "0.5.0",
+            "internal_states": [{"env_vars": {"RANK": "0"}, "waiting_queue": 0}],
+        }
+        event = EngineEnvReportEvent(
+            timestamp=_FIXED_TS,
+            source=_FIXED_SOURCE,
+            cell_id="cell-0",
+            server_url="http://10.0.0.1:30000",
+            server_info=server_info,
+        )
+        parsed = _event_adapter.validate_json(event.model_dump_json())
+        assert isinstance(parsed, EngineEnvReportEvent)
+        assert parsed.cell_id == "cell-0"
+        assert parsed.server_url == "http://10.0.0.1:30000"
+        assert parsed.server_info == server_info
+
+
 class TestWitnessSnapshotParamEventWithStaleIds:
     def test_json_roundtrip(self) -> None:
         event = WitnessSnapshotParamEvent(
@@ -190,6 +242,8 @@ class TestDiscriminatedUnionParsesAllEvents:
                 timestamp=_FIXED_TS,
                 source=_FIXED_SOURCE,
                 rollout_id=0,
+                attempt=0,
+                role="actor",
                 cell_outcomes={0: [TrainStepOutcome.NORMAL]},
             ),
             InferenceEngineWeightChecksumEvent(

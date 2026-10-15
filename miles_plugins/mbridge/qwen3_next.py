@@ -1,10 +1,19 @@
 import torch
+
 from mbridge.core import register_model
 from mbridge.models import Qwen2MoEBridge
+from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import (
+    gdn_heads,
+    qkv_flat_to_group_major,
+    qkv_group_major_to_flat,
+)
+from miles_plugins.mbridge.linear_attn import LinearAttentionBridgeMixin
+
+_GDN_CONV = "self_attention.linear_attn.conv1d.weight"
 
 
 @register_model("qwen3_next")
-class Qwen3NextBridge(Qwen2MoEBridge):
+class Qwen3NextBridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
     _ATTENTION_MAPPING = (
         Qwen2MoEBridge._ATTENTION_MAPPING
         | {
@@ -41,6 +50,9 @@ class Qwen3NextBridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
+        if mcore_weights_name.endswith(_GDN_CONV):
+            return qkv_flat_to_group_major(hf_weights[0], gdn_heads(self.hf_config))
+
         if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             # merge qkv
             assert len(hf_weights) == 3
@@ -74,6 +86,14 @@ class Qwen3NextBridge(Qwen2MoEBridge):
             return qgkv
 
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
+
+    def _weight_to_hf_format(
+        self, mcore_weights_name: str, mcore_weights: torch.Tensor
+    ) -> tuple[list[str], list[torch.Tensor]]:
+        names, weights = super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
+        if mcore_weights_name.endswith(_GDN_CONV):
+            weights = [qkv_group_major_to_flat(weights[0], gdn_heads(self.hf_config))]
+        return names, weights
 
     def _build_config(self):
         mtp_args = {}
@@ -130,9 +150,10 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         if name in direct_mappings:
             return [direct_mappings[name]]
 
-        if "transformer_layer" in name:
+        _mtp_inner = next((p for p in ("transformer_layer", "mtp_model_layer") if p in name), None)
+        if _mtp_inner is not None:
             proxy_name = name.replace(
-                f"mtp.layers.{mtp_layer_idx}.transformer_layer",
+                f"mtp.layers.{mtp_layer_idx}.{_mtp_inner}",
                 f"decoder.layers.{mtp_layer_idx}",
             )
 

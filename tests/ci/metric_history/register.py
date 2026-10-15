@@ -1,4 +1,4 @@
-# doc-dev: docs/ci/03-metric-history-gate.md
+# doc-dev: docs/developer/ci/03-metric-history-gate.md
 """Declare and parse metric-history regression gates.
 
 * `register_ci_gate(...)` is the marker a test file uses to declare a gate.
@@ -18,9 +18,11 @@
   must write both fields.
 * A spec also carries `steps_key` / `constraint_key` -- canonical JSON of the
   raw `steps` / `constraint` literals (see :func:`_canonical_key` for the
-  exact serialization) -- which, plus the selection's `step`, form the
-  identity a stored value's history is keyed under.
-* `parse_ci_gate_specs` extracts every declaration as a :class:`CiGateSpec`.
+  exact serialization) -- stored beside each value as provenance. A stored
+  value's history is keyed by `metric_key` and the selection's `step` only,
+  so editing either literal keeps that history.
+* `parse_ci_gate_specs` extracts every declaration as a :class:`CiGateSpec`;
+  a file declares each `metric_key` at most once.
 
 Caveats:
 
@@ -43,7 +45,7 @@ def register_ci_gate(
     metric_key: str,
     steps: str | list[int] | None = None,
     constraint: dict | None = None,
-    enforce: bool = False,
+    enforce: bool = True,
     allowlist_reason: str | None = None,
 ):
     """Declare one history-gate spec for the test file it sits in.
@@ -58,9 +60,10 @@ def register_ci_gate(
     `rel` / `abs_floor` written. An omitted `steps` / `constraint` is filled from
     :data:`GATE_DEFAULTS` when `metric_key` has an entry there; the Python
     defaults of None exist only so a one-liner call runs as a no-op -- the
-    parser, not this signature, decides validity. `enforce` and
-    `allowlist_reason` are policy metadata the gate carries without acting on
-    (the verdict is informational this round).
+    parser, not this signature, decides validity. `enforce` defaults to True:
+    the harness automatically fails numerical regressions after ten trusted
+    baselines; explicit False disables enforcement. `allowlist_reason` is
+    optional explanatory metadata. Neither field changes the baseline coordinate.
     """
     return None
 
@@ -75,22 +78,25 @@ _FIELDS: dict[str, tuple[bool, object]] = {
     "metric_key": (True, _REQUIRED),
     "steps": (True, _REQUIRED),
     "constraint": (True, _REQUIRED),
-    "enforce": (False, False),
+    "enforce": (False, True),
     "allowlist_reason": (False, None),
 }
 
 # Per-metric_key declaration defaults for the captured standard metrics: the
 # `steps` / `constraint` literals filled in when a declaration omits them.
-# These literals feed the SAME key derivation as written literals, so a
-# defaulted coordinate keys on the table entry -- editing a value here re-keys
-# every declaration that relied on it and cold-starts those baselines. Band
-# values are shadow-calibration starting points, deliberately loose. Keys must
+# A defaulted declaration records the table's literal as its provenance; editing
+# a value here changes the band every relying declaration applies and keeps
+# their history (`mark_untrusted` is the reset). Band values are
+# shadow-calibration starting points, deliberately loose. Keys must
 # stay within the capture whitelist (miles.utils.tracking_utils
 # TARGET_METRIC_KEYS; test-enforced, not imported here).
 GATE_DEFAULTS: dict[str, dict] = {
+    # grad_norm jitters and is exactly 0 on steps where every GRPO group's rewards
+    # are uniform, which also drags the averaged baseline down. The band is only a
+    # sanity check: up to 4x the mean or the mean plus 1.0, whichever is higher.
     "train/grad_norm": {
         "steps": "all",
-        "constraint": {"rel_up": 0.5, "abs_floor_up": 0.1, "rel_down": 0.8, "abs_floor_down": 0.1},
+        "constraint": {"rel_up": 3.0, "abs_floor_up": 1.0, "rel_down": 1.0},
     },
     "train/ppo_kl": {
         "steps": "all",
@@ -126,9 +132,9 @@ class CiGateSpec:
     `steps` is the validated selection literal (`"last"` | `"all"` | a list of
     step indices); `constraint` is a normalized dict (name + validated params
     + filled defaults); both drive execution. `steps_key` / `constraint_key` are
-    canonical JSON of the same literals as written and, with the extraction's
-    `step`, form the stored value's identity. `filename` is the test file the
-    spec governs; run identity comes from its CIRegistry.
+    canonical JSON of the same literals as written, stored beside each value as
+    provenance; history is keyed by `metric_key` and step. `filename` is the
+    test file the spec governs; run identity comes from its CIRegistry.
     """
 
     filename: str
@@ -137,7 +143,7 @@ class CiGateSpec:
     constraint: dict
     steps_key: str
     constraint_key: str
-    enforce: bool = False
+    enforce: bool = True
     allowlist_reason: str | None = None
 
 
@@ -266,15 +272,11 @@ def _require_opt_str(value: object, field: str) -> str | None:
 
 def _canonical_key(raw: object) -> str:
     """Canonical JSON of a declaration literal (the `steps` string/list or
-    the `constraint` dict), as the stored identity key: no whitespace, dict
-    keys sorted, list order kept as written, a bare string keyword
-    serialized with its JSON quotes (`"last"` -> `'"last"'`).
-
-    Deliberately built from the literal as written in the test file, NOT the
-    normalized form: filled-in defaults live in code, so a code-side default
-    change would silently rewrite normalized keys and reset every series. The
-    raw literal changes only with an edit to the declaration itself -- the
-    intended reset lever for that coordinate's history.
+    the `constraint` dict), stored beside each value as provenance of the rule
+    that judged it: no whitespace, dict keys sorted, list order kept as
+    written, a bare string keyword serialized with its JSON quotes
+    (`"last"` -> `'"last"'`). Older readers still key on these columns, so the
+    serialization must stay byte-stable.
     """
     return json.dumps(raw, sort_keys=True, separators=(",", ":"))
 
@@ -338,12 +340,9 @@ def parse_ci_gate_specs(filename: str) -> list[CiGateSpec]:
 
     Parsed the same way as `register_cuda_ci`: top-level `Expr(Call)` whose
     callee is the bare name `register_ci_gate`. Non-literal / invalid args raise
-    ValueError naming the file and field.
-
-    Two specs may still map to the same baseline coordinate (identical
-    steps + constraint literals, differing only in policy metadata); the
-    harness writer (`tests.ci.ci_utils.run_gate_hook`) collapses such
-    duplicates to one `metric_values` row per coordinate.
+    ValueError naming the file and field. A second declaration of the same
+    `metric_key` raises too: stored history is keyed by metric and step, so two
+    declarations would judge one series and write it twice.
     """
     with open(filename) as f:
         tree = ast.parse(f.read(), filename=filename)
@@ -354,5 +353,8 @@ def parse_ci_gate_specs(filename: str) -> list[CiGateSpec]:
         call = stmt.value
         if not isinstance(call.func, ast.Name) or call.func.id != _REGISTER_NAME:
             continue
-        specs.append(_parse_ci_gate_call(call, filename))
+        spec = _parse_ci_gate_call(call, filename)
+        if any(s.metric_key == spec.metric_key for s in specs):
+            raise ValueError(f"{filename}: {_REGISTER_NAME}() declares metric_key {spec.metric_key!r} more than once")
+        specs.append(spec)
     return specs

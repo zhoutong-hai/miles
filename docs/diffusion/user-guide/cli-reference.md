@@ -209,7 +209,7 @@ See [Dtype Control](/diffusion/advanced/dtype-control).
 | `--prompt-data` | str | – | jsonl, one row per prompt. |
 | `--input-key` | str | `input` | |
 | `--metadata-key` | str | `metadata` | |
-| `--data-source-path` | str | – | Defaults to `RolloutDataSourceWithBuffer`. |
+| `--data-source-path` | str | – | Defaults to `RolloutDataSource`. |
 | `--disable-rollout-global-dataset` | flag | off | Manage data yourself. |
 | `--rollout-batch-size` | int | – | |
 | `--n-samples-per-prompt` | int | `1` | |
@@ -358,7 +358,7 @@ Every one takes a dotted path.
 | `--debug-rollout-only` | flag | off | Rollout, no training. |
 | `--train-only` | flag | off | No engines, no weight sync, no eval. (`--debug-train-only` is a legacy alias.) |
 | `--debug-skip-optimizer-step` | flag | off | No backward/step — weights never drift. Use it to measure pure forward divergence from the engine. |
-| `--save-debug-rollout-data` | path template | – | `.format(rollout_id)`. |
+| `--save-debug-rollout-data` | path template | – | `.format(rollout_id)`; must contain `{rollout_id}`. |
 | `--load-debug-rollout-data` | path template | – | Replays a rollout with **no engines started**. |
 | `--load-debug-rollout-data-subsample` | float | – | |
 | `--save-debug-train-data` | path template | – | |
@@ -370,7 +370,8 @@ probe: frozen weights, and the metrics report exactly how far the two forwards d
 
 ### CI
 
-`--ci-test`, `--ci-metric-checker-key`, `--ci-metric-checker-threshold`. Used by `tests/e2e`;
+`--ci-test`, `--ci-metric-checker-key`, `--ci-metric-checker-threshold`,
+`--ci-metric-checker-expect-num`. Used by `tests/e2e`;
 not meant for manual runs.
 
 ---

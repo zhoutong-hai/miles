@@ -1,7 +1,7 @@
 import argparse
 
 from sglang.srt.server_args import ServerArgs
-from miles.utils.http_utils import _wrap_ipv6
+from miles.utils.http_utils import wrap_ipv6
 
 
 # TODO: use all sglang router arguments with `--sglang-router` prefix
@@ -21,6 +21,7 @@ def add_sglang_router_arguments(parser):
         default=None,
         help="Port of the SGLang router",
     )
+    parser.set_defaults(sglang_model_routers=None)
     parser.add_argument(
         "--sglang-router-policy",
         type=str,
@@ -53,6 +54,7 @@ _SKIPPED_SERVER_ARGS = [
     "gpu_id_step",
     "base_gpu_id",
     "nccl_port",
+    "gated_launch_port",
     "skip_server_warmup",
     "enable_return_routed_experts",
     "enable_return_indexer_topk",
@@ -183,10 +185,18 @@ def add_sglang_arguments(parser):
 def validate_args(args):
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
 
+    if getattr(args, "loss_type", None) == "score_centering":
+        # Score centering forces the base LM-head setting on, overriding the parsed
+        # value to avoid lower-precision logits rounding before rollout probabilities.
+        # This trades serving compute/memory for precision; per-engine overrides still win.
+        args.sglang_enable_fp32_lm_head = True
+
     if args.true_on_policy_mode:
+        # True on-policy mode overrides the parsed setting to keep inference deterministic.
         args.sglang_enable_deterministic_inference = True
 
     if getattr(args, "recompute_logprobs_via_prefill", False):
+        # Prefill logprob recomputation overrides both parsed settings for deterministic scoring.
         args.sglang_enable_prefill_only_deterministic_inference = True
         args.sglang_enable_deterministic_inference = True
 
@@ -202,4 +212,4 @@ def validate_args(args):
             args.router_assignment_mode = "min_load"
 
     if getattr(args, "sglang_router_ip", None):
-        args.sglang_router_ip = _wrap_ipv6(args.sglang_router_ip)
+        args.sglang_router_ip = wrap_ipv6(args.sglang_router_ip)

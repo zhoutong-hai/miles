@@ -17,12 +17,14 @@ from unittest.mock import patch
 
 import httpx
 import numpy as np
+from tests.fast.fixtures.session_fixtures import make_session_server_config
 
 from miles.rollout.base_types import GenerateFnInput
 from miles.rollout.generate_hub import agentic_tool_call
 from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
 from miles.rollout.session.samples.codec import SamplesReply
 from miles.rollout.session.server import SessionServer
+from miles.rollout.session.types import SessionServerInstance
 from miles.utils import http_utils
 from miles.utils.http_utils import find_available_port
 from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
@@ -33,7 +35,7 @@ V2 = "v2"
 SESSION_PARITY_SEED = 20260803
 
 _CHAT_TIMEOUT_SECS = 120.0
-_PICKER_PATH = "miles.rollout.session.v2.picker_hub.drop_retries"
+_PICKER_PATH = "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries"
 _POSTPROCESSOR_PATH = "miles.rollout.session.v2.postprocessor_hub.default_postprocess"
 _RUNTIME_LIFECYCLE_KEYS = frozenset({"t0", "t1", "req_ts", "prev_t1"})
 _EXPECTED_AGENT_METADATA = {
@@ -99,7 +101,10 @@ async def _run_and_collect(
     input_samples: list[Sample],
 ) -> list[tuple[dict[str, Any], SamplesReply, list[Sample]]]:
     async with httpx.AsyncClient(timeout=None) as client:
-        with patch.object(http_utils, "_http_client", client):
+        with (
+            patch.dict(http_utils._http_clients, {asyncio.get_running_loop(): client}),
+            patch.object(http_utils, "_client_concurrency", 1),
+        ):
             original_collect = OpenAIEndpointTracer.collect_samples
             collected: dict[int, tuple[dict[str, Any], SamplesReply]] = {}
 
@@ -230,6 +235,7 @@ def assert_sample_bitwise_equal(
 def _serve_session(*, backend_url: str, hf_checkpoint: str, version: str) -> Iterator[SimpleNamespace]:
     port = find_available_port(31000)
     instance_id = f"session-parity-{version}"
+    session_addr = f"127.0.0.1:{port}"
     args = SimpleNamespace(
         miles_router_timeout=_CHAT_TIMEOUT_SECS,
         hf_checkpoint=hf_checkpoint,
@@ -240,19 +246,35 @@ def _serve_session(*, backend_url: str, hf_checkpoint: str, version: str) -> Ite
         use_session_server=version,
         use_rollout_routing_replay=False,
         use_rollout_indexer_replay=False,
-        session_server_instance_id=instance_id,
+        use_sampling_support_replay=False,
+        pause_generation_mode="retract",
         session_server_ip="127.0.0.1",
-        session_server_ports=[port],
-        session_server_instance_ids={port: instance_id},
+        session_server_instances=[SessionServerInstance(addr=session_addr, instance_id=instance_id)],
         save_debug_trajectory_data=None,
         custom_agent_function_path="miles.utils.test_utils.session_verify_agent.run_agent",
+        custom_agent_function_mode="inline",
+        partial_rollout=False,
         max_seq_len=None,
         session_verify_cycles=1,
         tool_call_failure_mode="rollback",
         session_sample_picker_path=_PICKER_PATH,
         session_sample_postprocessor_path=_POSTPROCESSOR_PATH,
     )
-    app = SessionServer(args, backend_url=backend_url).app
+    config = make_session_server_config(
+        host=args.session_server_ip,
+        port=port,
+        instance_id=instance_id,
+        backend_url=backend_url,
+        timeout=args.miles_router_timeout,
+        hf_checkpoint=args.hf_checkpoint,
+        apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+        tito_model=args.tito_model,
+        use_session_server=args.use_session_server,
+        pause_generation_mode=args.pause_generation_mode,
+        session_sample_picker_path=args.session_sample_picker_path,
+        session_sample_postprocessor_path=args.session_sample_postprocessor_path,
+    )
+    app = SessionServer(config).app
     server = UvicornThreadServer(app, host=args.session_server_ip, port=port)
     server.start()
     try:

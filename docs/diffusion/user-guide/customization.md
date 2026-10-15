@@ -63,15 +63,14 @@ unset.
 ### `--data-source-path`
 
 **Class** (not a function). Default:
-`miles.rollout.data_source.RolloutDataSourceWithBuffer`.
+`miles.rollout.data_source.RolloutDataSource`.
 
 ```python
 class CustomDataSource:
     def __init__(self, args): ...
     def get_samples(self, num_samples) -> list[list[Sample]]: ...
-    def add_samples(self, samples) -> None: ...
-    def save(self, rollout_id) -> None: ...
-    def load(self, rollout_id=None) -> None: ...
+    def save(self, directory: Path) -> None: ...
+    def load(self, directory: Path) -> None: ...
 ```
 
 ### `--custom-generate-function-path`
@@ -177,7 +176,7 @@ Per-group filter after scoring (DAPO-style). Stock:
 
 ```python
 def filter_function(args, samples: list[Sample], **kwargs):
-    # return DynamicFilterOutput(keep=..., reason=...) or a bool
+    # return FilterOutput(keep=..., reason=...) or a bool
     ...
 ```
 

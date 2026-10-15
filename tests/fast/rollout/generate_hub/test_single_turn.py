@@ -1,6 +1,6 @@
 from tests.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=220, suite="stage-b-cpu", labels=[])
+register_cpu_ci(est_time=220, suite="stage-b-cpu", labels=["rollout"])
 
 import numpy as np
 import pybase64
@@ -10,9 +10,12 @@ from PIL import Image
 from tests.fast.fixtures.generation_fixtures import GenerateEnv, generation_env, listify, make_sample, run_generate
 from transformers import AutoProcessor
 
+from miles.rollout.base_types import GenerateFnInput
+from miles.rollout.generate_hub import single_turn
+from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
 from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.test_utils.mock_sglang_server import ProcessResult, ProcessResultMetaInfo
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 _ = generation_env
 
@@ -43,6 +46,7 @@ def expected_request(
     return_routed_experts: bool = False,
     return_indexer_topk: bool = False,
     image_data: list[str] | None = None,
+    extra_key: str | None = None,
 ) -> dict:
     result = {
         "input_ids": input_ids or PROMPT_TOKENS,
@@ -55,6 +59,8 @@ def expected_request(
         result["return_indexer_topk"] = return_indexer_topk
     if image_data is not None:
         result["image_data"] = image_data
+    if extra_key is not None:
+        result["extra_key"] = extra_key
     return result
 
 
@@ -76,22 +82,42 @@ def expected_sample(
     status: Sample.Status = Sample.Status.COMPLETED,
     cached_tokens: int = 0,
     prompt_tokens: int = 7,
-    weight_versions: list[str] | None = None,
+    weight_versions: list[str | None] | None = None,
+    prefill_spans: list[WeightVersionSpan] | None = None,
+    output_starts: list[int] | None = None,
     rollout_routed_experts: np.ndarray | None = None,
     spec_info: Sample.SpecInfo | None = None,
     multimodal_inputs: dict | None = None,
     multimodal_train_inputs: dict | None = None,
     loss_mask: list[int] | None | _Unset = _UNSET,
+    kv_cache_namespace: str | None = None,
 ) -> Sample:
     actual_response_length = response_length if response_length is not None else len(RESPONSE_TOKENS)
     if isinstance(loss_mask, _Unset):
         loss_mask = [1] * actual_response_length if variant == "multi_turn" else None
+    actual_tokens = PROMPT_TOKENS + RESPONSE_TOKENS if isinstance(tokens, _Unset) else tokens
+    versions = weight_versions if weight_versions is not None else [None]
+    expected_weight_versions = [
+        WeightVersionsPerCall(
+            spans=(
+                []
+                if version is None
+                else [WeightVersionSpan(version, len(actual_tokens) - actual_response_length, len(actual_tokens))]
+            ),
+            prefill_spans=prefill_spans or [],
+            output_start=output_start,
+            prompt_tokens=output_start,
+        )
+        for version, output_start in zip(
+            versions, output_starts or [len(actual_tokens) - actual_response_length] * len(versions), strict=True
+        )
+    ]
 
     return Sample(
         group_index=None,
         index=None,
         prompt=prompt,
-        tokens=PROMPT_TOKENS + RESPONSE_TOKENS if isinstance(tokens, _Unset) else tokens,
+        tokens=actual_tokens,
         multimodal_inputs=multimodal_inputs,
         multimodal_train_inputs=multimodal_train_inputs,
         response=response,
@@ -99,7 +125,7 @@ def expected_sample(
         label=None,
         reward=None,
         loss_mask=loss_mask,
-        weight_versions=weight_versions or [],
+        weight_versions=expected_weight_versions,
         rollout_log_probs=RESPONSE_LOG_PROBS if isinstance(rollout_log_probs, _Unset) else rollout_log_probs,
         rollout_routed_experts=rollout_routed_experts,
         remove_sample=False,
@@ -109,6 +135,7 @@ def expected_sample(
         non_generation_time=0.0,
         spec_info=spec_info or Sample.SpecInfo(),
         prefix_cache_info=Sample.PrefixCacheInfo(cached_tokens=cached_tokens, total_prompt_tokens=prompt_tokens),
+        kv_cache_namespace=kv_cache_namespace,
     )
 
 
@@ -137,8 +164,58 @@ class TestBasicGeneration:
         assert listify(result.sample) == [expected_sample(variant)]
 
 
+class TestRadixCacheExtraKey:
+    def test_a_started_sample_partitions_the_cache_by_its_kv_cache_namespace(self, variant, generation_env):
+        """A sample with a kv_cache_namespace sends extra_key the namespace itself and keeps it."""
+        sample = _make_sample()
+        sample.kv_cache_namespace = "train:-:7"
+
+        result = _run_generate(variant, generation_env, sample)
+
+        assert result.requests == [expected_request(variant, extra_key="train:-:7")]
+        assert listify(result.sample) == [expected_sample(variant, kv_cache_namespace="train:-:7")]
+
+    def test_an_unstamped_sample_carries_no_extra_key(self, variant, generation_env):
+        """With the partition off nothing stamps the sample, so the request looks exactly as it used to."""
+        result = _run_generate(variant, generation_env, _make_sample())
+
+        assert "extra_key" not in result.requests[0]
+        assert result.requests == [expected_request(variant)]
+        assert listify(result.sample) == [expected_sample(variant)]
+
+
+class TestEndpointRouting:
+    @pytest.mark.parametrize("variant", ["single_turn"])
+    async def test_an_explicit_url_routes_generation_to_that_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, variant: str, generation_env: GenerateEnv
+    ) -> None:
+        """An explicit endpoint overrides the router address configured in the arguments."""
+        requested_urls: list[str] = []
+
+        async def fake_post(
+            url: str, payload: dict[str, object], headers: dict[str, str] | None = None
+        ) -> dict[str, object]:
+            requested_urls.append(url)
+            return {"text": "", "meta_info": {"finish_reason": {"type": "stop"}}}
+
+        monkeypatch.setattr(single_turn, "post", fake_post)
+        state = GenerateState(generation_env.args)
+        generate_input = GenerateFnInput(
+            state=state,
+            sample=_make_sample(),
+            sampling_params=SAMPLING_PARAMS.copy(),
+            evaluation=False,
+        )
+        explicit_url = "http://policy-router:4321/generate"
+
+        await single_turn.generate(generate_input, url=explicit_url)
+
+        assert requested_urls == [explicit_url]
+
+
 class TestResumedSingleTurn:
-    def test_two_consecutive_calls_on_same_sample(self, variant, generation_env):
+    def test_two_consecutive_calls_on_same_sample(self, variant: str, generation_env: GenerateEnv) -> None:
+        """An aborted sample resumes with the same radix cache key and accumulated output."""
         if variant == "multi_turn":
             pytest.skip("not tested yet")
         partial_text = "\\boxed"
@@ -151,10 +228,12 @@ class TestResumedSingleTurn:
 
         generation_env.mock_server.process_fn = lambda _: ProcessResult(text=partial_text, finish_reason="abort")
         sample = _make_sample()
-        result1 = _run_generate(variant, generation_env, sample)
-        assert result1.requests == [expected_request(variant)]
+        sample.kv_cache_namespace = "train:-:7"
+        result1 = _run_generate(variant=variant, env=generation_env, sample=sample)
+        assert result1.requests == [expected_request(variant=variant, extra_key="train:-:7")]
         assert result1.sample == expected_sample(
-            variant,
+            variant=variant,
+            kv_cache_namespace="train:-:7",
             response=partial_text,
             response_length=2,
             tokens=PROMPT_TOKENS + partial_tokens,
@@ -163,23 +242,27 @@ class TestResumedSingleTurn:
         )
 
         generation_env.mock_server.process_fn = lambda _: ProcessResult(text=remaining_text, finish_reason="stop")
-        result2 = _run_generate(variant, generation_env, result1.sample)
+        result2 = _run_generate(variant=variant, env=generation_env, sample=result1.sample)
         tokens_after_turn1 = PROMPT_TOKENS + partial_tokens
         assert result2.requests == [
             expected_request(
-                variant,
+                variant=variant,
+                extra_key="train:-:7",
                 input_ids=tokens_after_turn1,
                 sampling_params={"max_new_tokens": 14, "temperature": 0.7},
             )
         ]
         assert result2.sample == expected_sample(
-            variant,
+            variant=variant,
+            kv_cache_namespace="train:-:7",
             response=partial_text + remaining_text,
             response_length=2 + 3,
             tokens=tokens_after_turn1 + remaining_tokens,
             rollout_log_probs=partial_log_probs + remaining_log_probs,
             prompt_tokens=len(PROMPT_TOKENS) + len(tokens_after_turn1),
             status=Sample.Status.COMPLETED,
+            weight_versions=[None, None],
+            output_starts=[len(PROMPT_TOKENS), len(tokens_after_turn1)],
         )
 
 
@@ -247,8 +330,39 @@ class TestMetaInfo:
         "generation_env",
         [
             {
+                "process_fn_kwargs": {
+                    "weight_version": "2",
+                    "prefill_weight_versions": [
+                        {"version": "1", "start": 0, "end": 3},
+                        {"version": "2", "start": 3, "end": PROMPT_TOKEN_LEN},
+                    ],
+                }
+            }
+        ],
+        indirect=True,
+    )
+    def test_prefill_weight_versions_reach_the_sample(self, variant, generation_env):
+        """Prompt KV version spans reported by the engine land on the call, indexed from the first prompt token."""
+        result = _run_generate(variant, generation_env)
+
+        assert listify(result.sample) == [
+            expected_sample(
+                variant,
+                weight_versions=["2"],
+                prefill_spans=[WeightVersionSpan("1", 0, 3), WeightVersionSpan("2", 3, PROMPT_TOKEN_LEN)],
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "generation_env",
+        [
+            {
                 "args_kwargs": {"sglang_speculative_algorithm": "EAGLE"},
-                "process_fn_kwargs": {"spec_accept_token_num": 10, "spec_draft_token_num": 15, "spec_verify_ct": 3},
+                "process_fn_kwargs": {
+                    "spec_num_correct_drafts": 10,
+                    "spec_num_proposed_drafts": 15,
+                    "spec_verify_ct": 3,
+                },
             }
         ],
         indirect=True,
@@ -260,7 +374,7 @@ class TestMetaInfo:
             expected_sample(
                 variant,
                 spec_info=Sample.SpecInfo(
-                    spec_accept_token_num=10, spec_draft_token_num=15, spec_verify_ct=3, completion_token_num=5
+                    spec_num_correct_drafts=10, spec_num_proposed_drafts=15, spec_verify_ct=3, completion_tokens=5
                 ),
             )
         ]
@@ -284,10 +398,10 @@ class TestInputStatusValidation:
 class TestPayloadStructure:
     def test_sampling_params_passed_through(self, variant, generation_env):
         result = _run_generate(
-            variant, generation_env, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 0.9}
+            variant, generation_env, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 1.0}
         )
         assert result.requests == [
-            expected_request(variant, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 0.9})
+            expected_request(variant, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 1.0})
         ]
         assert listify(result.sample) == [expected_sample(variant)]
 
@@ -309,6 +423,7 @@ class TestBoundaryConditions:
             rollout_log_probs=None,
             status=Sample.Status.TRUNCATED,
             prompt_tokens=0,
+            weight_versions=[],
         )
 
     @pytest.mark.parametrize("generation_env", [{"args_kwargs": {"rollout_max_context_len": 5}}], indirect=True)
@@ -328,6 +443,7 @@ class TestBoundaryConditions:
                 status=Sample.Status.TRUNCATED,
                 prompt_tokens=0,
                 loss_mask=None if variant == "multi_turn" else _UNSET,
+                weight_versions=[],
             )
         ]
 
@@ -370,6 +486,7 @@ class TestBoundaryConditions:
                 status=Sample.Status.TRUNCATED,
                 prompt_tokens=0,
                 loss_mask=None if variant == "multi_turn" else _UNSET,
+                weight_versions=[],
             )
         ]
 

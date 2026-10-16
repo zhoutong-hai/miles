@@ -188,6 +188,42 @@ settings. This sampler does not guarantee an entropy floor or learning gain.
 Interpret rewards/entropy on comparable task cohorts: changing the selected
 mixture can move batch averages even without learning.
 
+##### Optional coverage schedule
+
+To schedule discovery from remaining unseen rows instead of a fixed bucket
+weight, add these fields inside `adaptive_sampling`:
+
+```yaml
+unseen_schedule: coverage_linear
+unseen_start_fraction: 0.75
+unseen_end_fraction: 0.25
+```
+
+For each stratum, discovery probability is `end + (start - end) * U / N`,
+where `U` counts rows never presented and `N` is the stratum size. It becomes
+zero at `U == 0`. The configured unseen bucket weight is ignored in this mode;
+the other weights retain their relative proportions (4:1:1 in the example).
+The outer dataset-proportional stratum allocator is unchanged. Selection uses
+the saved seeded RNG, with no duplicate rows inside a batch. Percentages are
+probabilities, not exact batch quotas or a guaranteed full-coverage deadline.
+The existing warmup applies first; unavailable pools fall back to available rows.
+
+Revisits use the latest trusted reward bucket and least-recent selection within
+that bucket. A presented row with no trusted reward is not new and is not labeled
+hard: it has a neutral refresh lane of weight one alongside available revisit
+buckets. Therefore legacy `pool_unseen`/`selected_unseen` (unrated history) need
+not equal never-presented coverage. Use the additional metrics:
+
+- `scheduled_unseen_fraction`: average pre-fallback probability over selected slots.
+- `selected_new_rows`, `selected_revisit_rows`, `actual_new_fraction`: actual coverage choices.
+- `unseen_rows_remaining`: never-presented rows after selection.
+
+Coverage is derived from visit counts and survives native save/restore, together
+with RNG and selection metrics. Changing the schedule or endpoints rejects an
+exact resume. Omitted `unseen_schedule` retains the original fixed behavior and
+checkpoint identity. This schedule changes coverage, not the reward objective,
+entropy coefficient, temperature, or the number of generated responses.
+
 ### `--eval-function-path`
 
 Same signature as `--rollout-function-path`. Defaults to whatever rollout function is

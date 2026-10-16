@@ -226,5 +226,14 @@ class TestAdaptiveRollout(unittest.TestCase):
         self.source.abort_rollout()
 
 
+class TestCoverageRollout(TestAdaptiveRollout):
+    """Run the same native boundary/rollback/resume contracts with scheduling."""
+
+    def setUp(self):
+        super().setUp()
+        self.args.adaptive_sampling["unseen_schedule"] = "coverage_linear"
+        self.source = self.module.AdaptiveDataSource(self.args)
+
+
 if __name__ == "__main__":
     unittest.main()

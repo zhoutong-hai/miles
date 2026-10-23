@@ -9,6 +9,7 @@ from sglang_router.launch_router import RouterArgs
 
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
+from miles.backends.training_utils.adaptive_entropy import validate_adaptive_entropy_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
@@ -1471,6 +1472,24 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Interval (in rollout steps) to update ref model from actor. If None, ref model is not updated.",
             )
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
+            parser.add_argument(
+                "--adaptive-entropy-target",
+                type=float,
+                default=None,
+                help="Target observed training entropy; enables bounded coefficient feedback",
+            )
+            parser.add_argument(
+                "--adaptive-entropy-rate",
+                type=float,
+                default=None,
+                help="Additive coefficient change per unit entropy error after a successful optimizer step",
+            )
+            parser.add_argument(
+                "--adaptive-entropy-max-coef",
+                type=float,
+                default=None,
+                help="Maximum nonnegative entropy coefficient for adaptive feedback",
+            )
             parser.add_argument("--observe-router-load", action="store_true", help="Aggregate frozen-router load observations")
             parser.add_argument("--router-load-snapshot-interval", type=int, default=10)
             parser.add_argument("--router-load-output", type=str, default=None, help="Private aggregate count directory, no model state")
@@ -2867,6 +2886,8 @@ def miles_validate_args(args):
         ):
             raise ValueError("Dr. GRPO requires centered/no-std rewards, fixed generation budget, "
                              "sample reduction and no additional advantage/custom loss normalization")
+
+    validate_adaptive_entropy_args(args)
 
     args.ft_components = _resolve_ft_components(args)
     args.eval_datasets = _resolve_eval_datasets(args)

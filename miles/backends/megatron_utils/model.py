@@ -25,6 +25,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from miles.backends.megatron_utils.adaptive_entropy import advance_adaptive_entropy, restore_adaptive_entropy
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
@@ -777,9 +778,12 @@ def train(
     num_steps_per_rollout = len(num_microbatches)
     if parallel_state.indep_dp.size > 1:
         assert num_steps_per_rollout == 1, "indep_dp is incompatible with num_steps_per_rollout>1 currently"
+    role = getattr(model[0], "role", "actor")
+    adaptive_entropy = role == "actor" and getattr(args, "adaptive_entropy_target", None) is not None
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        scheduler_steps_before = opt_param_scheduler.num_steps if adaptive_entropy and opt_param_scheduler else None
 
         # Run training step.
         with router_observer.step() if router_observer is not None else nullcontext():
@@ -789,6 +793,12 @@ def train(
                 witness_info=witness_info, attempt=attempt,
                 ft_test_action_executor=ft_test_action_executor,
             )
+        entropy_controller_metrics = {}
+        if adaptive_entropy:
+            optimizer_advanced = (
+                scheduler_steps_before is not None and opt_param_scheduler.num_steps > scheduler_steps_before
+            )
+            entropy_controller_metrics = advance_adaptive_entropy(args, loss_dict, optimizer_advanced)
         if router_observer is not None and train_step_outcome == TrainStepOutcome.NORMAL:
             router_observer.finish(rollout_id, step_id, num_steps_per_rollout)
 
@@ -826,10 +836,9 @@ def train(
         # per train step log.
         if (train_step_outcome == TrainStepOutcome.NORMAL) and is_first_replica_megatron_main_rank():
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
-            role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
 
-            extra_metrics = {}
+            extra_metrics = dict(entropy_controller_metrics)
             if args.enable_mtp_training and mtp_losses is not None:
                 extra_metrics["mtp_loss"] = mtp_losses
 
@@ -978,6 +987,9 @@ def initialize_model_and_optimizer(
                 # refresh the fp32 masters, or the first step() restores the
                 # pre-load init values over the adapter we just wrote
                 optimizer.reload_model_params()
+
+    if role == "actor":
+        restore_adaptive_entropy(args, iteration)
 
     check_peak_gpu_memory_after_load(args)
     clear_memory()

@@ -21,6 +21,7 @@ def maybe_dump_policy_loss_debug(
     local_loss_masks: list[torch.Tensor],
     ppo_kl: torch.Tensor,
     pg_loss: torch.Tensor,
+    score_centering: dict[str, torch.Tensor] | None = None,
 ) -> None:
     dump_dir = args.dump_details
     if dump_dir is None:
@@ -57,20 +58,22 @@ def maybe_dump_policy_loss_debug(
                 sample["train_rollout_abs_diff"] = to_cpu((train_lp - rollout_log_probs[index]).abs())
         samples.append(sample)
 
-    torch.save(
-        {
-            "rank": rank,
-            "call": counter,
-            "samples": samples,
-            "ppo_kl": to_cpu(ppo_kl),
-            "pg_loss": to_cpu(pg_loss),
-            "finite": {
-                "ppo_kl": torch.isfinite(ppo_kl).all().item(),
-                "pg_loss": torch.isfinite(pg_loss).all().item(),
-                "train_log_probs": all(torch.isfinite(t).all().item() for t in train_log_probs),
-                "old_log_probs": all(torch.isfinite(t).all().item() for t in old_log_probs),
-                "advantages": all(torch.isfinite(t).all().item() for t in advantages),
-            },
+    payload = {
+        "rank": rank,
+        "call": counter,
+        "samples": samples,
+        "ppo_kl": to_cpu(ppo_kl),
+        "pg_loss": to_cpu(pg_loss),
+        "finite": {
+            "ppo_kl": torch.isfinite(ppo_kl).all().item(),
+            "pg_loss": torch.isfinite(pg_loss).all().item(),
+            "train_log_probs": all(torch.isfinite(t).all().item() for t in train_log_probs),
+            "old_log_probs": all(torch.isfinite(t).all().item() for t in old_log_probs),
+            "advantages": all(torch.isfinite(t).all().item() for t in advantages),
         },
-        path,
-    )
+    }
+    if score_centering is not None:
+        payload["score_centering"] = {key: value.detach().cpu() for key, value in score_centering.items()}
+        payload["sample_indices"] = batch.get("sample_indices")
+        payload["pg_loss_stage"] = "BEFORE_SAMPLED_TIS_AND_CENTERING"
+    torch.save(payload, path)

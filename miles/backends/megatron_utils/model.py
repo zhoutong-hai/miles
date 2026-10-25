@@ -29,6 +29,7 @@ from miles.backends.megatron_utils.lora.native import wrap_model_provider_with_l
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
 from miles.backends.training_utils.data.rollout import DataIterator, get_batch
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
+from miles.backends.training_utils.loss.hub.policy_score_centering_loss import old_policy_log_probs_with_candidates
 from miles.backends.training_utils.loss.objective import loss_function
 from miles.backends.training_utils.metrics.checks import check_grad_norm, check_kl
 from miles.backends.training_utils.metrics.log_utils import (
@@ -345,6 +346,9 @@ def forward_only(
         ]
         if use_rollout_sampling_mask:
             forward_only_keys.extend(["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"])
+        capture_policy_candidates = args.policy_score_centering and store_prefix == ""
+        if capture_policy_candidates:
+            forward_only_keys.extend(["rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_topk_lengths"])
         batch = get_batch(
             data_iterator,
             forward_only_keys,
@@ -387,7 +391,10 @@ def forward_only(
         if use_rollout_sampling_mask:
             callback_kwargs["rollout_sampling_mask"] = rollout_sampling_mask
 
-        return output_tensor, partial(f, **callback_kwargs)
+        callback = partial(f, **callback_kwargs)
+        if capture_policy_candidates:
+            callback = partial(old_policy_log_probs_with_candidates, args=args, batch=batch, callback=callback)
+        return output_tensor, callback
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
@@ -488,6 +495,7 @@ def run_forward_backward_pass(
                 "rollout_topk_token_ids",
                 "rollout_topk_lengths",
                 "rollout_topk_log_probs",
+                "old_policy_topk_log_probs",
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",

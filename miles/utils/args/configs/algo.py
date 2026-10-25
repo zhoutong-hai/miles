@@ -98,6 +98,10 @@ class AlgoConfig(BaseConfig):
     score_centering_tis_clip: A[float, Arg()] = 2.0
     score_centering_mis_low: A[float, Arg()] = 0.5
     score_centering_mis_high: A[float, Arg()] = 5.0
+    policy_score_centering: A[
+        bool,
+        Arg(help="Experimental token PPO+TIS score centering with group-relative advantages (Megatron CP1)."),
+    ] = False
     custom_loss_function_path: A[
         CustomFunctionConfig | None,
         Arg(

@@ -5,7 +5,6 @@ from sglang.srt.server_args import ServerArgs
 from miles.utils.args.utils import config_values
 from miles.utils.http_utils import wrap_ipv6
 
-
 _SKIPPED_SERVER_ARGS = [
     "model_path",
     "config",
@@ -130,7 +129,7 @@ def add_sglang_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 def validate_args(args):
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
 
-    if args.loss_type == "score_centering":
+    if args.loss_type == "score_centering" or args.policy_score_centering:
         # Score centering forces the base LM-head setting on, overriding the parsed
         # value to avoid lower-precision logits rounding before rollout probabilities.
         # This trades serving compute/memory for precision; per-engine overrides still win.

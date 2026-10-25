@@ -21,6 +21,7 @@ def _args(**overrides: object) -> Namespace:
         ci_test=False,
         enable_sample_ownership_checker=False,
         loss_type="score_centering",
+        policy_score_centering=False,
         rollout_top_logprobs_num=3,
         rollout_sampling_logprobs_mode="selected",
         use_opd=False,

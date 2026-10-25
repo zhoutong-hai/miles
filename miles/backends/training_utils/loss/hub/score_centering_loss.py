@@ -22,12 +22,14 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
 
 
-def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
+def _candidate_log_probs(
+    args: Namespace, batch: RolloutBatch, logits: torch.Tensor, *, policy_loss: bool = False
+) -> dict[str, list[torch.Tensor]]:
     parallel = get_parallel_state()
     result = {"selected": []}
     if args.use_kl_loss:
         result["kl_log_probs"] = []
-    with_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    with_entropy = not policy_loss and (args.entropy_coef != 0 or args.observe_training_entropy)
     replay = args.use_sampling_support_replay
     support_only = replay and not args.use_kl_loss
     if with_entropy:
@@ -49,7 +51,9 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
             chunk,
             ids,
             group=parallel.tp.group if parallel.tp.size > 1 else None,
-            vocab_size=args.backend.vocab_size if args.train_backend == "megatron" else None,
+            # PPO's torch backend normalizes over the padded trainer vocabulary.
+            # Match that existing policy distribution, including in the old forward.
+            vocab_size=args.backend.vocab_size if args.train_backend == "megatron" and not policy_loss else None,
             temperature=args.rollout_temperature,
             chunk_size=args.log_probs_chunk_size,
             with_entropy=with_entropy and (not replay or support_only),

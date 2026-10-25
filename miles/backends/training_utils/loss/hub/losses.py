@@ -19,6 +19,10 @@ from miles.backends.training_utils.loss.hub.math_utils import (
     compute_opsm_mask,
     compute_policy_loss,
 )
+from miles.backends.training_utils.loss.hub.policy_score_centering_loss import (
+    checked_policy_frozen_log_probs,
+    policy_centering_token_loss,
+)
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.args.custom_view import compute_custom_function_config
@@ -198,6 +202,16 @@ def policy_loss_function(
     )
     local_loss_masks = torch.cat(local_loss_mask_list, dim=0).to(device=ppo_kl.device)
     active_tokens = local_loss_masks.bool()
+    if args.policy_score_centering:
+        trainer_scored_log_probs, rollout_old_log_probs = checked_policy_frozen_log_probs(
+            trainer_scored_log_probs,
+            rollout_old_log_probs,
+            active_tokens,
+        )
+        old_log_probs_list = trainer_scored_log_probs
+        old_log_probs = torch.cat(trainer_scored_log_probs)
+        if not torch.isfinite(log_probs[active_tokens]).all():
+            raise ValueError("Policy centering requires finite sampled current-trainer log-probabilities")
     ppo_kl = torch.where(
         active_tokens,
         torch.nan_to_num(ppo_kl, nan=0.0, posinf=0.0, neginf=0.0),
@@ -210,6 +224,9 @@ def policy_loss_function(
     )
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c)
+    centering_debug = None
+    if args.policy_score_centering:
+        correction, centering_metrics, centering_debug = policy_centering_token_loss(args, batch, logits)
 
     if args.dump_details is not None:
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
@@ -224,6 +241,7 @@ def policy_loss_function(
             local_loss_masks=local_loss_mask_list,
             ppo_kl=ppo_kl,
             pg_loss=pg_loss,
+            score_centering=centering_debug,
         )
 
     if args.use_opsm:
@@ -276,6 +294,11 @@ def policy_loss_function(
             max_seq_lens,
             denominators=batch.get("rollout_mask_sums", None),
         )
+
+    if args.policy_score_centering:
+        # Correction already integrates the effective PPO+TIS mass over candidates.
+        # Applying sampled TIS here would weight it twice and change the estimator.
+        pg_loss = pg_loss + correction
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if args.custom_pg_loss_reducer_function_path is not None:
@@ -396,6 +419,9 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    if args.policy_score_centering:
+        reported_loss.update({key: sum_of_sample_mean(value).detach() for key, value in centering_metrics.items()})
 
     # Add OPD metrics if available
     if batch.get("opd_reverse_kl") is not None:

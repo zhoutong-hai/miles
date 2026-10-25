@@ -93,6 +93,7 @@ _ARGS_DEFAULTS = dict(
     opd_kl_coef=1.0,
     # policy_loss_function
     loss_type="policy_loss",
+    policy_score_centering=False,
     eps_clip=0.2,
     eps_clip_high=0.2,
     entropy_coef=0.01,

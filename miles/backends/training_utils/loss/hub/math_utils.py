@@ -14,9 +14,8 @@ from miles.backends.training_utils.data.context_parallel import (
     slice_log_prob_with_cp,
     slice_loss_masks_for_local_cp,
 )
+from miles.backends.training_utils.loss.hub.policy_ratio import LOG_RATIO_EXP_CLAMP as _LOG_RATIO_EXP_CLAMP
 from miles.backends.training_utils.parallel import get_parallel_state
-
-_LOG_RATIO_EXP_CLAMP = 20.0
 
 
 def _safe_clamp_log_ratio(log_ratio: torch.Tensor) -> torch.Tensor:

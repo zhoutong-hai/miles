@@ -34,6 +34,92 @@ Reference-KL tokens with non-finite probabilities or absolute log-probability ra
 
 Training logs include `train/train_rollout_logprob_abs_diff` and `train/train_rollout_kl`. The latter uses the same masked, sampled-token k3 estimator of KL(rollout || train) as the policy loss. It is a detached diagnostic and is emitted even when reference-KL regularization is disabled.
 
+## Experimental token PPO + TIS centering
+
+`--policy-score-centering` adds centering to the native `policy_loss` actor
+objective, with group-relative advantages and **no learned critic or GAE**:
+
+```bash
+--loss-type policy_loss \
+--advantage-estimator grpo \
+--policy-score-centering \
+--use-tis --tis-clip 2 --tis-clip-low 0 \
+--eps-clip 0.2 --eps-clip-high 0.2 \
+--rollout-top-logprobs-num 128 \
+--rollout-temperature 1 --rollout-top-p 1 --rollout-top-k -1 \
+--disable-grpo-std-normalization \
+--entropy-coef 0 --kl-coef 0 --observe-training-entropy
+```
+
+Keep the standalone old-trainer forward enabled and omit
+`--use-rollout-logprobs`. The policy ratio is `p / p_old`; the separate, detached
+token TIS weight is `min(p_old / q, tis_clip)`. This is not another `p / q`
+factor on a rollout-anchored PPO loss. Native sample means give equal response
+weighting when `--calculate-per-token-loss` is omitted. Sampling, model precision,
+batch size, optimizer updates and evaluations remain explicit recipe choices.
+
+This first implementation accepts only Megatron, CP1, the torch log-probability
+backend and unfiltered sampling. It rejects critic/GAE PPO, GSPO, dual clipping,
+skipped old-policy forwards, custom TIS/reducers, OPSM, OPD, multi-LoRA, filtered
+sampling and speculative decoding. Other configurations need separate
+qualification. The original `score_centering` loss and the default policy path
+remain unchanged when this flag is off.
+
+Let `g(v,A)` be the derivative multiplier of the sign-dependent PPO clip branch.
+It is zero above the upper ratio bound for positive advantages and below the
+lower bound for negative advantages; exact boundary derivatives follow native
+PyTorch clamp/maximum conventions. The centered effective score has weight:
+
+```text
+u(v) = stop_gradient(min(p_old(v) / q(v), c) * p(v) / p_old(v) * g(v,A))
+```
+
+The sampled loss remains native PPO+TIS. Its additive correction integrates
+`q*u` over candidates; the correction must not receive sampled TIS again.
+Outside the retained head, model **both** `q` and `p_old` as proportional to the
+current trainer distribution, each with its own remaining mass. If their tail
+masses are `q_tail`, `old_tail` and `p_tail`, then:
+
+```text
+r_tail = p_tail / old_tail
+alpha  = min(1, c * q_tail / old_tail) * g(r_tail,A)
+mass_H = min(p_old[H], c*q[H]) * p[H]/p_old[H] * g(H,A)
+additive_token_loss = A * sum(stop_gradient(mass_H - alpha*p[H]) * log(p[H]))
+```
+
+Tail masses use the existing numerical floor. The native ratio exponent safety
+clamp is included in the derivative multiplier. Full-head coverage gives exact
+centering; K=128 with omitted candidates approximates two tails. No head
+renormalization or vocabulary-wide tensor gather is introduced. Candidate scoring
+uses the same padded trainer-vocabulary distribution as native torch PPO.
+
+The existing frozen old-policy forward also captures `old_policy_topk_log_probs`
+for the sampler's candidate IDs. The field is ephemeral rollout training data,
+not a new model or training checkpoint. It is consumed by the matching training
+microbatch and excluded from scalar rollout summaries. Active sampled old/rollout
+scores must be finite; masked observation rows are sanitized before native TIS.
+
+Centering changes the gradient even when the sampled PPO branch is clipped:
+that sample can still contribute a centering correction. This is a centered
+PPO-style estimator, not a claim to preserve the unchanged clipped PPO objective
+or its guarantees. With one optimizer update per fresh batch, trainer-anchored
+ratios start near one and clipping may rarely bind; report actual binding.
+
+The existing native entropy metric remains available at zero coefficient.
+Additional `sc_*` metrics report current/old/sampler head masses, effective head
+mass, tail ratios and correction size. With `--dump-details`, policy debug dumps
+also retain aligned current/old/sampler candidate scores, candidate IDs, sample
+indices and additive token losses. The existing `pg_loss` dump is explicitly
+marked as preceding sampled TIS and centering; native training metrics contain
+the final combined loss.
+
+CPU dense-oracle tests cover signed clipping, exact boundaries, detachment,
+constant-advantage drift cancellation and reconstructed two-tail distributions.
+The consumer test uses real PPO/TIS/candidate/reduction code with a dense CPU
+replacement for the GPU selected-token cross-entropy kernel. These tests do not
+establish GPU, full-model, CP>1, quantized-rollout protocol, memory, performance
+or learning acceptance. Qualify the actual frozen runtime before model training.
+
 ## How it works
 
 When the rollout distribution differs from the current trainer, even a constant reward can produce an unwanted average policy update. Score centering subtracts the expected weighted score under the rollout distribution.

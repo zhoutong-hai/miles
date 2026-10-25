@@ -35,6 +35,28 @@ Reference-KL tokens with non-finite probabilities or absolute log-probability ra
 
 Training logs include `train/train_rollout_logprob_abs_diff` and `train/train_rollout_kl`. The latter uses the same masked, sampled-token k3 estimator of KL(rollout || train) as the policy loss. It is a detached diagnostic and is emitted even when reference-KL regularization is disabled.
 
+## Sampler KL loss
+
+`--sampler-kl-coef 0.03` adds a differentiable KL from the recorded sampler to
+the trainer, independently of reference-KL flags. Use `--score-centering-is none`
+to compare SFC+sampler KL against SFC+TIS. The coefficient is constant, including
+fresh-sampler tokens; no sampler-age decay is implied. This is an explicit
+variation on the age-dependent recipe in the
+[SFC+KL article](https://huggingface.co/blog/NormalUhr/sfc-kl).
+
+The transported head is exact; omitted sampler probabilities are modeled as
+proportional to the trainer tail. Full-head gradients equal those of dense
+KL(q || p). Partial heads approximate an arbitrary true tail. The loss uses a
+fixed-sampler gradient surrogate, with its forward value replaced by the
+head-plus-tail KL estimate. Sampler probabilities and reconstruction coefficients
+are detached. The term remains active when reward advantages are zero.
+
+`train/sampler_kl_loss`, `train/sampler_kl_weighted_loss` and
+`train/sampler_kl_coef` report the new term. The existing detached sampled-token
+`train/train_rollout_kl` remains a separate diagnostic. Coefficient zero preserves
+the original loss path and its metrics. CPU gradient tests do not qualify a
+particular GPU runtime, transport, memory cost or learning outcome.
+
 ## How it works
 
 When the rollout distribution differs from the current trainer, even a constant reward can produce an unwanted average policy update. Score centering subtracts the expected weighted score under the rollout distribution.

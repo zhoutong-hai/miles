@@ -17,6 +17,7 @@ from miles.backends.training_utils.loss.hub.score_centering import (
     score_centering_loss,
     selected_log_probs_and_entropy,
 )
+from miles.backends.training_utils.loss.hub.score_centering.sampler_kl import sampler_kl_loss
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
 
@@ -192,10 +193,17 @@ def score_centering_loss_function(
     pg_loss = sum_of_sample_mean(token_loss)
     entropy = torch.cat(probabilities["entropy"]) if "entropy" in probabilities else None
     kl_log_probs = torch.cat(probabilities["kl_log_probs"]) if args.use_kl_loss else None
-    loss, log = _regularization(
-        args, batch, entropy, selected[:, 0], rollout, active, sum_of_sample_mean, kl_log_probs
-    )
+    loss, log = _regularization(args, batch, entropy, selected[:, 0], rollout, active, sum_of_sample_mean, kl_log_probs)
     loss = loss + pg_loss
+    sampler_kl_coef = getattr(args, "sampler_kl_coef", 0.0)
+    if sampler_kl_coef != 0:
+        sampler_kl = sum_of_sample_mean(sampler_kl_loss(selected[:, 1:], head, ids >= 0, active))
+        # This is a constant coefficient, including fresh-sampler tokens.
+        # Reference KL and the detached rollout-KL diagnostic remain separate.
+        loss = loss + sampler_kl_coef * sampler_kl
+        log["sampler_kl_loss"] = sampler_kl.detach()
+        log["sampler_kl_weighted_loss"] = (sampler_kl_coef * sampler_kl).detach()
+        log["sampler_kl_coef"] = sampler_kl.new_tensor(sampler_kl_coef)
     log.update({key: sum_of_sample_mean(value).detach() for key, value in metrics.as_log_dict().items()})
     log.update(loss=loss.detach(), pg_loss=pg_loss.detach())
     train_log_probs = torch.where(active, selected[:, 0].detach(), 0.0)

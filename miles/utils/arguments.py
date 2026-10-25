@@ -1633,6 +1633,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
             parser.add_argument(
+                "--sampler-kl-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Constant KL(rollout sampler || trainer) loss coefficient for score_centering. "
+                    "Uses recorded candidate probabilities and a proportional modeled tail, "
+                    "including fresh-sampler tokens. Independent of reference-KL coefficients."
+                ),
+            )
+            parser.add_argument(
                 "--kl-loss-type",
                 type=str,
                 choices=["k1", "k2", "k3", "low_var_kl"],

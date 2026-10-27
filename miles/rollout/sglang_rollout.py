@@ -13,6 +13,10 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+)
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.inference_rollout.compatibility import load_generate_function
@@ -204,6 +208,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if getattr(args, "use_rollout_indexer_replay", False):
         payload["return_indexer_topk"] = True
 
+    if not evaluation:
+        configure_rollout_topk_logprobs_request(args, payload)
+
     if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
         image_data = sample.multimodal_inputs["images"]
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
@@ -242,6 +249,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     sample.tokens = sample.tokens + new_response_tokens
     sample.response_length += len(new_response_tokens)
     sample.response += output["text"]
+    if not evaluation:
+        append_rollout_topk_logprobs(sample, output["meta_info"], getattr(args, "rollout_top_logprobs_num", 0))
 
     # When partial rollout and masking off policy is enabled, update the loss mask
     if sample.loss_mask is not None:

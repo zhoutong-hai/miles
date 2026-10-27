@@ -44,6 +44,8 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    rollout_topk_token_ids: numpy.ndarray | None = None  # [response, k], int32; -1 pads
+    rollout_topk_log_probs: numpy.ndarray | None = None  # [response, k], float32; -inf pads
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
     )
@@ -202,6 +204,11 @@ class Sample:
             assert (
                 len(self.opd_reverse_kl) == self.response_length
             ), f"opd_reverse_kl length ({len(self.opd_reverse_kl)}) != response_length ({self.response_length})"
+        if self.rollout_topk_token_ids is not None or self.rollout_topk_log_probs is not None:
+            ids, logps = self.rollout_topk_token_ids, self.rollout_topk_log_probs
+            assert ids is not None and logps is not None, "Candidate IDs and logprobs must both be present"
+            assert ids.ndim == 2 and ids.shape == logps.shape, "Candidate shapes must agree"
+            assert len(ids) == self.response_length, "Candidate rows must match response length"
         if self.rollout_routed_experts is not None:
             actual = len(self.rollout_routed_experts)
             expect = len(self.tokens) - 1
@@ -227,6 +234,9 @@ class Sample:
         ), f"cannot strip {n} tokens: only {self.response_length} output tokens available"
         self.tokens = self.tokens[:-n]
         self.response_length -= n
+        if self.rollout_topk_token_ids is not None:
+            self.rollout_topk_token_ids = self.rollout_topk_token_ids[:-n]
+            self.rollout_topk_log_probs = self.rollout_topk_log_probs[:-n]
         if self.rollout_log_probs is not None:
             self.rollout_log_probs = self.rollout_log_probs[:-n]
         if self.teacher_log_probs is not None:
@@ -258,6 +268,8 @@ class Sample:
         self.loss_mask = None
         self.weight_versions = []
         self.rollout_log_probs = None
+        self.rollout_topk_token_ids = None
+        self.rollout_topk_log_probs = None
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None
         self.status = Sample.Status.ABORTED

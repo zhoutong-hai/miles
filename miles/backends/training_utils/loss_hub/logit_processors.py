@@ -5,10 +5,11 @@ import torch
 
 from miles.backends.training_utils.cp_utils import allgather_cp_redistribute, get_logits_and_tokens_offset_with_cp
 from miles.backends.training_utils.loss_hub.math_utils import calculate_log_probs_and_entropy
+from miles.backends.training_utils.loss_hub.score_centering import selected_log_probs_and_entropy
 from miles.backends.training_utils.parallel import get_parallel_state
 
 
-def get_responses(
+def _iter_response_chunks(
     logits: torch.Tensor,
     *,
     args: Namespace,
@@ -16,7 +17,8 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
-) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    include_response_indices: bool,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, list[int] | range]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
     After squeezing batch dimension and applying temperature scaling, this
@@ -78,7 +80,8 @@ def get_responses(
                 end += total_length
                 start = end - response_length
                 logits_chunk = logits[start - 1 : end - 1]
-            tokens_chunk = tokens[-response_length:]
+            tokens_chunk = tokens[-response_length:] if response_length else tokens[0:0]
+            response_indices = range(response_length)
         elif args.allgather_cp:
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
@@ -98,9 +101,11 @@ def get_responses(
             if e <= s:
                 logits_chunk = logits[0:0]
                 tokens_chunk = tokens[0:0]
+                response_indices = []
             else:
                 logits_chunk = logits[s - chunk_start : e - chunk_start]
                 tokens_chunk = tokens[(s + 1) - seq_start : (e + 1) - seq_start]
+                response_indices = range(s - logit_global_start, e - logit_global_start)
             assert logits_chunk.size(0) == tokens_chunk.size(0), f"{logits_chunk.size(0)} vs {tokens_chunk.size(0)}"
         else:
             # TODO: this is super ugly... do better abstraction.
@@ -122,10 +127,21 @@ def get_responses(
 
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
+            prompt_length = total_length - response_length
+            response_indices = [
+                *range(tokens_offset[0][0] - prompt_length, tokens_offset[0][1] - prompt_length),
+                *range(tokens_offset[1][0] - prompt_length, tokens_offset[1][1] - prompt_length),
+            ]
 
         seq_start += total_length
 
-        yield logits_chunk, tokens_chunk
+        yield logits_chunk, tokens_chunk, response_indices if include_response_indices else []
+
+
+def get_responses(logits: torch.Tensor, **kwargs) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Preserve the retained two-value response iterator API."""
+    for chunk, tokens, _ in _iter_response_chunks(logits, **kwargs, include_response_indices=False):
+        yield chunk, tokens
 
 
 def get_log_probs_and_entropy(
@@ -175,16 +191,26 @@ def get_log_probs_and_entropy(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
     ):
-        log_prob, entropy = calculate_log_probs_and_entropy(
-            logits_chunk,
-            tokens_chunk,
-            parallel_state.tp.group,
-            with_entropy=with_entropy,
-            entropy_requires_grad=entropy_requires_grad,
-            chunk_size=args.log_probs_chunk_size,
-            true_on_policy=args.true_on_policy_mode,
-            vocab_size=getattr(args, "vocab_size", None),
-        )
+        if getattr(args, "loss_type", None) == "score_centering":
+            log_prob, entropy = selected_log_probs_and_entropy(
+                logits_chunk, tokens_chunk.unsqueeze(-1),
+                group=parallel_state.tp.group if parallel_state.tp.size > 1 else None,
+                vocab_size=getattr(args, "vocab_size", None), temperature=1.0,
+                chunk_size=args.log_probs_chunk_size, with_entropy=with_entropy,
+            )
+            if not entropy_requires_grad:
+                entropy = entropy.detach()
+        else:
+            log_prob, entropy = calculate_log_probs_and_entropy(
+                logits_chunk,
+                tokens_chunk,
+                parallel_state.tp.group,
+                with_entropy=with_entropy,
+                entropy_requires_grad=entropy_requires_grad,
+                chunk_size=args.log_probs_chunk_size,
+                true_on_policy=args.true_on_policy_mode,
+                vocab_size=getattr(args, "vocab_size", None),
+            )
 
         log_probs_list.append(log_prob.squeeze(-1))
         if with_entropy:

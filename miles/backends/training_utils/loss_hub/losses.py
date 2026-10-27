@@ -18,6 +18,7 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_opsm_mask,
     compute_policy_loss,
 )
+from miles.backends.training_utils.loss_hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.misc import load_function
 from miles.utils.types import RolloutBatch
@@ -512,6 +513,8 @@ def get_loss_function(args: Namespace) -> LossFunction:
             return policy_loss_function
         case "value_loss":
             return value_loss_function
+        case "score_centering":
+            return score_centering_loss_function
         case "sft_loss":
             return sft_loss_function
         case "custom_loss":

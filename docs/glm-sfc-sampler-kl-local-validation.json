@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "state": "LOCAL_EAGER_CPU_SOURCE_CHECKS_PASSED_NOT_GLM_RUNTIME_QUALIFIED",
+  "base": "d951cc5765e2abf1f6d07815ff2ed2f92cd49c69",
+  "branch": "codex/e010-glm-sfc-sampler-kl",
+  "observed_at": "2026-10-27T21:19:57.027283+00:00",
+  "tests": {
+    "passed": 487,
+    "cuda_skipped": 6,
+    "compiled_path_qualified": false,
+    "mode": "TORCH_COMPILE_DISABLE=1 eager CPU; actual four-process Gloo TP4 and CP4 collective parity",
+    "covered": [
+      "native SFC none/tis detached gradients",
+      "head/tail sampler KL dense and zero-advantage cases",
+      "masked/empty/true-vocabulary/temperature/candidate scoring",
+      "generation candidate validation and greedy-evaluation separation",
+      "Sample/retry/strip/gap/conversion/reordered microbatch preservation",
+      "original-token normalization and coefficient metric",
+      "unchanged adaptive sampler/reducer/router/GLM source tests"
+    ]
+  },
+  "unchanged_source_sha256": {
+    "miles_plugins/models/glm5/glm5.py": "613f1a088b4fba7248303304fb8d61e14b58c361195a847adc87b6682ea8917f",
+    "miles/backends/megatron_utils/router_load_observer.py": "d72903eb4e72b7469be57b7587472ea76b3afa5f6dd53de9061749acb6bbeac3",
+    "miles/backends/megatron_utils/actor.py": "3e916972a17265e670ce5abcb047d9c6be71889f0d028f6fe1b9fc4787ebed34",
+    "miles/rollout/adaptive_sampling/policy.py": "24af778180c0b61f0b07f734aa43baf5810c05cbc907951315734caa97434d6c",
+    "miles/rollout/adaptive_sampling/rollout.py": "ffdde231311842e79372794397a2e9afadfbe1a80db804cdb4e79dab7a20ca7e",
+    "miles/ray/placement_group.py": "fdb63d066a8533ab4d2b558d3999e8cd937c064b4b55cdda75521d9a832be81f",
+    "miles/backends/training_utils/loss.py": "ea3fc2073766dbfa37cdf06a431c2e5bda2292d61247f4dd26b0420667220cbe"
+  },
+  "pending": [
+    "actual retained SGLang top128/sampler-q semantics and transport",
+    "CUDA compiled numerical path and GLM TP4/PP8/CP4 model-bearing canary",
+    "full additional logging/probes/audits and overhead",
+    "full-state/sampler save/resume/capacity/retention binding",
+    "explicit later execution/resource admission"
+  ]
+}

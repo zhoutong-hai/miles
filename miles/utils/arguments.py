@@ -22,6 +22,7 @@ from miles.utils.lora import is_lora_enabled
 from miles.utils.megatron_args_utils import compute_megatron_world_size_except_dp
 from miles.utils.misc import load_function
 from miles.utils.object_store import ObjectStoreBackend
+from miles.utils.score_centering import validate_score_centering_args
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
@@ -1400,13 +1401,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft_loss", "custom_loss", "score_centering"],
                 default="policy_loss",
                 help=(
                     "Choose loss type, currently support ppo policy_loss or sft_loss, "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
             )
+            parser.add_argument("--rollout-top-logprobs-num", type=int, default=0)
+            parser.add_argument("--score-centering-is", choices=["none", "tis"], default="none")
+            parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
+            parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
+            parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
+            parser.add_argument("--sampler-kl-coef", type=float, default=0.0,
+                                help="Constant head/tail KL(q_sampler || p_trainer), independent of PG weights.")
             parser.add_argument(
                 "--custom-loss-function-path",
                 type=str,
@@ -2867,6 +2875,8 @@ def miles_validate_args(args):
         ):
             raise ValueError("Dr. GRPO requires centered/no-std rewards, fixed generation budget, "
                              "sample reduction and no additional advantage/custom loss normalization")
+
+    validate_score_centering_args(args)
 
     args.ft_components = _resolve_ft_components(args)
     args.eval_datasets = _resolve_eval_datasets(args)

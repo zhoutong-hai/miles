@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 
+from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.multi_lora import is_multi_lora_enabled
@@ -17,6 +18,8 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "loss_masks": "int32",
     "rollout_log_probs": "float32",
+    "rollout_topk_token_ids": "int32",
+    "rollout_topk_log_probs": "float32",
     "teacher_log_probs": "float32",
     "opd_reverse_kl": "float32",
     "rollout_routed_experts": "int32",
@@ -111,6 +114,12 @@ def convert_samples_to_train_data(
     # Add rollout log probabilities for off-policy correction
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+
+    if k := getattr(args, "rollout_top_logprobs_num", 0):
+        for sample in samples:
+            validate_rollout_topk_logprobs_sample(sample, k)
+        train_data["rollout_topk_token_ids"] = [sample.rollout_topk_token_ids for sample in samples]
+        train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]

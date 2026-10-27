@@ -170,11 +170,49 @@ def test_glm_kernels_router_sampler_and_lifecycle_are_unchanged():
     # The loss, candidate-conversion and CP-width changes have separate tests.
     paths = ["miles_plugins/models/glm5", "miles/kernels/attention/dsa",
              "miles/backends/megatron_utils/router_load_observer.py",
-             "miles/backends/megatron_utils/actor.py", "miles/rollout/adaptive_sampling",
+             "miles/rollout/adaptive_sampling",
              "miles/ray/placement_group.py", "miles/ray/actor_group.py",
              "miles/utils/tracking_utils", "miles/backends/megatron_utils/update_weight"]
     subprocess.run(["git", "diff", "--exit-code", "d951cc5765e2abf1f6d07815ff2ed2f92cd49c69", "--", *paths],
                    cwd=ROOT, check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("mode", ["none", "tis"])
+def test_private_observations_preserve_native_loss_and_gradient(tmp_path, monkeypatch, mode):
+    from miles.backends.training_utils.loss_hub import sfc_observations
+    from miles.backends.training_utils.loss_hub.sfc_summary import read_frames
+
+    parallel.set_parallel_state(SimpleNamespace(cp=SimpleNamespace(size=1, rank=0),
+                               tp=SimpleNamespace(size=1, rank=0, group=None),
+                               effective_dp=SimpleNamespace(size=1), is_pp_last_stage=True))
+    monkeypatch.setenv("MILES_SOURCE_COMMIT", "frozen-source")
+    args = arguments(score_centering_is=mode, sampler_kl_coef=.01, wandb_run_id="run")
+    logits = torch.tensor([[[.2, -.7, .1, .4, 0.], [.5, .1, -.4, .8, .2], [0., .1, .2, .3, .4]]], requires_grad=True)
+    q = torch.tensor([[.05, .15, .2, .3, .3], [.1, .2, .3, .15, .25]])
+    heads = q.topk(3)
+    batch = dict(unconcat_tokens=[torch.tensor([0, 1, 2])], total_lengths=[3], response_lengths=[2],
+                 loss_masks=[torch.ones(2)], advantages=[torch.zeros(2)],
+                 rollout_log_probs=[q.log().gather(-1, torch.tensor([[1], [2]])).squeeze(-1)],
+                 rollout_topk_token_ids=[heads.indices], rollout_topk_log_probs=[heads.values.log()],
+                 sample_indices=[0], weight_versions=[["1"]], rewards=[0.],
+                 sfc_sample_metadata=[{"group_index": 0, "source_row": 4, "theme": "theme", "scenario": "scenario",
+                                       "rewards": {"scenario_score": 1.}, "valid_tokens": 2, "first_valid_positions": [0, 1]}])
+    baseline, _ = score_centering_loss_function(args, batch, logits, torch.sum)
+    baseline_gradient = torch.autograd.grad(baseline, logits)[0]
+    args.sfc_diagnostics_dir = str(tmp_path.resolve())
+    sfc_observations.configure_rollout(args, 0, 1, batch)
+    observed, _ = score_centering_loss_function(args, batch, logits, torch.sum)
+    # Simulate loss checkpoint recomputation: numeric frames must not duplicate.
+    score_centering_loss_function(args, batch, logits, torch.sum)
+    torch.testing.assert_close(observed, baseline)
+    torch.testing.assert_close(torch.autograd.grad(observed, logits)[0], baseline_gradient)
+    summary = sfc_observations.finish(args, "NORMAL")
+    frames = list(read_frames(tmp_path/"paired_scores/update-000001/cp-0.bin"))
+    assert len(frames) == 1
+    assert summary["sfc/original_valid_tokens"] == 2
+    assert summary["sfc/zero_advantage_token_fraction"] == 1
+    assert summary["sfc/sampler_head_mass_mean"] > .5  # Real head even at A=0.
+    assert summary["sfc/sampler_kl_coefficient_actual"] == .01
 
 
 @pytest.mark.parametrize("mode", ["none", "tis"])

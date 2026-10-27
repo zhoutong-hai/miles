@@ -570,6 +570,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
+            from miles.backends.training_utils.loss_hub.sfc_observations import configure_rollout
+            from miles.backends.training_utils.loss_hub.sfc_probe import run_fixed_probe
+
+            if rollout_id == 0 and getattr(self.args, "sfc_fixed_probe", None):
+                self._set_replay_stage("fallthrough")
+                run_fixed_probe(self.args, self.model, completed=0)
+            configure_rollout(self.args, rollout_id, self.weight_updater.weight_version, rollout_data)
+
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
             self._set_replay_stage("replay_backward")
@@ -586,6 +594,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     attempt=attempt,
                     ft_test_action_executor=self._ft_test_action_executor,
                 )
+
+            if train_step_outcome == TrainStepOutcome.NORMAL and getattr(self.args, "sfc_fixed_probe", None):
+                self._set_replay_stage("fallthrough")
+                run_fixed_probe(self.args, self.model, completed=rollout_id+1)
 
             self.prof.step(rollout_id=rollout_id)
 

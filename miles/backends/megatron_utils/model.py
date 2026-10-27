@@ -497,6 +497,10 @@ def train_one_step(
                 "rollout_log_probs",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
+                "sample_indices",
+                "weight_versions",
+                "sfc_sample_metadata",
+                "sfc_generation_log_probs",
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",
@@ -661,6 +665,9 @@ def train_one_step(
                 if parallel_state.indep_dp.size > 1
                 else aggregate_train_losses(losses_reduced, metric_num_rollouts)
             )
+            from miles.backends.training_utils.loss_hub.sfc_observations import finish
+
+            loss_reduced.update(finish(args, outcome.name))
             return loss_reduced, grad_norm, outcome
 
     return {}, grad_norm, outcome

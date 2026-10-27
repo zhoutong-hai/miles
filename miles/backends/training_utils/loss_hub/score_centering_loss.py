@@ -12,6 +12,7 @@ from miles.backends.training_utils.cp_utils import (
     slice_log_prob_with_cp,
 )
 from miles.backends.training_utils.loss_hub.logit_processors import _iter_response_chunks
+from miles.backends.training_utils.loss_hub import sfc_observations
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.score_centering import (
     ScoreCenteringInputs,
@@ -26,7 +27,7 @@ from miles.utils.types import RolloutBatch
 def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
     parallel = get_parallel_state()
     result = {"selected": []}
-    with_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    with_entropy = args.entropy_coef != 0 or args.observe_training_entropy or sfc_observations.enabled(args)
     if with_entropy:
         result["entropy"] = []
     chunks = _iter_response_chunks(
@@ -39,6 +40,7 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
         include_response_indices=True,
     )
     for i, (chunk, tokens, indices) in enumerate(chunks):
+        sfc_observations.logit_audit(args, batch, i, chunk, tokens, indices)
         indices = torch.as_tensor(list(indices), dtype=torch.long)
         ids = torch.as_tensor(batch["rollout_topk_token_ids"][i])[indices].to(logits.device).long()
         ids = torch.cat((tokens.unsqueeze(-1), ids), dim=-1)
@@ -182,8 +184,10 @@ def score_centering_loss_function(
     loss, log = _regularization(args, batch, entropy, selected[:, 0], rollout, active, sum_of_sample_mean, kl_log_probs)
     loss = loss + pg_loss
     sampler_kl_coef = getattr(args, "sampler_kl_coef", 0.0)
+    sampler_kl_tokens = (sampler_kl_loss(selected[:, 1:], head, ids >= 0, active)
+                         if sampler_kl_coef != 0 or sfc_observations.enabled(args) else torch.zeros_like(token_loss))
     if sampler_kl_coef != 0:
-        sampler_kl = sum_of_sample_mean(sampler_kl_loss(selected[:, 1:], head, ids >= 0, active))
+        sampler_kl = sum_of_sample_mean(sampler_kl_tokens)
         # This is a constant coefficient, including fresh-sampler tokens.
         # Reference KL and the detached rollout-KL diagnostic remain separate.
         loss = loss + sampler_kl_coef * sampler_kl
@@ -208,4 +212,6 @@ def score_centering_loss_function(
         0.0,
     )
     log["train_rollout_kl"] = sum_of_sample_mean(rollout_train_kl).detach()
+    sfc_observations.capture(args, batch, selected, rollout, advantages, active, ids, head,
+                             metrics, entropy, token_loss, sampler_kl_tokens)
     return loss, log

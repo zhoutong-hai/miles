@@ -3,9 +3,9 @@
   "state": "LOCAL_EAGER_CPU_SOURCE_CHECKS_PASSED_NOT_GLM_RUNTIME_QUALIFIED",
   "base": "d951cc5765e2abf1f6d07815ff2ed2f92cd49c69",
   "branch": "codex/e010-glm-sfc-sampler-kl",
-  "observed_at": "2026-10-27T21:19:57.027283+00:00",
+  "observed_at": "2026-10-27T22:39:00.173766+00:00",
   "tests": {
-    "passed": 487,
+    "passed": 265,
     "cuda_skipped": 6,
     "compiled_path_qualified": false,
     "mode": "TORCH_COMPILE_DISABLE=1 eager CPU; actual four-process Gloo TP4 and CP4 collective parity",
@@ -16,23 +16,36 @@
       "generation candidate validation and greedy-evaluation separation",
       "Sample/retry/strip/gap/conversion/reordered microbatch preservation",
       "original-token normalization and coefficient metric",
-      "unchanged adaptive sampler/reducer/router/GLM source tests"
-    ]
+      "unchanged adaptive sampler/reducer/router/GLM source tests",
+      "Dense-autograd component-gradient agreement at positive/negative/zero advantages, partial/full heads, true vocab and temperature",
+      "CP numeric-frame integrity/coverage/deduplication and zero-live response entropy denominator",
+      "Enabled observations preserve native loss and gradients, including zero-advantage independent KL",
+      "Actor AST unchanged after removing explicit optional observation calls",
+      "Fixed-prefix entropy/top-k numerical agreement excluding padded vocabulary"
+    ],
+    "previous_source_scan": {
+      "passed": 487,
+      "cuda_skipped": 6,
+      "commit": "6b74481622e55a8d4d8267803f85b992e328a8f0"
+    }
   },
   "unchanged_source_sha256": {
     "miles_plugins/models/glm5/glm5.py": "613f1a088b4fba7248303304fb8d61e14b58c361195a847adc87b6682ea8917f",
     "miles/backends/megatron_utils/router_load_observer.py": "d72903eb4e72b7469be57b7587472ea76b3afa5f6dd53de9061749acb6bbeac3",
-    "miles/backends/megatron_utils/actor.py": "3e916972a17265e670ce5abcb047d9c6be71889f0d028f6fe1b9fc4787ebed34",
     "miles/rollout/adaptive_sampling/policy.py": "24af778180c0b61f0b07f734aa43baf5810c05cbc907951315734caa97434d6c",
     "miles/rollout/adaptive_sampling/rollout.py": "ffdde231311842e79372794397a2e9afadfbe1a80db804cdb4e79dab7a20ca7e",
     "miles/ray/placement_group.py": "fdb63d066a8533ab4d2b558d3999e8cd937c064b4b55cdda75521d9a832be81f",
     "miles/backends/training_utils/loss.py": "ea3fc2073766dbfa37cdf06a431c2e5bda2292d61247f4dd26b0420667220cbe"
   },
   "pending": [
-    "actual retained SGLang top128/sampler-q semantics and transport",
-    "CUDA compiled numerical path and GLM TP4/PP8/CP4 model-bearing canary",
-    "full additional logging/probes/audits and overhead",
-    "full-state/sampler save/resume/capacity/retention binding",
-    "explicit later execution/resource admission"
-  ]
+    "actual SGLang generation-time top128 and sampler-q transport",
+    "CUDA TP4 x CP4 mechanics and GLM PP8 model-bearing first normal update",
+    "actual fixed-prefix probe/RNG invariance and32-position audit at declared cadences",
+    "checkpoint save/resume/storage/retention binding",
+    "separate overhead and current physical/resource/window admission"
+  ],
+  "observational_callsite_sha256": {
+    "miles/backends/megatron_utils/actor.py": "c5bf89394cc0e2f6f1d22f9fd81298725a8557cc1acfde6ec5bde6d61f6d2468",
+    "miles/backends/megatron_utils/model.py": "b6949e0d95eb625bb15be51b98ebf18f507b04e74eedd18be924f0a62b4919d3"
+  }
 }

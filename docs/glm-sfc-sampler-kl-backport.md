@@ -21,7 +21,7 @@ iterator is retained to keep the packed/CP alignment change reviewable.
 ## Selected behavior
 
 Both arms use `--loss-type score_centering --rollout-top-logprobs-num 128
---sampler-kl-coef 0.03 --entropy-coef 0 --observe-training-entropy`.
+--sampler-kl-coef 0.01 --entropy-coef 0 --observe-training-entropy`.
 i023 sets `--score-centering-is none`; i024 sets
 `--score-centering-is tis --score-centering-tis-clip 2`.
 Generic `--use-tis` stays off. There is no lower floor or PPO surrogate.
@@ -60,15 +60,24 @@ signed/absolute weight-times-advantage changes. Sampler KL raw/weighted loss and
 coefficient use the original valid-token denominator. The applied cap fraction
 is zero for importance mode none; raw upper-tail diagnostics remain available.
 
-This does not complete E010's additional logging specification. Private aligned
-pre-update token sidecars, global quantiles/ESS, theme/position crosses,
-counterfactual floor changes, equal-response entropy, sealed fixed-prefix probes,
-sparse component-gradient audits and overhead measurements remain to be bound
-and qualified before launch. No fixed probe inputs are fabricated locally.
+Optional `--sfc-diagnostics-dir` captures private aligned pre-update token sidecars,
+global quantiles/ESS, theme/position/advantage crosses, counterfactual floor
+changes and equal-response entropy. Native optimizer-normal completion seals
+CP shards and emits aggregate tracking values. `--sfc-fixed-probe` and its
+SHA256 bind64 private prefixes sealed from i020 base evaluation0. Trainer-only
+forward probes at0/8/16/32/48/64 preserve Python/NumPy/PyTorch/Megatron RNG,
+model mode and timer bindings. Sparse32-position output-logit audits at8/32/64
+record component gradients without another backward/optimizer step. They are
+partial logit-space directions, never full parameter-gradient directions.
+These changed paths still require CUDA/full-model runtime qualification.
+Capture/audit/probe timings are separate; unmeasured transport overhead stays
+unmeasured rather than being inferred from nested timers.
 
 The qualified GLM attention kernels/indexer, router observer/frozen gates,
-coverage sampler, actor lifecycle, checkpointing and weight publication sources
-are unchanged from the base. Existing Megatron/SGLang pins are retained as
+coverage sampler, checkpointing and weight publication sources
+are unchanged from the base. Actor changes are limited to optional observational
+call sites, guarded by a regression that removes those calls and compares the
+remaining actor AST with the base. Existing Megatron/SGLang pins are retained as
 references; no third-party package upgrade is included. Changed paths still
 require the actual GLM TP4/PP8/CP4 model-bearing qualification, GPU compiled-path
 checks, memory/timing evidence, full-state/sampler save/resume binding and first

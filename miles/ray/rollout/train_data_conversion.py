@@ -18,6 +18,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "loss_masks": "int32",
     "rollout_log_probs": "float32",
+    "sfc_generation_log_probs": "float32",
     "rollout_topk_token_ids": "int32",
     "rollout_topk_log_probs": "float32",
     "teacher_log_probs": "float32",
@@ -41,6 +42,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
+    "sfc_sample_metadata": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -100,6 +102,10 @@ def convert_samples_to_train_data(
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+
+    if getattr(args, "sfc_diagnostics_dir", None):
+        train_data["sfc_sample_metadata"] = [_sfc_sample_metadata(sample) for sample in samples]
+        train_data["sfc_generation_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -426,3 +432,15 @@ def process_rollout_data_shard(args, rollout_data):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data
+
+
+def _sfc_sample_metadata(sample):
+    """Keep identities and numeric reward fields; omit prompt/verifier text."""
+    metadata = sample.metadata or {}
+    adaptive = metadata.get("miles_adaptive_sampling", {})
+    live = [i for i, active in enumerate(sample.loss_mask) if active]
+    return {"group_index": sample.group_index, "source_row": adaptive.get("row"),
+            "theme": metadata.get("theme", "UNBOUND"), "scenario": metadata.get("scenario", "UNBOUND"),
+            "rewards": {k: v for k, v in sample.reward.items() if isinstance(v, (int, float))}
+                       if isinstance(sample.reward, dict) else {"reward": sample.reward},
+            "valid_tokens": len(live), "first_valid_positions": live[:32]}

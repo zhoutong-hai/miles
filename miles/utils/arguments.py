@@ -1413,6 +1413,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
+            parser.add_argument("--sfc-diagnostics-dir", type=str, default=None)
+            parser.add_argument("--sfc-fixed-probe", type=str, default=None)
+            parser.add_argument("--sfc-fixed-probe-sha256", type=str, default=None)
             parser.add_argument("--sampler-kl-coef", type=float, default=0.0,
                                 help="Constant head/tail KL(q_sampler || p_trainer), independent of PG weights.")
             parser.add_argument(

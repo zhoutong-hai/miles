@@ -192,6 +192,8 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "loss_masks",
                 "sample_indices",
                 "rollout_ids",
+                "sfc_sample_metadata",
+                "sfc_generation_log_probs",
                 "rollout_mask_sums",
                 "rollout_routed_experts",
                 "rollout_indexer_topk",

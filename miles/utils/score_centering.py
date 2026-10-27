@@ -19,6 +19,14 @@ def validate_score_centering_args(args):
     coefficient = getattr(args, "sampler_kl_coef", 0.0)
     if not math.isfinite(coefficient) or coefficient < 0:
         raise ValueError("--sampler-kl-coef must be finite and non-negative")
+    diagnostics = getattr(args, "sfc_diagnostics_dir", None)
+    if diagnostics:
+        if (getattr(args, "normalize_advantages", False) or not getattr(args, "calculate_per_token_loss", False)
+            or getattr(args, "kl_coef", 0) or getattr(args, "use_kl_loss", False)
+            or args.score_centering_tis_clip != 2):
+            raise ValueError("Selected SFC observations bind token mean, raw centered rewards, cap2 and no reference/reward KL")
+    if getattr(args, "sfc_fixed_probe", None) and (not diagnostics or not getattr(args, "sfc_fixed_probe_sha256", None)):
+        raise ValueError("SFC fixed probe needs a diagnostics directory and source SHA256")
     if getattr(args, "loss_type", None) != "score_centering":
         if coefficient or getattr(args, "rollout_top_logprobs_num", 0):
             raise ValueError("The GLM sampler-KL/candidate backport requires --loss-type score_centering")

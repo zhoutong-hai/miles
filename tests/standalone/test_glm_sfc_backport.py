@@ -215,6 +215,43 @@ def test_private_observations_preserve_native_loss_and_gradient(tmp_path, monkey
     assert summary["sfc/sampler_kl_coefficient_actual"] == .01
 
 
+def test_candidates_and_observations_survive_real_dp_packaging_and_microbatch_reorder():
+    samples = [sample_with_candidates() for _ in range(4)]
+    for i, sample in enumerate(samples):
+        sample.index = i
+        sample.group_index = i//2
+        sample.reward = {"score": float(i)}
+        sample.weight_versions = ["1"]
+        sample.metadata = {"theme": "a", "scenario": "b", "miles_adaptive_sampling": {"row": i}}
+    ns = _load_functions("miles/ray/rollout/train_data_conversion.py", {
+        "convert_samples_to_train_data", "_compute_rollout_mask_sums", "_sfc_sample_metadata",
+        "_package_shards", "process_rollout_data_shard"}, {
+        "Any": object, "Sample": Sample,
+        "validate_rollout_topk_logprobs_sample": validate_rollout_topk_logprobs_sample,
+        "_post_process_rewards": lambda *a, **kw: ([0., 1., 2., 3.], [-.5, .5, -.5, .5]),
+        "Timer": lambda: SimpleNamespace(seq_lens=None)})
+    args = Namespace(rollout_top_logprobs_num=3, use_dynamic_global_batch_size=False,
+                     sfc_diagnostics_dir="/private/diagnostics")
+    data = ns["convert_samples_to_train_data"](args, samples, {}, None, None)
+    data["total_lengths"] = [len(sample.tokens) for sample in samples]
+    shards = ns["_package_shards"](args, data, [[3, 1], [2, 0]])
+    for shard, identities in zip(shards, [[3, 1], [2, 0]], strict=True):
+        shard = ns["process_rollout_data_shard"](args, shard)
+        assert shard["sample_indices"] == identities
+        for position, identity in enumerate(identities):
+            np.testing.assert_array_equal(shard["rollout_topk_token_ids"][position], samples[identity].rollout_topk_token_ids)
+            np.testing.assert_array_equal(shard["rollout_topk_log_probs"][position], samples[identity].rollout_topk_log_probs)
+            assert shard["sfc_sample_metadata"][position]["source_row"] == identity
+            assert shard["sfc_generation_log_probs"][position] == samples[identity].rollout_log_probs
+        iterator = _load_functions("miles/backends/training_utils/data.py", {"DataIterator"},
+                                   {"RolloutBatch": dict, "Sequence": list})["DataIterator"]
+        batch = iterator(shard, micro_batch_indices=[[1, 0]]).get_next([
+            "sample_indices", "rollout_topk_token_ids", "rollout_topk_log_probs",
+            "sfc_sample_metadata", "sfc_generation_log_probs"])
+        assert batch["sample_indices"] == identities[::-1]
+        assert [m["source_row"] for m in batch["sfc_sample_metadata"]] == identities[::-1]
+
+
 @pytest.mark.parametrize("mode", ["none", "tis"])
 @pytest.mark.parametrize("coefficient", [0.0, 0.03])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])

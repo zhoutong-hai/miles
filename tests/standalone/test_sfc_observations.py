@@ -17,7 +17,7 @@ from miles.backends.training_utils import parallel
 from miles.backends.training_utils.loss_hub.score_centering import ScoreCenteringInputs, score_centering_loss
 from miles.backends.training_utils.loss_hub.score_centering.sampler_kl import sampler_kl_loss
 from miles.backends.training_utils.loss_hub.sfc_logit_audit import component_gradients, component_statistics
-from miles.backends.training_utils.loss_hub.sfc_probe import distribution_statistics
+from miles.backends.training_utils.loss_hub.sfc_probe import _probe_callback, distribution_statistics
 from miles.backends.training_utils.loss_hub.sfc_summary import read_frames, summarize_update
 
 
@@ -92,6 +92,35 @@ def test_probe_distribution_excludes_padded_vocab_and_matches_dense():
     torch.testing.assert_close(mass, logp.exp().topk(2).values.sum(-1))
     empty = distribution_statistics(logits[:0], vocab_size=3, topk=2)
     assert empty[0].shape == empty[1].shape == (0,)
+
+
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_probe_callback_uses_real_response_iterator_and_preserves_cp_ownership(cp_size):
+    previous = parallel._parallel_state
+    logits = torch.tensor([[[1., 2., -3., 999.]] * 8])
+    tokens = [torch.tensor([0, 1, 2, 0]), torch.tensor([2, 0, 1, 2])]
+    args = Namespace(qkv_format="thd", true_on_policy_mode=False,
+                     allgather_cp=True, rollout_temperature=1., vocab_size=3)
+    counts, entropies, masses = [], [], []
+    try:
+        for rank in range(cp_size):
+            parallel.set_parallel_state(SimpleNamespace(
+                cp=SimpleNamespace(size=cp_size, rank=rank),
+                tp=SimpleNamespace(size=1, group=None)))
+            chunk = logits.chunk(cp_size, dim=1)[rank]
+            result = _probe_callback(chunk, args=args, unconcat_tokens=tokens,
+                                     total_lengths=[4, 4], response_lengths=[1, 1])
+            counts.append(torch.cat(result["probe_count"]))
+            entropies.append(torch.cat(result["probe_entropy"]))
+            masses.append(torch.cat(result["probe_head_mass"]))
+        expected_entropy, expected_mass = distribution_statistics(logits[0, [2, 6]], vocab_size=3)
+        torch.testing.assert_close(torch.stack(counts).sum(0), torch.ones(2))
+        torch.testing.assert_close(torch.stack(entropies).sum(0), expected_entropy)
+        torch.testing.assert_close(torch.stack(masses).sum(0), expected_mass)
+        if cp_size == 4:
+            assert sum(not row.any() for row in counts) == 2
+    finally:
+        parallel.set_parallel_state(previous)
 
 
 def _write_shard(directory, rank, frame):

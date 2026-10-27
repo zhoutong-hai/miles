@@ -47,7 +47,7 @@ def _probe_callback(logits, *, args, unconcat_tokens, total_lengths, response_le
     result = {"probe_entropy": [], "probe_head_mass": [], "probe_count": []}
     chunks = _iter_response_chunks(logits, args=args, unconcat_tokens=unconcat_tokens,
                                   total_lengths=total_lengths, response_lengths=response_lengths,
-                                  max_seq_lens=max_seq_lens)
+                                  max_seq_lens=max_seq_lens, include_response_indices=False)
     for chunk, _, _ in chunks:
         if len(chunk):
             entropy, mass = distribution_statistics(chunk, vocab_size=args.vocab_size, group=group)

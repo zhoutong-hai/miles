@@ -70,6 +70,7 @@ def component_gradients(logits, head_ids, head_logq, sampled_ids, sampled_logq, 
         "importance_change": (selected-unweighted) / scale,
         "weighted_sampler_kl": kl_gradient / scale,
         "sfc_change_from_uncentered": (selected-uncentered) / scale,
+        "uncentered_pg": uncentered / scale,
         "entropy": -p*(safe_logp+entropy) / temperature,
     }
 

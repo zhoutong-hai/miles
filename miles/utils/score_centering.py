@@ -4,6 +4,23 @@ import math
 import os
 
 
+def observation_updates(args, *, probe=False):
+    name = "sfc_fixed_probe_updates" if probe else "sfc_logit_audit_updates"
+    default = (0, 8, 16, 32, 48, 64) if probe else (8, 32, 64)
+    values = tuple(getattr(args, name, default))
+    if not values or any(type(value) is not int or value < (0 if probe else 1) for value in values):
+        raise ValueError(f"{name} requires nonnegative probe or positive audit update positions")
+    if tuple(sorted(set(values))) != values:
+        raise ValueError(f"{name} positions must be unique and increasing")
+    return values
+
+
+def observation_importance_mode(args):
+    if args.loss_type == "score_centering":
+        return args.score_centering_is
+    return "mis"
+
+
 def validate_candidate_sampling(sampling, *, temperature):
     """Candidates must describe the actual unfiltered generation distribution."""
     if not math.isfinite(temperature) or temperature <= 0 or sampling.get("temperature", temperature) != temperature:
@@ -21,6 +38,8 @@ def validate_score_centering_args(args):
         raise ValueError("--sampler-kl-coef must be finite and non-negative")
     diagnostics = getattr(args, "sfc_diagnostics_dir", None)
     if diagnostics:
+        observation_updates(args, probe=True)
+        observation_updates(args)
         if (getattr(args, "normalize_advantages", False) or not getattr(args, "calculate_per_token_loss", False)
             or getattr(args, "kl_coef", 0) or getattr(args, "use_kl_loss", False)
             or args.score_centering_tis_clip != 2):
@@ -30,6 +49,22 @@ def validate_score_centering_args(args):
     if getattr(args, "loss_type", None) != "score_centering":
         if coefficient or getattr(args, "rollout_top_logprobs_num", 0):
             raise ValueError("The GLM sampler-KL/candidate backport requires --loss-type score_centering")
+        if diagnostics:
+            if (args.loss_type != "policy_loss" or not getattr(args, "use_tis", False)
+                or getattr(args, "custom_tis_function_path", None)
+                != "miles.backends.training_utils.loss_hub.corrections.icepop_function"
+                or args.tis_clip_low != .5 or args.tis_clip != 2):
+                raise ValueError("Policy observations currently bind native MIS [0.5,2] only")
+            unsupported = ("use_opsm", "use_rollout_logprobs", "skip_actor_forward_only", "true_on_policy_mode",
+                           "custom_pg_loss_reducer_function_path", "partial_rollout", "fully_async")
+            if any(getattr(args, key, False) for key in unsupported) or args.advantage_estimator != "grpo":
+                raise ValueError("MIS observations require ordinary precomputed trainer scores and native GRPO reduction")
+            if args.entropy_coef != 0 or getattr(args, "qkv_format", "thd") != "thd":
+                raise ValueError("MIS observation binding requires entropy0 and THD")
+            validate_candidate_sampling({"top_p": args.rollout_top_p, "top_k": args.rollout_top_k},
+                                        temperature=args.rollout_temperature)
+            if os.environ.get("SGLANG_RETURN_ORIGINAL_LOGPROB", "").lower() in ("1", "true"):
+                raise ValueError("MIS observations require actual sampling logprobs")
         return
     if args.rollout_top_logprobs_num <= 0:
         raise ValueError("Score centering requires positive --rollout-top-logprobs-num")

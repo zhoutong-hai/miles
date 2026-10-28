@@ -10,6 +10,7 @@ from miles.backends.training_utils.cp_utils import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
+from miles.backends.training_utils.loss_hub import policy_observations
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
@@ -111,7 +112,7 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
-    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy or bool(getattr(args, "sfc_diagnostics_dir", None))
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -284,6 +285,13 @@ def policy_loss_function(
         )
     else:
         pg_loss_reducer = sum_of_sample_mean
+
+    if getattr(args, "sfc_diagnostics_dir", None):
+        policy_observations.observe(
+            args, batch, logits, logp=log_probs, trainer_logp=trainer_scored_log_probs,
+            rollout_logp=rollout_old_log_probs, advantages=advantages, active=active_tokens,
+            entropy=torch.cat(log_probs_and_entropy["entropy"]), token_loss=pg_loss,
+        )
 
     # ESS (Effective Sample Size) ratio from per-token IS weights
     # w = π_new/π_old = exp(-ppo_kl).  A value of 1.0 is on-policy; near 0

@@ -76,19 +76,23 @@ def _load_update(directory, *, expected_tokens, expected_samples, cp_size):
         raise ValueError("Original valid-token coverage or CP/recompute deduplication differs")
     if not n:
         raise ValueError("Selected ordinary update has no valid response tokens")
-    for key in ("logp", "logq", "advantage", "weight", "entropy", "pg_loss", "sampler_kl", "correction", "p_head_mass", "q_head_mass"):
-        if not torch.isfinite(data[key]).all():
+    for key, value in data.items():
+        if not torch.isfinite(value).all():
             raise ValueError("Nonfinite original-token diagnostic: " + key)
     return data, frames, seals, sample_metadata, n
 
 
 def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
-    log_ratio = (data["logp"]-data["logq"]).double()
-    ratio = log_ratio.exp()
+    log_ratio = (data.get("importance_logp", data["logp"])-data["logq"]).double()
+    # MIS boundaries must use the actual native FP32 ratio: recomputing exp in
+    # CPU FP64 can flip inclusive boundary tokens at exactly0.5 or2.
+    ratio = data.get("importance_ratio", log_ratio.exp()).double()
+    torch.testing.assert_close(ratio, log_ratio.exp(), atol=1e-6, rtol=2e-5)
     if not torch.isfinite(ratio).all():
         raise ValueError("Nonfinite active raw importance ratios")
     advantage, weight = data["advantage"].double(), data["weight"].double()
-    expected_weight = ratio.clamp_max(2) if mode == "tis" else torch.ones_like(ratio)
+    expected_weight = (torch.where((ratio >= .5) & (ratio <= 2), ratio, 0.) if mode == "mis"
+                       else ratio.clamp_max(2) if mode == "tis" else torch.ones_like(ratio))
     torch.testing.assert_close(weight, expected_weight, atol=1e-6, rtol=2e-5)
     tails = {"ratio_lt01": ratio < .1, "ratio_lt05": ratio < .5,
              "ratio_gt2": ratio > 2, "ratio_gt5": ratio > 5}
@@ -101,21 +105,35 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
               "sfc/applied_cap_fraction": float((ratio > 2).double().mean()) if mode == "tis" else 0.0,
               "sfc/applied_weight_sum": float(weight.sum()), "sfc/applied_weight_square_sum": float(weight.square().sum()),
               "sfc/raw_weight_sum": float(ratio.sum()), "sfc/raw_weight_square_sum": float(ratio.square().sum()),
-              "sfc/applied_ess": float(weight.sum().square()/weight.square().sum()),
+              "sfc/applied_ess": float(weight.sum().square()/weight.square().sum().clamp_min(1e-30)),
               "sfc/raw_ess": float(ratio.sum().square()/ratio.square().sum()),
               "sfc/zero_advantage_token_fraction": float((advantage == 0).double().mean()),
-              "sfc/sample_in_head_fraction": float(data["sample_in_head"].double().mean()),
-              "sfc/candidate_count_mean": float(data["candidate_count"].double().mean()),
-              "sfc/centering_correction_abs_mean": float(data["correction"].double().abs().mean()),
               "sfc/paired_capture_max_rank_seconds": max(s["capture_seconds"] for s in seals),
               "sfc/logit_audit_sum_rank_seconds": sum(s["audit_seconds"] for s in seals)}
     output["sfc/applied_ess_fraction"] = output["sfc/applied_ess"]/n
     output["sfc/raw_ess_fraction"] = output["sfc/raw_ess"]/n
+    output["sfc/importance_mode_mis"] = int(mode == "mis")
+    output["sfc/score_centering_enabled"] = int("correction" in data)
     output["sfc/sampler_kl_weighted_token_mean"] = beta*output["sfc/sampler_kl_raw_token_mean"]
     output["sfc/total_loss_token_mean"] = output["sfc/pg_token_mean"]+output["sfc/sampler_kl_weighted_token_mean"]
+    if mode == "mis":
+        # There is no candidate payload for an SFC-off MIS arm: do not present
+        # an uncomputed head/tail KL estimator as a measured zero.
+        output.pop("sfc/sampler_kl_raw_token_mean")
     _quantiles(output, "log_ratio", log_ratio, [.001, .01, .5, .99, .999])
-    _quantiles(output, "centering_correction_abs", data["correction"].abs(), [.95])
-    for prefix, masses in (("trainer", data["p_head_mass"]), ("sampler", data["q_head_mass"])):
+    if "correction" in data:
+        correction = data["correction"].double()
+        output.update({"sfc/sample_in_head_fraction": float(data["sample_in_head"].double().mean()),
+                       "sfc/candidate_count_mean": float(data["candidate_count"].double().mean()),
+                       "sfc/centering_correction_mean": float(correction.mean()),
+                       "sfc/centering_correction_abs_mean": float(correction.abs().mean()),
+                       "sfc/advantage_correction_mean": float((advantage*correction).mean()),
+                       "sfc/advantage_correction_abs_mean": float((advantage*correction).abs().mean())})
+        _quantiles(output, "centering_correction_abs", correction.abs(), [.95])
+    for prefix, key in (("trainer", "p_head_mass"), ("sampler", "q_head_mass")):
+        if key not in data:
+            continue
+        masses = data[key]
         if (masses < -1e-6).any() or (masses > 1+1e-5).any():
             raise ValueError("Candidate head mass is outside probability bounds")
         output[f"sfc/{prefix}_head_mass_mean"] = float(masses.double().mean())
@@ -134,13 +152,36 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
     for name, tail in tails.items():
         output[f"sfc/{name}_fraction"] = float(tail.double().mean())
         output[f"sfc/{name}_tokens"] = int(tail.sum())
+    if mode == "mis":
+        _mis_statistics(output, data, ratio, advantage, weight, signs)
     return output, tails
+
+
+def _mis_statistics(output, data, ratio, advantage, weight, signs):
+    lower, upper = ratio < .5, ratio > 2
+    rejected = lower | upper
+    tis = ratio.clamp(.5, 2)
+    torch.testing.assert_close(data["counterfactual_tis_weight"].double(), tis, atol=1e-6, rtol=2e-5)
+    delta = (weight-tis)*advantage
+    output["sfc/mis_retained_fraction"] = float((~rejected).double().mean())
+    output["sfc/mis_minus_tis_advantage_mean"] = float(delta.mean())
+    output["sfc/mis_minus_tis_advantage_abs_mean"] = float(delta.abs().mean())
+    for label, selected in {"all": torch.ones_like(rejected), **signs}.items():
+        output[f"sfc/mis_minus_tis_advantage_{label}_mean"] = float((delta*selected).mean())
+        output[f"sfc/mis_minus_tis_advantage_{label}_abs_mean"] = float((delta*selected).abs().mean())
+        for name, tail in (("lower", lower), ("upper", upper), ("total", rejected)):
+            chosen = tail & selected
+            output[f"sfc/mis_{name}_rejected_adv_{label}_tokens"] = int(chosen.sum())
+            output[f"sfc/mis_{name}_rejected_adv_{label}_fraction"] = float(chosen.double().mean())
+            output[f"sfc/mis_minus_tis_{name}_adv_{label}_mean"] = float((delta*chosen).mean())
+            output[f"sfc/mis_minus_tis_{name}_adv_{label}_abs_mean"] = float((delta*chosen).abs().mean())
 
 
 def _slice_statistics(output, data, sample_metadata, expected_samples, tails):
     ids = data["sample_id"].tolist()
-    observations = {"p_head_mass": data["p_head_mass"], "q_head_mass": data["q_head_mass"],
-                    "correction_abs": data["correction"].abs(), "sample_in_head": data["sample_in_head"]}
+    observations = {key: data[key] for key in ("p_head_mass", "q_head_mass", "sample_in_head") if key in data}
+    if "correction" in data:
+        observations["correction_abs"] = data["correction"].abs()
     for field in ("theme", "scenario"):
         groups = [sample_metadata[i][field] for i in ids]
         _group_rates(output, field, groups, groups, tails, observations)
@@ -160,7 +201,7 @@ def _slice_statistics(output, data, sample_metadata, expected_samples, tails):
 
 def _audit_integrity(directory, data, frame):
     completed = frame["completed_update"]
-    if completed not in (8, 32, 64):
+    if completed not in frame.get("audit_updates", (8, 32, 64)):
         return None
     root = directory.parent.parent/"logit_audit"/f"update-{completed:06d}"
     positions, packets = [], []
@@ -189,6 +230,8 @@ def summarize_update(directory, *, expected_tokens, expected_samples, cp_size, m
     directory = Path(directory)
     data, frames, seals, sample_metadata, n = _load_update(
         directory, expected_tokens=expected_tokens, expected_samples=expected_samples, cp_size=cp_size)
+    if any(frame.get("importance_mode", mode) != mode for frame in frames):
+        raise ValueError("Paired-score importance method differs from the selected method")
     output, tails = _token_statistics(data, n=n, expected_samples=expected_samples, seals=seals, mode=mode, beta=beta)
     categories = _slice_statistics(output, data, sample_metadata, expected_samples, tails)
     audit = _audit_integrity(directory, data, frames[0])

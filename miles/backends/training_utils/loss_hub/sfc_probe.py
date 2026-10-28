@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from miles.backends.training_utils.loss_hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.score_centering import observation_updates
 
 
 def distribution_statistics(logits, *, vocab_size, group=None, topk=128):
@@ -84,7 +85,7 @@ def _persist_probe(args, result, packet, source_hash, completed, elapsed):
 
 
 def run_fixed_probe(args, model, completed):
-    if not getattr(args, "sfc_fixed_probe", None) or completed not in (0, 8, 16, 32, 48, 64):
+    if not getattr(args, "sfc_fixed_probe", None) or completed not in observation_updates(args, probe=True):
         return
     # Megatron is optional in CPU tests and this module is imported only by the
     # owning Megatron actor; defer these framework imports to the actual probe.

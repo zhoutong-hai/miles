@@ -14,12 +14,17 @@ import torch.distributed as dist
 from miles.backends.training_utils.cp_utils import slice_log_prob_with_cp
 from miles.backends.training_utils.loss_hub.sfc_logit_audit import component_gradients, component_statistics
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.score_centering import observation_importance_mode, observation_updates
 
 _CONTEXT = None
 
 
 def enabled(args):
-    return getattr(args, "loss_type", None) == "score_centering" and bool(getattr(args, "sfc_diagnostics_dir", None))
+    return getattr(args, "loss_type", None) in ("score_centering", "policy_loss") and bool(getattr(args, "sfc_diagnostics_dir", None))
+
+
+def audit_due(args):
+    return enabled(args) and _CONTEXT is not None and _CONTEXT["completed"] in observation_updates(args)
 
 
 def configure_rollout(args, rollout_id, trainer_version, data):
@@ -77,7 +82,8 @@ def _response_layout(args, batch):
             "sample_id": torch.cat(sample_ids), "sample_slot": torch.cat(sample_slots)}
 
 
-def capture(args, batch, selected, rollout, advantages, active, ids, head, metrics, entropy, token_loss, sampler_kl):
+def capture(args, batch, selected, rollout, advantages, active, ids, head, metrics, entropy, token_loss, sampler_kl,
+            *, applied_weight=None, importance_logp=None, importance_ratio=None):
     if not enabled(args) or not _writer():
         return
     start = time.perf_counter()
@@ -92,16 +98,24 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
         raise ValueError("Nonfinite active sampler/trainer scores in paired diagnostics")
     if not torch.isfinite(advantages[active]).all() or not torch.isfinite((logp-logq)[active]).all():
         raise ValueError("Nonfinite active advantages or raw log ratios")
+    if applied_weight is None:
+        applied_weight = ((logp-logq).clamp_max(0.6931471805599453).exp()
+                          if args.score_centering_is == "tis" else torch.ones_like(logp))
     records = {**layout, "mask": active.detach().cpu(), "logp": logp.cpu(), "logq": logq.cpu(),
+               "importance_logp": (logp if importance_logp is None else importance_logp.detach()).cpu(),
                "advantage": advantages.detach().cpu(),
-               "weight": ((logp-logq).clamp_max(0.6931471805599453).exp() if args.score_centering_is == "tis"
-                          else torch.ones_like(logp)).cpu(),
+               "weight": applied_weight.detach().cpu(),
                "entropy": entropy.detach().cpu(), "pg_loss": token_loss.detach().cpu(),
-               "sampler_kl": sampler_kl.detach().cpu(), "correction": metrics.correction.cpu(),
-               "p_head_mass": selected[:, 1:].detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
-               "q_head_mass": head.detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
-               "candidate_count": (ids >= 0).sum(-1).cpu(),
-               "sample_in_head": ((ids.cpu() == layout["token_id"][:, None]) & (ids.cpu() >= 0)).any(-1)}
+               "sampler_kl": sampler_kl.detach().cpu()}
+    if metrics is not None:
+        records.update({"correction": metrics.correction.cpu(),
+                        "p_head_mass": selected[:, 1:].detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
+                        "q_head_mass": head.detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
+                        "candidate_count": (ids >= 0).sum(-1).cpu(),
+                        "sample_in_head": ((ids.cpu() == layout["token_id"][:, None]) & (ids.cpu() >= 0)).any(-1)})
+    else:
+        records["importance_ratio"] = importance_ratio.detach().cpu()
+        records["counterfactual_tis_weight"] = importance_ratio.detach().clamp(.5, 2).cpu()
     metadata = batch.get("sfc_sample_metadata")
     if metadata is None or batch.get("weight_versions") is None:
         raise ValueError("SFC observations require reward/theme/group and actual sampler-version metadata")
@@ -109,7 +123,9 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
     torch.testing.assert_close(records["advantage"][records["mask"]],
                                expected_advantage[records["mask"]], rtol=1e-5, atol=1e-6)
     candidate_hash = hashlib.sha256(ids.detach().cpu().contiguous().numpy().tobytes() + head.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
-    packet = {"schema_version": 1, "run": context["run"], "source": context["source"],
+    packet = {"schema_version": 2, "run": context["run"], "source": context["source"],
+              "sfc_enabled": args.loss_type == "score_centering", "importance_mode": observation_importance_mode(args),
+              "audit_updates": list(observation_updates(args)),
               "rollout": context["rollout"], "native_pre_update": context["rollout"],
               "completed_update": context["completed"], "trainer_version": context["trainer_version"],
               "sample_indices": list(map(int, batch["sample_indices"])), "samples": metadata,
@@ -126,9 +142,9 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
     context["capture_seconds"] += time.perf_counter() - start
 
 
-def logit_audit(args, batch, sample, chunk, tokens, indices):
+def logit_audit(args, batch, sample, chunk, tokens, indices, *, policy_old_logp=None):
     context = _CONTEXT
-    if not enabled(args) or context is None or context["completed"] not in (8, 32, 64):
+    if not audit_due(args):
         return
     index = int(batch["sample_indices"][sample])
     chosen = [i for i, position in enumerate(indices) if (index, int(position)) in context["audit_positions"]]
@@ -139,18 +155,26 @@ def logit_audit(args, batch, sample, chunk, tokens, indices):
     keys = tuple((index, int(position)) for position in positions)
     # Every TP member must enter the same audit collectives even on recompute;
     # the writer below prevents duplicate persisted records.
-    head_ids = torch.as_tensor(batch["rollout_topk_token_ids"][sample])[positions].to(chunk.device).long()
-    head_logq = torch.as_tensor(batch["rollout_topk_log_probs"][sample])[positions].to(chunk.device)
     q = torch.as_tensor(batch["sfc_generation_log_probs"][sample])[positions].to(chunk.device)
     full_advantage = batch["sfc_sample_metadata"][sample]["advantage"]
     advantage = torch.full((len(chosen),), full_advantage, device=chunk.device)
     parallel = get_parallel_state()
     group = parallel.tp.group if parallel.tp.size > 1 else None
-    components = component_gradients(chunk[chosen], head_ids, head_logq, tokens[chosen], q, advantage,
-                                    mode=args.score_centering_is, beta=args.sampler_kl_coef,
-                                    vocab_size=args.vocab_size, group=group, denominator=context["expected_tokens"])
-    # chunk has already been temperature-scaled by the retained response iterator.
-    components = {k: value / args.rollout_temperature for k, value in components.items()}
+    if policy_old_logp is None:
+        head_ids = torch.as_tensor(batch["rollout_topk_token_ids"][sample])[positions].to(chunk.device).long()
+        head_logq = torch.as_tensor(batch["rollout_topk_log_probs"][sample])[positions].to(chunk.device)
+        components = component_gradients(chunk[chosen], head_ids, head_logq, tokens[chosen], q, advantage,
+                                        mode=args.score_centering_is, beta=args.sampler_kl_coef,
+                                        vocab_size=args.vocab_size, group=group, denominator=context["expected_tokens"])
+        # chunk is already temperature-scaled by the retained response iterator.
+        components = {k: value / args.rollout_temperature for k, value in components.items()}
+    else:
+        # Deferred solely to break the observation lifecycle/policy hook cycle.
+        from miles.backends.training_utils.loss_hub import policy_observations
+
+        old = policy_old_logp[positions.to(policy_old_logp.device)].to(chunk.device)
+        components = policy_observations.component_gradients(
+            chunk[chosen], tokens[chosen], q, old, advantage, args=args, denominator=context["expected_tokens"])
     statistics = component_statistics(components, group=group)
     if parallel.tp.rank == 0:
         destination = context["root"] / "logit_audit" / f"update-{context['completed']:06d}"
@@ -189,4 +213,4 @@ def finish(args, outcome):
     from miles.backends.training_utils.loss_hub.sfc_summary import summarize_update
     return summarize_update(context["directory"], expected_tokens=context["expected_tokens"],
                             expected_samples=context["expected_samples"], cp_size=parallel.cp.size,
-                            mode=args.score_centering_is, beta=args.sampler_kl_coef)
+                            mode=observation_importance_mode(args), beta=args.sampler_kl_coef)

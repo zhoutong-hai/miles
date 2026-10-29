@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from miles.backends.training_utils.cp_utils import slice_log_prob_with_cp
+from miles.backends.training_utils.loss_hub.corrections import mis_intervals
 from miles.backends.training_utils.loss_hub.sfc_logit_audit import component_gradients, component_statistics
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.score_centering import observation_importance_mode, observation_updates
@@ -124,6 +125,7 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
                                expected_advantage[records["mask"]], rtol=1e-5, atol=1e-6)
     candidate_hash = hashlib.sha256(ids.detach().cpu().contiguous().numpy().tobytes() + head.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
     packet = {"schema_version": 2, "run": context["run"], "source": context["source"],
+              "mis_intervals": list(mis_intervals(args)) if args.loss_type == "policy_loss" else None,
               "sfc_enabled": args.loss_type == "score_centering", "importance_mode": observation_importance_mode(args),
               "audit_updates": list(observation_updates(args)),
               "rollout": context["rollout"], "native_pre_update": context["rollout"],

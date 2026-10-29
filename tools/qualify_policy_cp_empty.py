@@ -13,6 +13,7 @@ import torch.distributed.nn
 from miles.backends.training_utils.cp_utils import slice_log_prob_with_cp
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy
 from miles.backends.training_utils.loss_hub.math_utils import compute_policy_loss
+from miles.backends.training_utils.loss_hub.corrections import icepop_function
 from miles.backends.training_utils.parallel import set_parallel_state
 
 
@@ -36,7 +37,9 @@ def case(rank, tp_group, cp_group, device, all_rejected, total, response, dtype)
     local=full[cp*width:(cp+1)*width,tp*8:(tp+1)*8].clone().to(dtype).requires_grad_()
     tokens=torch.arange(total,device=device)%32
     args=Namespace(qkv_format='thd',allgather_cp=True,true_on_policy_mode=False,
-        rollout_temperature=1.,loss_type='policy_loss',log_probs_chunk_size=-1,vocab_size=32)
+        rollout_temperature=1.,loss_type='policy_loss',log_probs_chunk_size=-1,vocab_size=32,
+        tis_clip_low=.5,tis_clip=2.,mis_positive_low=.25,mis_positive_high=4.,
+        mis_negative_low=.5,mis_negative_high=2.)
     result=get_log_probs_and_entropy(local[None],args=args,unconcat_tokens=[tokens],total_lengths=[total],
         response_lengths=[response],with_entropy=True,entropy_requires_grad=False)
     flag=torch.tensor([result['log_probs'][0].requires_grad],device=device)
@@ -45,15 +48,23 @@ def case(rank, tp_group, cp_group, device, all_rejected, total, response, dtype)
     assert all(bool(f.item()) for f in flags), 'CP owner lost differentiable redistribution'
     assert not result['entropy'][0].requires_grad
     old=full[total-response-1:total-1].log_softmax(-1).gather(-1,tokens[-response:,None]).squeeze(-1)
-    ratio=torch.tensor(([.1,.2,3.] if all_rejected else [.1,1.,3.])*((response+2)//3),device=device)[:response]
+    values=[.1,8.,.1] if all_rejected else [.25,3.,.3,.5,4.,2.,.1,1.,5.]
+    ratio=torch.tensor(values*((response+len(values)-1)//len(values)),device=device)[:response]
     q=old-ratio.log();ratio=(old-q).exp()
-    mis=torch.where((ratio>=.5)&(ratio<=2.),ratio,0.)
+    advantages=torch.tensor([1.,-1.,0.]*((response+2)//3),device=device)[:response]
+    keep=torch.where(advantages>0,(ratio>=.25)&(ratio<=4.),(ratio>=.5)&(ratio<=2.))
+    mis=torch.where(keep,ratio,0.)
     score=result['log_probs'][0]
-    pg,_=compute_policy_loss(slice_log_prob_with_cp(old,total,response)-score,torch.ones_like(score),.2,.28,10.)
-    ((pg*slice_log_prob_with_cp(mis,total,response)).sum()/response+local.sum()*0).backward()
+    local_advantages=slice_log_prob_with_cp(advantages,total,response)
+    pg,_=compute_policy_loss(slice_log_prob_with_cp(old,total,response)-score,local_advantages,.2,.28,10.)
+    weighted,masks,_=icepop_function(args,pg_loss=pg,train_log_probs=[slice_log_prob_with_cp(old,total,response)],
+        rollout_log_probs=[slice_log_prob_with_cp(q,total,response)],loss_masks=[torch.ones_like(score)],
+        advantages=local_advantages)
+    assert masks[0].sum()==score.numel()
+    (weighted.sum()/response+local.sum()*0).backward()
     reference=full.clone().requires_grad_()
     chosen=reference[total-response-1:total-1].log_softmax(-1).gather(-1,tokens[-response:,None]).squeeze(-1)
-    native,_=compute_policy_loss(old-chosen,torch.ones(response,device=device),.2,.28,10.)
+    native,_=compute_policy_loss(old-chosen,advantages,.2,.28,10.)
     (native.mul(mis).sum()/response).backward()
     # This pinned native fused CE deliberately returns BF16 gradients, even
     # for FP32 inputs. Mirror that unchanged backward boundary in the oracle.

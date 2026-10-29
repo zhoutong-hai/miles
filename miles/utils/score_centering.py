@@ -33,6 +33,17 @@ def validate_candidate_sampling(sampling, *, temperature):
 
 
 def validate_score_centering_args(args):
+    mis_bounds = tuple(getattr(args, name, None) for name in (
+        "mis_positive_low", "mis_positive_high", "mis_negative_low", "mis_negative_high"))
+    if any(value is not None for value in mis_bounds):
+        if (any(value is None for value in mis_bounds)
+            or not all(math.isfinite(value) for value in mis_bounds)
+            or not (0 < mis_bounds[0] <= mis_bounds[1] and 0 < mis_bounds[2] <= mis_bounds[3])):
+            raise ValueError("Specify four finite positive ordered MIS advantage bounds")
+        if (getattr(args, "loss_type", None) != "policy_loss" or not getattr(args, "use_tis", False)
+            or getattr(args, "custom_tis_function_path", None)
+            != "miles.backends.training_utils.loss_hub.corrections.icepop_function"):
+            raise ValueError("Fixed advantage bounds require the native MIS dispatcher")
     coefficient = getattr(args, "sampler_kl_coef", 0.0)
     if not math.isfinite(coefficient) or coefficient < 0:
         raise ValueError("--sampler-kl-coef must be finite and non-negative")

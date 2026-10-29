@@ -82,7 +82,7 @@ def _load_update(directory, *, expected_tokens, expected_samples, cp_size):
     return data, frames, seals, sample_metadata, n
 
 
-def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
+def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_intervals=(.5, 2., .5, 2.)):
     log_ratio = (data.get("importance_logp", data["logp"])-data["logq"]).double()
     # MIS boundaries must use the actual native FP32 ratio: recomputing exp in
     # CPU FP64 can flip inclusive boundary tokens at exactly0.5 or2.
@@ -91,7 +91,10 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
     if not torch.isfinite(ratio).all():
         raise ValueError("Nonfinite active raw importance ratios")
     advantage, weight = data["advantage"].double(), data["weight"].double()
-    expected_weight = (torch.where((ratio >= .5) & (ratio <= 2), ratio, 0.) if mode == "mis"
+    positive = advantage > 0
+    low = torch.where(positive, mis_intervals[0], mis_intervals[2])
+    high = torch.where(positive, mis_intervals[1], mis_intervals[3])
+    expected_weight = (torch.where((ratio >= low) & (ratio <= high), ratio, 0.) if mode == "mis"
                        else ratio.clamp_max(2) if mode == "tis" else torch.ones_like(ratio))
     torch.testing.assert_close(weight, expected_weight, atol=1e-6, rtol=2e-5)
     tails = {"ratio_lt01": ratio < .1, "ratio_lt05": ratio < .5,
@@ -153,16 +156,22 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta):
         output[f"sfc/{name}_fraction"] = float(tail.double().mean())
         output[f"sfc/{name}_tokens"] = int(tail.sum())
     if mode == "mis":
-        _mis_statistics(output, data, ratio, advantage, weight, signs)
+        _mis_statistics(output, data, ratio, advantage, weight, signs, low=low, high=high)
+        output.update({f"sfc/mis_{name}_bound": float(value) for name, value in zip(
+            ("positive_low", "positive_high", "negative_low", "negative_high"), mis_intervals, strict=True)})
     return output, tails
 
 
-def _mis_statistics(output, data, ratio, advantage, weight, signs):
-    lower, upper = ratio < .5, ratio > 2
+def _mis_statistics(output, data, ratio, advantage, weight, signs, *, low=.5, high=2.):
+    lower, upper = ratio < low, ratio > high
     rejected = lower | upper
     tis = ratio.clamp(.5, 2)
     torch.testing.assert_close(data["counterfactual_tis_weight"].double(), tis, atol=1e-6, rtol=2e-5)
     delta = (weight-tis)*advantage
+    symmetric = torch.where((ratio >= .5) & (ratio <= 2), ratio, 0.)
+    output["sfc/mis_minus_symmetric_mis_advantage_mean"] = float(((weight-symmetric)*advantage).mean())
+    output["sfc/mis_minus_symmetric_mis_advantage_abs_mean"] = float(((weight-symmetric)*advantage).abs().mean())
+    output["sfc/mis_restored_vs_symmetric_fraction"] = float(((weight != 0) & (symmetric == 0)).double().mean())
     output["sfc/mis_retained_fraction"] = float((~rejected).double().mean())
     output["sfc/mis_minus_tis_advantage_mean"] = float(delta.mean())
     output["sfc/mis_minus_tis_advantage_abs_mean"] = float(delta.abs().mean())
@@ -221,6 +230,11 @@ def _audit_integrity(directory, data, frame):
     packet = {"state": "COMPLETE32OUTPUT_LOGIT_POSITIONS", "positions": positions,
               "source": frame["source"], "trainer_version": frame["trainer_version"],
               "scope": "partial output-logit gradients only; not parameter-gradient directions"}
+    names = packets[0]["components"][:-1]
+    if any(part["components"][:-1] != names for part in packets):
+        raise ValueError("Partial logit audit component names differ")
+    projections = torch.cat([part["entropy_change_per_unit_logit_gradient_step"] for part in packets])
+    packet["entropy_direction_sum"] = dict(zip(names, projections.double().sum(0).tolist(), strict=True))
     with (root/"complete.json").open("x") as stream:
         json.dump(packet, stream, allow_nan=False)
     return packet
@@ -232,9 +246,16 @@ def summarize_update(directory, *, expected_tokens, expected_samples, cp_size, m
         directory, expected_tokens=expected_tokens, expected_samples=expected_samples, cp_size=cp_size)
     if any(frame.get("importance_mode", mode) != mode for frame in frames):
         raise ValueError("Paired-score importance method differs from the selected method")
-    output, tails = _token_statistics(data, n=n, expected_samples=expected_samples, seals=seals, mode=mode, beta=beta)
+    intervals = tuple(frames[0].get("mis_intervals") or (.5, 2., .5, 2.))
+    if any(tuple(frame.get("mis_intervals") or (.5, 2., .5, 2.)) != intervals for frame in frames):
+        raise ValueError("Paired-score MIS advantage bounds differ between frames")
+    output, tails = _token_statistics(data, n=n, expected_samples=expected_samples, seals=seals,
+                                    mode=mode, beta=beta, mis_intervals=intervals)
     categories = _slice_statistics(output, data, sample_metadata, expected_samples, tails)
     audit = _audit_integrity(directory, data, frames[0])
+    if audit is not None:
+        output.update({f"sfc/logit_audit/{name}/entropy_direction_sum": value
+                       for name, value in audit["entropy_direction_sum"].items()})
     complete = {"schema_version": 1, "state": "COMPLETE_ORIGINAL_TOKEN_DIAGNOSTICS", "metrics": output,
                 "categories": categories, "source": frames[0]["source"], "trainer_version": frames[0]["trainer_version"],
                 "completed_update": frames[0]["completed_update"], "ranks": cp_size,

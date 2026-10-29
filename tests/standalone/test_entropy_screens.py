@@ -41,23 +41,30 @@ def arguments(**changes):
 
 
 @pytest.mark.parametrize("temperature", [.7, 1.])
-def test_native_ppo_mis_logit_components_match_dense_autograd(temperature):
-    args = arguments(rollout_temperature=temperature)
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_native_ppo_mis_logit_components_match_dense_autograd(temperature, asymmetric):
+    bounds = dict(mis_positive_low=.25, mis_positive_high=4., mis_negative_low=.5, mis_negative_high=2.) if asymmetric else {}
+    args = arguments(rollout_temperature=temperature, **bounds)
     logits = torch.randn(8, 7, generator=torch.Generator().manual_seed(55), requires_grad=True)
     samples = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2])
     logp = (logits[:, :5]/temperature).log_softmax(-1)
     selected = logp.gather(-1, samples[:, None]).squeeze(-1)
     # Include native PPO clipping, dual clipping and MIS rejection independently.
     old = selected.detach()-torch.tensor([.1, .5, -1., 0., 3., .3, -.4, -30.])
-    q = old-torch.tensor([.0, -2., 2., -.4, .2, -1., .1, 0.])
+    q = old-torch.tensor([.3, 3., 7.4, .67, 1.22, .37, 1.1, 1.]).log()
     advantage = torch.tensor([1., 1., -1., 0., -2., -.5, .8, 1.])
     token_loss, _ = math_utils.compute_policy_loss(old-selected, advantage, .2, .28, 10.)
     ratio = (old-q).exp()
     tis = ratio.clamp(.5, 2.)
-    mis = torch.where((ratio >= .5) & (ratio <= 2.), ratio, 0.)
+    keep = torch.where(advantage > 0, (ratio >= .25) & (ratio <= 4.),
+                       (ratio >= .5) & (ratio <= 2.)) if asymmetric else (ratio >= .5) & (ratio <= 2.)
+    mis = torch.where(keep, ratio, 0.)
     entropy = -(logp.exp()*logp).sum(-1)
     expected = {"counterfactual_tis_pg": (tis*token_loss).sum()/19,
                 "mis_minus_tis": ((mis-tis)*token_loss).sum()/19, "entropy": entropy.sum()}
+    if asymmetric:
+        symmetric = torch.where((ratio >= .5) & (ratio <= 2.), ratio, 0.)
+        expected["asymmetric_minus_symmetric_mis"] = ((mis-symmetric)*token_loss).sum()/19
     actual = policy_observations.component_gradients(logits.detach()/temperature, samples, q, old,
                                                     advantage, args=args, denominator=19)
     for name, loss in expected.items():
@@ -84,7 +91,9 @@ def _native_policy_function():
 
 
 @pytest.mark.parametrize("all_rejected", [False, True])
-def test_real_policy_observations_preserve_loss_gradient_and_original_denominator(tmp_path, monkeypatch, all_rejected):
+@pytest.mark.parametrize("asymmetric", [False, True])
+@pytest.mark.parametrize("advantage", [-.5, 0., .5])
+def test_real_policy_observations_preserve_loss_gradient_and_original_denominator(tmp_path, monkeypatch, all_rejected, asymmetric, advantage):
     monkeypatch.setenv("MILES_SOURCE_COMMIT", "cpu-test")
     logits = torch.randn(1, 5, 5, generator=torch.Generator().manual_seed(12), requires_grad=True)
     tokens = torch.tensor([0, 1, 2, 3, 4, 0])
@@ -92,18 +101,19 @@ def test_real_policy_observations_preserve_loss_gradient_and_original_denominato
     ratio = torch.tensor([.1, .5, 1., 2., 3.]) if not all_rejected else torch.full((5,), .1)
     q = old-ratio.log()
     mask = torch.tensor([1., 1., 0., 1., 1.])
-    batch = dict(advantages=[torch.full((5,), -.5)], log_probs=[old], rollout_log_probs=[q],
+    batch = dict(advantages=[torch.full((5,), advantage)], log_probs=[old], rollout_log_probs=[q],
         loss_masks=[mask], total_lengths=[6], response_lengths=[5], unconcat_tokens=[tokens],
         rollout_mask_sums=[mask.sum()], sample_indices=[10], weight_versions=[["version1"]],
         sfc_generation_log_probs=[q], sfc_sample_metadata=[dict(valid_tokens=4,
-            first_valid_positions=[0, 1, 3, 4], theme="a", scenario="b", advantage=-.5)])
+            first_valid_positions=[0, 1, 3, 4], theme="a", scenario="b", advantage=advantage)])
     function = _native_policy_function()
     reducer = cp_utils.get_sum_of_sample_mean([6], [5], [mask], calculate_per_token_loss=True)
-    args = arguments()
+    args = arguments(**(dict(mis_positive_low=.25, mis_positive_high=4.,
+                            mis_negative_low=.5, mis_negative_high=2.) if asymmetric else {}))
     plain, _ = function(args, batch, logits, reducer)
     plain_grad, = torch.autograd.grad(plain, logits, retain_graph=True)
     args.sfc_diagnostics_dir = str(tmp_path)
-    sfc_observations.configure_rollout(args, 0, "version1", {**batch, "rewards": [-.5]})
+    sfc_observations.configure_rollout(args, 0, "version1", {**batch, "rewards": [advantage]})
     observed, _ = function(args, batch, logits, reducer)
     observed_grad, = torch.autograd.grad(observed, logits)
     torch.testing.assert_close(plain, observed, rtol=0, atol=0)
@@ -113,9 +123,34 @@ def test_real_policy_observations_preserve_loss_gradient_and_original_denominato
     assert not frame["sfc_enabled"] and "correction" not in frame["data"]
     assert not any("centering_correction" in name or "head_mass" in name for name in result)
     assert result["sfc/original_valid_tokens"] == 4
-    assert result["sfc/mis_retained_fraction"] == (0 if all_rejected else .5)
+    assert result["sfc/mis_retained_fraction"] == (0 if all_rejected else .75 if asymmetric and advantage > 0 else .5)
     assert result["sfc/applied_ess"] == 0 if all_rejected else result["sfc/applied_ess"] > 0
     assert result["sfc/pg_token_mean"] == pytest.approx(float(observed.detach()/4))
+
+
+def test_asymmetric_mis_inclusive_boundaries_zero_advantages_and_detached_weights():
+    args = arguments(mis_positive_low=.25, mis_positive_high=4., mis_negative_low=.5, mis_negative_high=2.)
+    values = torch.tensor([.25, 4., .5, 2.])
+    ratio = torch.cat([torch.nextafter(values, torch.zeros_like(values)), values,
+                       torch.nextafter(values, torch.full_like(values, float("inf")))]).requires_grad_()
+    advantages = torch.tensor([1., 1., -1., -1.]*3)
+    expected_keep = torch.tensor([False, True, False, True, True, True, True, True, True, False, True, False])
+    actual = corrections.mis_weights(args, ratio, advantages)
+    torch.testing.assert_close(actual, torch.where(expected_keep, ratio.detach(), 0.))
+    assert not actual.requires_grad
+    # Zero advantages have no direct gradient, but retain the original diagnostic band.
+    torch.testing.assert_close(corrections.mis_weights(args, values, torch.zeros_like(values)),
+                               torch.tensor([0., 0., .5, 2.]))
+    with pytest.raises(ValueError, match="aligned token advantages"):
+        corrections.mis_weights(args, ratio)
+
+
+@pytest.mark.parametrize("changes", [dict(mis_positive_low=.25),
+    dict(mis_positive_low=float("nan"), mis_positive_high=4., mis_negative_low=.5, mis_negative_high=2.),
+    dict(mis_positive_low=4., mis_positive_high=.25, mis_negative_low=.5, mis_negative_high=2.)])
+def test_asymmetric_mis_invalid_bounds_fail_before_model_initialization(changes):
+    with pytest.raises(ValueError, match="MIS advantage bounds"):
+        validate_score_centering_args(arguments(**changes))
 
 
 def test_screen_cadences_and_mis_validation():

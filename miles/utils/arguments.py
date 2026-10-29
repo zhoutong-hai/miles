@@ -1580,6 +1580,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Path to the custom TIS/RS function (e.g., examples/infra_features/train_infer_mismatch_helper/mis.py:compute_mis_weights_with_cp).",
             )
+            for name in ("positive-low", "positive-high", "negative-low", "negative-high"):
+                parser.add_argument(f"--mis-{name}", type=float, default=None,
+                                    help="Fixed advantage-sign MIS bound; set all four together. No entropy adaptation.")
             parser.add_argument(
                 "--custom-pg-loss-reducer-function-path",
                 type=str,

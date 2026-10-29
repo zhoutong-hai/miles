@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 from miles.backends.training_utils.cp_utils import all_gather_with_cp
 from miles.backends.training_utils.loss_hub import sfc_observations
+from miles.backends.training_utils.loss_hub.corrections import mis_weights
 from miles.backends.training_utils.loss_hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss_hub.math_utils import compute_policy_loss
 from miles.backends.training_utils.parallel import get_parallel_state
@@ -51,11 +52,15 @@ def component_gradients(logits, sampled_ids, logq, old_logp, advantages, *, args
         coefficient, = torch.autograd.grad(loss.sum(), leaf)
     ratio = (old_logp.detach()-logq.detach()).exp()
     tis = ratio.clamp(args.tis_clip_low, args.tis_clip)
-    mis = torch.where((ratio >= args.tis_clip_low) & (ratio <= args.tis_clip), ratio, 0.)
+    mis = mis_weights(args, ratio, advantages)
     base = coefficient[:, None]*score/(args.rollout_temperature*denominator)
-    return {"counterfactual_tis_pg": tis[:, None]*base,
-            "mis_minus_tis": (mis-tis)[:, None]*base,
-            "entropy": -p*(safe_logp+entropy)/args.rollout_temperature}
+    components = {"counterfactual_tis_pg": tis[:, None]*base,
+                  "mis_minus_tis": (mis-tis)[:, None]*base}
+    if getattr(args, "mis_positive_low", None) is not None:
+        symmetric = torch.where((ratio >= .5) & (ratio <= 2.), ratio, 0.)
+        components["asymmetric_minus_symmetric_mis"] = (mis-symmetric)[:, None]*base
+    components["entropy"] = -p*(safe_logp+entropy)/args.rollout_temperature
+    return components
 
 
 @torch.no_grad()
@@ -65,7 +70,7 @@ def observe(args, batch, logits, *, logp, trainer_logp, rollout_logp, advantages
     old = torch.cat(trainer_logp).detach()
     q = torch.cat(rollout_logp).detach()
     ratio = (old-q).exp()
-    weights = torch.where((ratio >= args.tis_clip_low) & (ratio <= args.tis_clip), ratio, 0.)
+    weights = mis_weights(args, ratio, advantages)
     empty_ids = torch.empty((len(logp), 0), dtype=torch.long, device=logp.device)
     empty_head = logp.new_empty((len(logp), 0))
     sfc_observations.capture(args, batch, logp[:, None], q, advantages, active, empty_ids, empty_head,

@@ -250,6 +250,7 @@ def policy_loss_function(
         ois = (-ppo_kl).exp()
         tis_kwargs = {
             "args": args,
+            "advantages": advantages,
             "pg_loss": pg_loss,
             "train_log_probs": trainer_scored_log_probs,
             "rollout_log_probs": rollout_old_log_probs,

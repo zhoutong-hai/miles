@@ -17,12 +17,14 @@ from miles.backends.training_utils.parallel import set_parallel_state
 
 @pytest.mark.parametrize("true_on_policy", [False, True])
 @pytest.mark.parametrize("entropy_requires_grad", [False, True])
-def test_empty_native_scores_preserve_graph_and_entropy_observation_mode(true_on_policy, entropy_requires_grad):
-    logits = torch.empty(0, 7, requires_grad=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_empty_native_scores_preserve_graph_and_entropy_observation_mode(true_on_policy, entropy_requires_grad, dtype):
+    logits = torch.empty(0, 7, dtype=dtype, requires_grad=True)
     logp, entropy = math_utils.calculate_log_probs_and_entropy(
         logits, torch.empty(0, dtype=torch.long), None, with_entropy=True,
         entropy_requires_grad=entropy_requires_grad, true_on_policy=true_on_policy)
     assert logp.shape == entropy.shape == (0,)
+    assert logp.dtype == (dtype if true_on_policy else torch.float32)
     assert logp.requires_grad
     assert entropy.requires_grad == entropy_requires_grad
     logp.sum().backward()

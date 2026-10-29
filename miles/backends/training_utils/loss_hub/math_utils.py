@@ -987,7 +987,7 @@ def calculate_log_probs_and_entropy(
         # Empty contiguous CP owners still join the differentiable response
         # redistribution's backward all-reduce. A detached empty tensor makes
         # those ranks skip it and enter the next model collective out of order.
-        log_prob = logits.sum(dim=-1)
+        log_prob = logits.float().sum(dim=-1)
         if with_entropy:
             entropy = log_prob if entropy_requires_grad else log_prob.detach()
 

@@ -55,7 +55,9 @@ def case(rank, tp_group, cp_group, device, all_rejected, total, response, dtype)
     chosen=reference[total-response-1:total-1].log_softmax(-1).gather(-1,tokens[-response:,None]).squeeze(-1)
     native,_=compute_policy_loss(old-chosen,torch.ones(response,device=device),.2,.28,10.)
     (native.mul(mis).sum()/response).backward()
-    expected=reference.grad[cp*width:(cp+1)*width,tp*8:(tp+1)*8].to(dtype)
+    # This pinned native fused CE deliberately returns BF16 gradients, even
+    # for FP32 inputs. Mirror that unchanged backward boundary in the oracle.
+    expected=reference.grad[cp*width:(cp+1)*width,tp*8:(tp+1)*8].to(torch.bfloat16).to(dtype)
     torch.testing.assert_close(local.grad,expected,atol=2e-6,rtol=.01 if dtype==torch.bfloat16 else 1e-4)
     assert torch.isfinite(local.grad).all()
     sentinel=torch.ones(1,device=device)
@@ -83,7 +85,14 @@ def main():
         with (output/f'rank-{rank}.json').open('x') as stream:json.dump(packet,stream,indent=2,allow_nan=False)
         dist.barrier()
         if rank==0: print(json.dumps({'marker':'NATIVE_EMPTY_CP_BACKWARD_PASS','ranks':16,'cases_per_rank':8}))
-    finally:dist.destroy_process_group()
+    except BaseException:
+        # A failing rank must surface its assertion before cleanup can wait
+        # on peers already inside their next collective.
+        import traceback
+        traceback.print_exc()
+        raise
+    else:
+        dist.destroy_process_group()
 
 
 if __name__=='__main__':main()

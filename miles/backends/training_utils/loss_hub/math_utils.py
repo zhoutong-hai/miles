@@ -984,9 +984,12 @@ def calculate_log_probs_and_entropy(
             if with_entropy:
                 entropy = compute_entropy(logits)
     else:
-        log_prob = logits.new_zeros((0,))
+        # Empty contiguous CP owners still join the differentiable response
+        # redistribution's backward all-reduce. A detached empty tensor makes
+        # those ranks skip it and enter the next model collective out of order.
+        log_prob = logits.sum(dim=-1)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob if entropy_requires_grad else log_prob.detach()
 
     return log_prob, entropy
 
@@ -1017,8 +1020,8 @@ def _calculate_log_probs_and_entropy_true_on_policy(
         and *entropy* has shape ``[R]`` or is ``None``.
     """
     if logits.size(0) == 0:
-        log_prob = logits.new_zeros((0,))
-        entropy = logits.new_zeros((0,)) if with_entropy else None
+        log_prob = logits.sum(dim=-1)
+        entropy = (log_prob if entropy_requires_grad else log_prob.detach()) if with_entropy else None
         return log_prob, entropy
 
     full_logits = _gather_true_on_policy_full_logits(logits, tp_group, vocab_size=vocab_size)

@@ -46,7 +46,8 @@ def _cp4(rank, mode, coefficient):
     args = Namespace(qkv_format="thd", allgather_cp=True, true_on_policy_mode=False, rollout_temperature=1.0,
                      vocab_size=7, log_probs_chunk_size=2, entropy_coef=0.0, observe_training_entropy=True,
                      use_kl_loss=False, sampler_kl_coef=coefficient, score_centering_is=mode,
-                     score_centering_tis_clip=2.0, score_centering_mis_low=0.5, score_centering_mis_high=5.0)
+                     score_centering_tis_clip=2.0, score_centering_mis_low=0.5, score_centering_mis_high=5.0,
+                     mis_positive_low=.25, mis_positive_high=4., mis_negative_low=.5, mis_negative_high=2.)
     generator = torch.Generator().manual_seed(27)
     full = torch.randn(32, 8, generator=generator, requires_grad=True)
     local = full.detach()[rank * 8:(rank + 1) * 8].clone().unsqueeze(0).requires_grad_()
@@ -62,6 +63,7 @@ def _cp4(rank, mode, coefficient):
                  advantages=[slice_log_prob_with_cp(a, t, n) for a, t, n in zip(advantages, totals, responses)],
                  rollout_log_probs=[slice_log_prob_with_cp(q, t, n) for q, t, n in zip(sampled, totals, responses)],
                  rollout_topk_token_ids=[h.indices for h in heads], rollout_topk_log_probs=[h.values.log() for h in heads])
+    batch["log_probs"] = [slice_log_prob_with_cp(q, t, n) for q,t,n in zip(sampled,totals,responses)]
     reduce = get_sum_of_sample_mean(totals, responses, masks, calculate_per_token_loss=True)
     count = sum(m.sum() for m in masks)
     actual, log = score_centering_loss_function(args, batch, local, reduce)
@@ -76,7 +78,7 @@ def _cp4(rank, mode, coefficient):
             losses, _ = score_centering_loss(ScoreCenteringInputs(
                 train_log_probs=selected, train_head_log_probs=candidates, rollout_log_probs=q_sample,
                 rollout_head_log_probs=head.values.log(), head_mask=torch.ones_like(candidates, dtype=torch.bool),
-                advantages=advantage, mode=mode,
+                advantages=advantage, mode=mode, mis_intervals=(.25,4.,.5,2.) if mode == "mis" else None,
             ))
             kl = sampler_kl_loss(candidates, head.values.log(), torch.ones_like(candidates, dtype=torch.bool), mask.bool())
             expected = expected + ((losses + coefficient * kl) * mask).sum() / count
@@ -170,7 +172,7 @@ def _worker(rank, rendezvous, observation_root):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
     try:
         _tp4(rank)
-        for mode in ("none", "tis"):
+        for mode in ("none", "tis", "mis"):
             for coefficient in (0.0, 0.03):
                 _cp4(rank, mode, coefficient)
         _mis_tp4(rank)

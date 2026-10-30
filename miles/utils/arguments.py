@@ -1409,7 +1409,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument("--rollout-top-logprobs-num", type=int, default=0)
-            parser.add_argument("--score-centering-is", choices=["none", "tis"], default="none")
+            parser.add_argument("--score-centering-is", choices=["none", "tis", "mis"], default="none")
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)

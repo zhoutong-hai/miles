@@ -3,9 +3,11 @@
 import torch
 import torch.distributed as dist
 
+from miles.backends.training_utils.loss_hub.score_centering.importance_sampling import importance_sampling
+
 
 def component_gradients(logits, head_ids, head_logq, sampled_ids, sampled_logq, advantages,
-                        *, mode, beta, temperature=1.0, vocab_size=None, group=None, denominator=1):
+                        *, mode, beta, temperature=1.0, vocab_size=None, group=None, denominator=1, mis_intervals=None):
     """Closed forms of the native detached-head SFC/KL derivatives on a TP shard.
 
     This is a diagnostic calculation on detached copies. It neither calls
@@ -60,19 +62,38 @@ def component_gradients(logits, head_ids, head_logq, sampled_ids, sampled_logq, 
     unweighted = -advantage * (score - residual_score(none_residual))
     weighted = -advantage * (weight[:, None]*score - residual_score(tis_residual))
     selected = weighted if mode == "tis" else unweighted
-    uncentered = -advantage * (weight[:, None] if mode == "tis" else 1) * score
+    sample_weight = weight if mode == "tis" else torch.ones_like(weight)
+    symmetric = None
+    if mode == "mis":
+        sampling = importance_sampling("mis", tis_clip=2., mis_low=.5, mis_high=2.,
+                                       mis_intervals=mis_intervals, advantages=advantages)
+        sample_weight = sampling.sample_weight(sample_logp-sampled_logq.detach())
+        head_logp = torch.where(owned, logp.gather(-1, local_ids.clamp(0,width-1)), 0.)
+        if group is not None:
+            dist.all_reduce(head_logp, group=group)
+        head_log_ratio = head_logp-head_logq.detach().to(dtype)
+        residual = sampling.head_mass(head_p, q, head_log_ratio)-sampling.tail_scale(rho, dtype)[:, None]*head_p
+        selected = -advantage*(sample_weight[:, None]*score-residual_score(residual))
+        sym = importance_sampling("mis", tis_clip=2., mis_low=.5, mis_high=2.)
+        sym_weight = sym.sample_weight(sample_logp-sampled_logq.detach())
+        sym_residual = sym.head_mass(head_p, q, head_log_ratio)-sym.tail_scale(rho, dtype)[:, None]*head_p
+        symmetric = -advantage*(sym_weight[:, None]*score-residual_score(sym_residual))
+    uncentered = -advantage * sample_weight[:, None] * score
     # The KL tail uses q_tail>=0, whereas native SFC uses its Appendix floor.
     kl_rho = (1-q.sum(-1)).clamp_min(0) / (1-head_p.sum(-1)).clamp_min(1e-6)
     kl_gradient = -beta * residual_score(q-kl_rho[:, None]*head_p)
     scale = temperature * denominator
-    return {
+    components = {
         "unweighted_sfc_pg": unweighted / scale,
         "importance_change": (selected-unweighted) / scale,
         "weighted_sampler_kl": kl_gradient / scale,
         "sfc_change_from_uncentered": (selected-uncentered) / scale,
         "uncentered_pg": uncentered / scale,
-        "entropy": -p*(safe_logp+entropy) / temperature,
     }
+    if symmetric is not None:
+        components["asymmetric_minus_symmetric_mis"] = (selected-symmetric)/scale
+    components["entropy"] = -p*(safe_logp+entropy) / temperature
+    return components
 
 
 def component_statistics(components, *, group=None):

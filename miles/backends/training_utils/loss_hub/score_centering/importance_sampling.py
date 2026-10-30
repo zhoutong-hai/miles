@@ -75,9 +75,51 @@ class MaskedImportanceSampling:
         return torch.where(self._inside(log_ratio), log_ratio.clamp(max=math.log(self.high)).exp(), 0.0)
 
 
+@dataclass(frozen=True)
+class AdvantageMaskedImportanceSampling:
+    """The same sign-specific MIS function in sampled, head and tail terms."""
+
+    intervals: tuple[float, float, float, float]
+    advantages: torch.Tensor
+
+    def _bounds(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        positive = self.advantages.detach() > 0
+        low = torch.where(positive, self.intervals[0], self.intervals[2]).to(value)
+        high = torch.where(positive, self.intervals[1], self.intervals[3]).to(value)
+        while low.ndim < value.ndim:
+            low, high = low.unsqueeze(-1), high.unsqueeze(-1)
+        return low, high
+
+    def _ratio_and_mask(self, log_ratio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        inactive = self.advantages.detach() == 0
+        while inactive.ndim < log_ratio.ndim:
+            inactive = inactive.unsqueeze(-1)
+        log_ratio = torch.where(inactive & torch.isnan(log_ratio), 0.0, log_ratio)
+        if torch.isnan(log_ratio).any():
+            raise ValueError("Score-centering importance log-ratio contains NaN")
+        low, high = self._bounds(log_ratio)
+        # Compare the actual FP32/FP64 exp ratio inclusively, including boundary
+        # rounding. Capping only above the largest accepted value avoids overflow.
+        ratio = log_ratio.clamp_max(high.log() + 1).exp()
+        return ratio, (ratio >= low) & (ratio <= high)
+
+    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
+        _, keep = self._ratio_and_mask(log_ratio)
+        return torch.where(keep, p, 0.0)
+
+    def tail_scale(self, rho: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        low, high = self._bounds(rho)
+        return ((rho >= 1 / high) & (rho <= 1 / low)).to(dtype)
+
+    def sample_weight(self, log_ratio: torch.Tensor) -> torch.Tensor:
+        ratio, keep = self._ratio_and_mask(log_ratio)
+        return torch.where(keep, ratio, 0.0)
+
+
 def importance_sampling(
-    mode: str, *, tis_clip: float, mis_low: float, mis_high: float
-) -> NoImportanceSampling | TruncatedImportanceSampling | MaskedImportanceSampling:
+    mode: str, *, tis_clip: float, mis_low: float, mis_high: float,
+    mis_intervals: tuple[float, float, float, float] | None = None, advantages: torch.Tensor | None = None,
+) -> NoImportanceSampling | TruncatedImportanceSampling | MaskedImportanceSampling | AdvantageMaskedImportanceSampling:
     """Validate the parameters of ``mode`` and return its importance sampling."""
     if mode == "tis" and (not math.isfinite(tis_clip) or tis_clip <= 0):
         raise ValueError("Score-centering TIS clip must be positive and finite")
@@ -87,6 +129,12 @@ def importance_sampling(
         return NoImportanceSampling()
     if mode == "tis":
         return TruncatedImportanceSampling(clip=tis_clip)
+    if mis_intervals is not None:
+        if (mode != "mis" or len(mis_intervals) != 4 or advantages is None
+            or not all(math.isfinite(x) for x in mis_intervals)
+            or not (0 < mis_intervals[0] <= mis_intervals[1] and 0 < mis_intervals[2] <= mis_intervals[3])):
+            raise ValueError("Sign-specific SFC MIS needs four finite ordered bounds and advantages")
+        return AdvantageMaskedImportanceSampling(intervals=mis_intervals, advantages=advantages)
     if mode == "mis":
         return MaskedImportanceSampling(low=mis_low, high=mis_high)
     raise ValueError(f"Unknown score-centering importance weighting: {mode}")

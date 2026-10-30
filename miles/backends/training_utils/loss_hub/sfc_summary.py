@@ -119,11 +119,19 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_inter
     output["sfc/score_centering_enabled"] = int("correction" in data)
     output["sfc/sampler_kl_weighted_token_mean"] = beta*output["sfc/sampler_kl_raw_token_mean"]
     output["sfc/total_loss_token_mean"] = output["sfc/pg_token_mean"]+output["sfc/sampler_kl_weighted_token_mean"]
-    if mode == "mis":
+    if mode == "mis" and "correction" not in data:
         # There is no candidate payload for an SFC-off MIS arm: do not present
         # an uncomputed head/tail KL estimator as a measured zero.
         output.pop("sfc/sampler_kl_raw_token_mean")
     _quantiles(output, "log_ratio", log_ratio, [.001, .01, .5, .99, .999])
+    if "cached_pre_update_logp" in data:
+        cached = data["cached_pre_update_logp"].double()
+        difference = data["logp"].double() - cached
+        cached_ratio = (data["cached_pre_update_logp"]-data["logq"]).exp().double()
+        cached_keep = (cached_ratio >= low) & (cached_ratio <= high)
+        actual_keep = (ratio >= low) & (ratio <= high)
+        output["sfc/training_vs_cached_logp_abs_mean"] = float(difference.abs().mean())
+        output["sfc/training_vs_cached_mis_mask_disagreement_fraction"] = float((cached_keep != actual_keep).double().mean())
     if "correction" in data:
         correction = data["correction"].double()
         output.update({"sfc/sample_in_head_fraction": float(data["sample_in_head"].double().mean()),
@@ -224,7 +232,19 @@ def _audit_integrity(directory, data, frame):
                 raise ValueError("Nonfinite partial logit audit")
         positions.extend(map(tuple, packet["positions"]))
         packets.append(packet)
-    expected = sorted(zip(data["sample_id"].tolist(), data["token_position"].tolist(), strict=True))[:32]
+    if frame.get("audit_selector") == "advantage_sign_v1":
+        from miles.backends.training_utils.loss_hub.sfc_audit_positions import select_positions
+
+        # Every frame contains one microbatch, so reconstruct metadata across all
+        # recorded original tokens rather than selecting within a single frame.
+        advantages = dict(zip(data["sample_id"].tolist(), data["advantage"].tolist(), strict=True))
+        identities = sorted(set(data["sample_id"].tolist()))
+        metadata = [{"advantage": advantages[index], "first_valid_positions":
+                     sorted(data["token_position"][data["sample_id"] == index].tolist())[:32]}
+                    for index in identities]
+        expected = select_positions(metadata, identities, sign_aware=True)
+    else:
+        expected = sorted(zip(data["sample_id"].tolist(), data["token_position"].tolist(), strict=True))[:32]
     if len(positions) != 32 or sorted(positions) != expected:
         raise ValueError("Partial logit audit must cover exactly32 selected original positions")
     packet = {"state": "COMPLETE32OUTPUT_LOGIT_POSITIONS", "positions": positions,

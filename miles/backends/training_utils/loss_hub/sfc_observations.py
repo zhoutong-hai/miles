@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from miles.backends.training_utils.cp_utils import slice_log_prob_with_cp
 from miles.backends.training_utils.loss_hub.corrections import mis_intervals
+from miles.backends.training_utils.loss_hub.sfc_audit_positions import select_positions
 from miles.backends.training_utils.loss_hub.sfc_logit_audit import component_gradients, component_statistics
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.score_centering import observation_importance_mode, observation_updates
@@ -40,13 +41,15 @@ def configure_rollout(args, rollout_id, trainer_version, data):
     if indices is None or len(set(indices)) != len(indices):
         raise ValueError("SFC observations require unique original sample identities")
     metadata = data["sfc_sample_metadata"]
-    live = [(int(index), int(position)) for index, sample in zip(indices, metadata, strict=True)
-            for position in sample["first_valid_positions"]]
     data["sfc_sample_metadata"] = [{**sample, "advantage": float(reward)}
                                    for sample, reward in zip(metadata, data["rewards"], strict=True)]
-    _CONTEXT = {"root": root, "rollout": int(rollout_id), "completed": int(rollout_id)+1,
+    sign_aware = (getattr(args, "loss_type", None) == "score_centering"
+                  and getattr(args, "score_centering_is", None) == "mis")
+    audit_positions = select_positions(data["sfc_sample_metadata"], indices, sign_aware=sign_aware)
+    _CONTEXT = {"audit_selector": "advantage_sign_v1" if sign_aware else "first32",
+                "root": root, "rollout": int(rollout_id), "completed": int(rollout_id)+1,
                 "trainer_version": str(trainer_version), "expected_tokens": sum(sample["valid_tokens"] for sample in metadata),
-                "expected_samples": set(map(int, indices)), "audit_positions": set(sorted(live)[:32]),
+                "expected_samples": set(map(int, indices)), "audit_positions": set(audit_positions),
                 "source": os.environ.get("MILES_SOURCE_COMMIT", "UNBOUND"),
                 "run": getattr(args, "wandb_run_id", None), "args": args,
                 "seen": set(), "frames": 0, "tokens": 0, "capture_seconds": 0.0, "audit_seconds": 0.0}
@@ -84,7 +87,7 @@ def _response_layout(args, batch):
 
 
 def capture(args, batch, selected, rollout, advantages, active, ids, head, metrics, entropy, token_loss, sampler_kl,
-            *, applied_weight=None, importance_logp=None, importance_ratio=None):
+            *, applied_weight=None, importance_logp=None, importance_ratio=None, pre_update_logp=None):
     if not enabled(args) or not _writer():
         return
     start = time.perf_counter()
@@ -108,7 +111,13 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
                "weight": applied_weight.detach().cpu(),
                "entropy": entropy.detach().cpu(), "pg_loss": token_loss.detach().cpu(),
                "sampler_kl": sampler_kl.detach().cpu()}
+    if pre_update_logp is not None:
+        records["cached_pre_update_logp"] = pre_update_logp.detach().cpu()
+        records["importance_ratio"] = (logp-logq).exp().cpu()
+        records["counterfactual_tis_weight"] = (logp-logq).exp().clamp(.5,2.).cpu()
     if metrics is not None:
+        if args.score_centering_is == "mis":
+            records["train_head_logp"] = selected[:, 1:].detach().cpu()
         records.update({"correction": metrics.correction.cpu(),
                         "p_head_mass": selected[:, 1:].detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
                         "q_head_mass": head.detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
@@ -125,7 +134,8 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
                                expected_advantage[records["mask"]], rtol=1e-5, atol=1e-6)
     candidate_hash = hashlib.sha256(ids.detach().cpu().contiguous().numpy().tobytes() + head.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
     packet = {"schema_version": 2, "run": context["run"], "source": context["source"],
-              "mis_intervals": list(mis_intervals(args)) if args.loss_type == "policy_loss" else None,
+              "mis_intervals": list(mis_intervals(args)) if args.loss_type == "policy_loss" or args.score_centering_is == "mis" else None,
+              "audit_selector": context["audit_selector"],
               "sfc_enabled": args.loss_type == "score_centering", "importance_mode": observation_importance_mode(args),
               "audit_updates": list(observation_updates(args)),
               "rollout": context["rollout"], "native_pre_update": context["rollout"],
@@ -167,7 +177,8 @@ def logit_audit(args, batch, sample, chunk, tokens, indices, *, policy_old_logp=
         head_logq = torch.as_tensor(batch["rollout_topk_log_probs"][sample])[positions].to(chunk.device)
         components = component_gradients(chunk[chosen], head_ids, head_logq, tokens[chosen], q, advantage,
                                         mode=args.score_centering_is, beta=args.sampler_kl_coef,
-                                        vocab_size=args.vocab_size, group=group, denominator=context["expected_tokens"])
+                                        vocab_size=args.vocab_size, group=group, denominator=context["expected_tokens"],
+                                        mis_intervals=mis_intervals(args) if args.score_centering_is == "mis" else None)
         # chunk is already temperature-scaled by the retained response iterator.
         components = {k: value / args.rollout_temperature for k, value in components.items()}
     else:

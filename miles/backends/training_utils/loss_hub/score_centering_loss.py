@@ -13,6 +13,7 @@ from miles.backends.training_utils.cp_utils import (
 )
 from miles.backends.training_utils.loss_hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss_hub import sfc_observations
+from miles.backends.training_utils.loss_hub.corrections import mis_intervals
 from miles.backends.training_utils.loss_hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss_hub.score_centering import (
     ScoreCenteringInputs,
@@ -176,6 +177,7 @@ def score_centering_loss_function(
             tis_clip=args.score_centering_tis_clip,
             mis_low=args.score_centering_mis_low,
             mis_high=args.score_centering_mis_high,
+            mis_intervals=mis_intervals(args) if args.score_centering_is == "mis" else None,
         ),
     )
     pg_loss = sum_of_sample_mean(token_loss)
@@ -213,5 +215,8 @@ def score_centering_loss_function(
     )
     log["train_rollout_kl"] = sum_of_sample_mean(rollout_train_kl).detach()
     sfc_observations.capture(args, batch, selected, rollout, advantages, active, ids, head,
-                             metrics, entropy, token_loss, sampler_kl_tokens)
+                             metrics, entropy, token_loss, sampler_kl_tokens,
+                             applied_weight=metrics.importance_weight,
+                             pre_update_logp=(torch.cat(batch["log_probs"]).detach()
+                                              if args.score_centering_is == "mis" else None))
     return loss, log

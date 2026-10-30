@@ -40,10 +40,13 @@ def validate_score_centering_args(args):
             or not all(math.isfinite(value) for value in mis_bounds)
             or not (0 < mis_bounds[0] <= mis_bounds[1] and 0 < mis_bounds[2] <= mis_bounds[3])):
             raise ValueError("Specify four finite positive ordered MIS advantage bounds")
-        if (getattr(args, "loss_type", None) != "policy_loss" or not getattr(args, "use_tis", False)
-            or getattr(args, "custom_tis_function_path", None)
-            != "miles.backends.training_utils.loss_hub.corrections.icepop_function"):
-            raise ValueError("Fixed advantage bounds require the native MIS dispatcher")
+        policy_mis = (getattr(args, "loss_type", None) == "policy_loss" and getattr(args, "use_tis", False)
+                      and getattr(args, "custom_tis_function_path", None)
+                      == "miles.backends.training_utils.loss_hub.corrections.icepop_function")
+        sfc_mis = (getattr(args, "loss_type", None) == "score_centering"
+                   and getattr(args, "score_centering_is", None) == "mis")
+        if not (policy_mis or sfc_mis):
+            raise ValueError("Fixed advantage bounds require native policy MIS or SFC MIS")
     coefficient = getattr(args, "sampler_kl_coef", 0.0)
     if not math.isfinite(coefficient) or coefficient < 0:
         raise ValueError("--sampler-kl-coef must be finite and non-negative")
@@ -79,8 +82,10 @@ def validate_score_centering_args(args):
         return
     if args.rollout_top_logprobs_num <= 0:
         raise ValueError("Score centering requires positive --rollout-top-logprobs-num")
-    if args.score_centering_is not in ("none", "tis"):
-        raise ValueError("This backport selects native importance mode none or tis")
+    if args.score_centering_is not in ("none", "tis", "mis"):
+        raise ValueError("This backport selects native importance mode none, tis or mis")
+    if args.score_centering_is == "mis" and any(value is None for value in mis_bounds):
+        raise ValueError("SFC MIS requires all four explicit advantage-sign bounds")
     if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:
         raise ValueError("--score-centering-tis-clip must be finite and positive")
     validate_candidate_sampling(

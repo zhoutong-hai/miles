@@ -177,7 +177,7 @@ def test_glm_kernels_router_sampler_and_lifecycle_are_unchanged():
                    cwd=ROOT, check=True, capture_output=True)
 
 
-@pytest.mark.parametrize("mode", ["none", "tis"])
+@pytest.mark.parametrize("mode", ["none", "tis", "mis"])
 def test_private_observations_preserve_native_loss_and_gradient(tmp_path, monkeypatch, mode):
     from miles.backends.training_utils.loss_hub import sfc_observations
     from miles.backends.training_utils.loss_hub.sfc_summary import read_frames
@@ -186,7 +186,8 @@ def test_private_observations_preserve_native_loss_and_gradient(tmp_path, monkey
                                tp=SimpleNamespace(size=1, rank=0, group=None),
                                effective_dp=SimpleNamespace(size=1), is_pp_last_stage=True))
     monkeypatch.setenv("MILES_SOURCE_COMMIT", "frozen-source")
-    args = arguments(score_centering_is=mode, sampler_kl_coef=.01, wandb_run_id="run")
+    args = arguments(score_centering_is=mode, sampler_kl_coef=.01, wandb_run_id="run",
+                     mis_positive_low=.25, mis_positive_high=4., mis_negative_low=.5, mis_negative_high=2.)
     logits = torch.tensor([[[.2, -.7, .1, .4, 0.], [.5, .1, -.4, .8, .2], [0., .1, .2, .3, .4]]], requires_grad=True)
     q = torch.tensor([[.05, .15, .2, .3, .3], [.1, .2, .3, .15, .25]])
     heads = q.topk(3)
@@ -197,6 +198,7 @@ def test_private_observations_preserve_native_loss_and_gradient(tmp_path, monkey
                  sample_indices=[0], weight_versions=[["1"]], rewards=[0.],
                  sfc_sample_metadata=[{"group_index": 0, "source_row": 4, "theme": "theme", "scenario": "scenario",
                                        "rewards": {"scenario_score": 1.}, "valid_tokens": 2, "first_valid_positions": [0, 1]}])
+    batch["log_probs"] = [torch.zeros(2)]
     baseline, _ = score_centering_loss_function(args, batch, logits, torch.sum)
     baseline_gradient = torch.autograd.grad(baseline, logits)[0]
     args.sfc_diagnostics_dir = str(tmp_path.resolve())

@@ -91,7 +91,7 @@ def _cp4(rank, mode, coefficient):
     assert all(torch.isfinite(value) for value in log.values())
 
 
-def _mis_tp4(rank):
+def _mis_tp4(rank, *, policy_tis=False):
     set_parallel_state(SimpleNamespace(tp=SimpleNamespace(size=4, rank=rank, group=dist.group.WORLD)))
     args = Namespace(vocab_size=13, rollout_temperature=1., eps_clip=.2, eps_clip_high=.28,
                      eps_clip_c=10., tis_clip_low=.5, tis_clip=2.)
@@ -109,6 +109,13 @@ def _mis_tp4(rank):
     expected = {"counterfactual_tis_pg": (tis*native).sum()/40,
                 "mis_minus_tis": ((mis-tis)*native).sum()/40,
                 "entropy": -(logp.exp()*logp).sum()}
+    if policy_tis:
+        args.custom_tis_function_path = None
+        expected = {"actual_tis_pg": (tis*native).sum()/40,
+                    "unweighted_policy_pg": native.sum()/40,
+                    "tis_change_from_unweighted": ((tis-1)*native).sum()/40,
+                    "counterfactual_mis_minus_tis": ((mis-tis)*native).sum()/40,
+                    "entropy": -(logp.exp()*logp).sum()}
     actual = policy_observations.component_gradients(full[:, rank*4:(rank+1)*4], samples, q, old,
                                                     advantage, args=args, denominator=40)
     for name, value in expected.items():
@@ -116,7 +123,7 @@ def _mis_tp4(rank):
         torch.testing.assert_close(actual[name], gradient[:, rank*4:(rank+1)*4], atol=2e-7, rtol=2e-5)
 
 
-def _mis_cp4(rank, root):
+def _mis_cp4(rank, root, *, policy_tis=False):
     import os
 
     os.environ["MILES_SOURCE_COMMIT"] = "cpu-gloo-source"
@@ -126,6 +133,9 @@ def _mis_cp4(rank, root):
         wandb_run_id="mis-cp4", qkv_format="thd", allgather_cp=True, true_on_policy_mode=False,
         vocab_size=7, rollout_temperature=1., eps_clip=.2, eps_clip_high=.28, eps_clip_c=10.,
         tis_clip_low=.5, tis_clip=2., sampler_kl_coef=0.)
+    if policy_tis:
+        args.custom_tis_function_path = None
+        args.sfc_audit_sign_aware = True
     full = torch.randn(64, 8, generator=torch.Generator().manual_seed(37))
     totals, responses, samples = [24, 38, 2], [20, 30, 0], [10, 11, 12]
     tokens = [torch.arange(total) % 7 for total in totals]
@@ -142,6 +152,8 @@ def _mis_cp4(rank, root):
         native, _ = compute_policy_loss(anchor-selected, torch.full((n,), advantage), .2, .28, 10.)
         native_ratio = (anchor-q).exp()
         weight = torch.where((native_ratio >= .5) & (native_ratio <= 2), native_ratio, 0.)
+        if policy_tis:
+            weight = native_ratio.clamp(.5, 2.)
         logps.append(selected)
         old.append(anchor)
         qs.append(q)
@@ -177,6 +189,8 @@ def _worker(rank, rendezvous, observation_root):
                 _cp4(rank, mode, coefficient)
         _mis_tp4(rank)
         _mis_cp4(rank, observation_root)
+        _mis_tp4(rank, policy_tis=True)
+        _mis_cp4(rank, observation_root+"-tis", policy_tis=True)
     finally:
         dist.destroy_process_group()
 

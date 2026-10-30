@@ -1418,6 +1418,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--sfc-fixed-probe-sha256", type=str, default=None)
             parser.add_argument("--sfc-fixed-probe-updates", type=int, nargs="+", default=[0, 8, 16, 32, 48, 64])
             parser.add_argument("--sfc-logit-audit-updates", type=int, nargs="+", default=[8, 32, 64])
+            parser.add_argument("--sfc-audit-sign-aware", action="store_true",
+                                help="Select positive and negative advantages for detached sparse audits.")
             parser.add_argument("--sampler-kl-coef", type=float, default=0.0,
                                 help="Constant head/tail KL(q_sampler || p_trainer), independent of PG weights.")
             parser.add_argument(

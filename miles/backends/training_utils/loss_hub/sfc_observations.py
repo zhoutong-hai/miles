@@ -43,8 +43,9 @@ def configure_rollout(args, rollout_id, trainer_version, data):
     metadata = data["sfc_sample_metadata"]
     data["sfc_sample_metadata"] = [{**sample, "advantage": float(reward)}
                                    for sample, reward in zip(metadata, data["rewards"], strict=True)]
-    sign_aware = (getattr(args, "loss_type", None) == "score_centering"
-                  and getattr(args, "score_centering_is", None) == "mis")
+    sign_aware = (getattr(args, "sfc_audit_sign_aware", False)
+                  or (getattr(args, "loss_type", None) == "score_centering"
+                      and getattr(args, "score_centering_is", None) == "mis"))
     audit_positions = select_positions(data["sfc_sample_metadata"], indices, sign_aware=sign_aware)
     _CONTEXT = {"audit_selector": "advantage_sign_v1" if sign_aware else "first32",
                 "root": root, "rollout": int(rollout_id), "completed": int(rollout_id)+1,
@@ -116,8 +117,7 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
         records["importance_ratio"] = (logp-logq).exp().cpu()
         records["counterfactual_tis_weight"] = (logp-logq).exp().clamp(.5,2.).cpu()
     if metrics is not None:
-        if args.score_centering_is == "mis":
-            records["train_head_logp"] = selected[:, 1:].detach().cpu()
+        records["train_head_logp"] = selected[:, 1:].detach().cpu()
         records.update({"correction": metrics.correction.cpu(),
                         "p_head_mass": selected[:, 1:].detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),
                         "q_head_mass": head.detach().exp().masked_fill(ids < 0, 0).sum(-1).cpu(),

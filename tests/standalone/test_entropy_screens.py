@@ -84,6 +84,7 @@ def _native_policy_function():
                 "entropy": [-(logp[0].exp()*logp[0]).sum(-1)]}
     namespace = {**vars(math_utils), **vars(cp_utils), "Namespace": Namespace, "Callable": Callable,
                  "RolloutBatch": dict, "policy_observations": policy_observations,
+                 "vanilla_tis_function": corrections.vanilla_tis_function,
                  "get_log_probs_and_entropy": dense_probabilities,
                  "load_function": lambda name: corrections.icepop_function}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "native_policy", "exec"), namespace)

@@ -95,6 +95,7 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_inter
     low = torch.where(positive, mis_intervals[0], mis_intervals[2])
     high = torch.where(positive, mis_intervals[1], mis_intervals[3])
     expected_weight = (torch.where((ratio >= low) & (ratio <= high), ratio, 0.) if mode == "mis"
+                       else ratio.clamp(.5, 2) if mode == "policy_tis"
                        else ratio.clamp_max(2) if mode == "tis" else torch.ones_like(ratio))
     torch.testing.assert_close(weight, expected_weight, atol=1e-6, rtol=2e-5)
     tails = {"ratio_lt01": ratio < .1, "ratio_lt05": ratio < .5,
@@ -104,8 +105,8 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_inter
               "sfc/sampler_kl_raw_token_mean": float(data["sampler_kl"].double().mean()),
               "sfc/pg_token_mean": float(data["pg_loss"].double().mean()),
               "sfc/entropy_pooled_token_mean": float(data["entropy"].double().mean()),
-              "sfc/applied_floor_fraction": 0.0,
-              "sfc/applied_cap_fraction": float((ratio > 2).double().mean()) if mode == "tis" else 0.0,
+              "sfc/applied_floor_fraction": float((ratio < .5).double().mean()) if mode == "policy_tis" else 0.0,
+              "sfc/applied_cap_fraction": float((ratio > 2).double().mean()) if mode in ("tis", "policy_tis") else 0.0,
               "sfc/applied_weight_sum": float(weight.sum()), "sfc/applied_weight_square_sum": float(weight.square().sum()),
               "sfc/raw_weight_sum": float(ratio.sum()), "sfc/raw_weight_square_sum": float(ratio.square().sum()),
               "sfc/applied_ess": float(weight.sum().square()/weight.square().sum().clamp_min(1e-30)),
@@ -116,10 +117,11 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_inter
     output["sfc/applied_ess_fraction"] = output["sfc/applied_ess"]/n
     output["sfc/raw_ess_fraction"] = output["sfc/raw_ess"]/n
     output["sfc/importance_mode_mis"] = int(mode == "mis")
+    output["sfc/importance_mode_policy_tis"] = int(mode == "policy_tis")
     output["sfc/score_centering_enabled"] = int("correction" in data)
     output["sfc/sampler_kl_weighted_token_mean"] = beta*output["sfc/sampler_kl_raw_token_mean"]
     output["sfc/total_loss_token_mean"] = output["sfc/pg_token_mean"]+output["sfc/sampler_kl_weighted_token_mean"]
-    if mode == "mis" and "correction" not in data:
+    if mode in ("mis", "policy_tis") and "correction" not in data:
         # There is no candidate payload for an SFC-off MIS arm: do not present
         # an uncomputed head/tail KL estimator as a measured zero.
         output.pop("sfc/sampler_kl_raw_token_mean")
@@ -167,7 +169,23 @@ def _token_statistics(data, *, n, expected_samples, seals, mode, beta, mis_inter
         _mis_statistics(output, data, ratio, advantage, weight, signs, low=low, high=high)
         output.update({f"sfc/mis_{name}_bound": float(value) for name, value in zip(
             ("positive_low", "positive_high", "negative_low", "negative_high"), mis_intervals, strict=True)})
+    if mode == "policy_tis":
+        _tis_statistics(output, ratio, advantage, weight, signs)
     return output, tails
+
+
+def _tis_statistics(output, ratio, advantage, weight, signs):
+    lower, upper = ratio < .5, ratio > 2
+    clipped = lower | upper
+    mis = torch.where(~clipped, ratio, 0.)
+    delta = (mis-weight)*advantage
+    for label, selected in {"all": torch.ones_like(clipped), **signs}.items():
+        output[f"sfc/counterfactual_mis_minus_tis_adv_{label}_mean"] = float((delta*selected).mean())
+        output[f"sfc/counterfactual_mis_minus_tis_adv_{label}_abs_mean"] = float((delta*selected).abs().mean())
+        for name, tail in (("lower", lower), ("upper", upper), ("total", clipped)):
+            chosen = tail & selected
+            output[f"sfc/tis_{name}_clipped_adv_{label}_tokens"] = int(chosen.sum())
+            output[f"sfc/tis_{name}_clipped_adv_{label}_fraction"] = float(chosen.double().mean())
 
 
 def _mis_statistics(output, data, ratio, advantage, weight, signs, *, low=.5, high=2.):

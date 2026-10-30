@@ -16,8 +16,12 @@ def observation_updates(args, *, probe=False):
 
 
 def observation_importance_mode(args):
-    if args.loss_type == "score_centering":
+    if getattr(args, "loss_type", "policy_loss") == "score_centering":
         return args.score_centering_is
+    correction = getattr(args, "custom_tis_function_path",
+                         "miles.backends.training_utils.loss_hub.corrections.icepop_function")
+    if correction in (None, "miles.backends.training_utils.loss_hub.corrections.vanilla_tis_function"):
+        return "policy_tis"
     return "mis"
 
 
@@ -65,10 +69,11 @@ def validate_score_centering_args(args):
             raise ValueError("The GLM sampler-KL/candidate backport requires --loss-type score_centering")
         if diagnostics:
             if (args.loss_type != "policy_loss" or not getattr(args, "use_tis", False)
-                or getattr(args, "custom_tis_function_path", None)
-                != "miles.backends.training_utils.loss_hub.corrections.icepop_function"
+                or getattr(args, "custom_tis_function_path", None) not in (
+                    None, "miles.backends.training_utils.loss_hub.corrections.vanilla_tis_function",
+                    "miles.backends.training_utils.loss_hub.corrections.icepop_function")
                 or args.tis_clip_low != .5 or args.tis_clip != 2):
-                raise ValueError("Policy observations currently bind native MIS [0.5,2] only")
+                raise ValueError("Policy observations bind native TIS or MIS [0.5,2] only")
             unsupported = ("use_opsm", "use_rollout_logprobs", "skip_actor_forward_only", "true_on_policy_mode",
                            "custom_pg_loss_reducer_function_path", "partial_rollout", "fully_async")
             if any(getattr(args, key, False) for key in unsupported) or args.advantage_estimator != "grpo":

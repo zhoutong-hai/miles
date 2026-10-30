@@ -1,4 +1,4 @@
-"""Detached observations for the native policy-loss MIS screen."""
+"""Detached observations for native policy-loss TIS and MIS screens."""
 
 import torch
 import torch.distributed as dist
@@ -9,6 +9,7 @@ from miles.backends.training_utils.loss_hub.corrections import mis_weights
 from miles.backends.training_utils.loss_hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss_hub.math_utils import compute_policy_loss
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.score_centering import observation_importance_mode
 
 
 @torch.no_grad()
@@ -56,6 +57,11 @@ def component_gradients(logits, sampled_ids, logq, old_logp, advantages, *, args
     base = coefficient[:, None]*score/(args.rollout_temperature*denominator)
     components = {"counterfactual_tis_pg": tis[:, None]*base,
                   "mis_minus_tis": (mis-tis)[:, None]*base}
+    if observation_importance_mode(args) == "policy_tis":
+        components = {"actual_tis_pg": tis[:, None]*base,
+                      "unweighted_policy_pg": base,
+                      "tis_change_from_unweighted": (tis-1)[:, None]*base,
+                      "counterfactual_mis_minus_tis": (mis-tis)[:, None]*base}
     if getattr(args, "mis_positive_low", None) is not None:
         symmetric = torch.where((ratio >= .5) & (ratio <= 2.), ratio, 0.)
         components["asymmetric_minus_symmetric_mis"] = (mis-symmetric)[:, None]*base
@@ -70,7 +76,8 @@ def observe(args, batch, logits, *, logp, trainer_logp, rollout_logp, advantages
     old = torch.cat(trainer_logp).detach()
     q = torch.cat(rollout_logp).detach()
     ratio = (old-q).exp()
-    weights = mis_weights(args, ratio, advantages)
+    weights = (ratio.clamp(args.tis_clip_low, args.tis_clip)
+               if observation_importance_mode(args) == "policy_tis" else mis_weights(args, ratio, advantages))
     empty_ids = torch.empty((len(logp), 0), dtype=torch.long, device=logp.device)
     empty_head = logp.new_empty((len(logp), 0))
     sfc_observations.capture(args, batch, logp[:, None], q, advantages, active, empty_ids, empty_head,

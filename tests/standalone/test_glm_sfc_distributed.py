@@ -43,7 +43,8 @@ def _tp4(rank):
 def _cp4(rank, mode, coefficient):
     set_parallel_state(SimpleNamespace(cp=SimpleNamespace(size=4, rank=rank, group=dist.group.WORLD),
                                       tp=SimpleNamespace(size=1, group=None)))
-    args = Namespace(qkv_format="thd", allgather_cp=True, true_on_policy_mode=False, rollout_temperature=1.0,
+    args = Namespace(loss_type="score_centering", skip_actor_forward_only=True,
+                     qkv_format="thd", allgather_cp=True, true_on_policy_mode=False, rollout_temperature=1.0,
                      vocab_size=7, log_probs_chunk_size=2, entropy_coef=0.0, observe_training_entropy=True,
                      use_kl_loss=False, sampler_kl_coef=coefficient, score_centering_is=mode,
                      score_centering_tis_clip=2.0, score_centering_mis_low=0.5, score_centering_mis_high=5.0,
@@ -63,7 +64,6 @@ def _cp4(rank, mode, coefficient):
                  advantages=[slice_log_prob_with_cp(a, t, n) for a, t, n in zip(advantages, totals, responses)],
                  rollout_log_probs=[slice_log_prob_with_cp(q, t, n) for q, t, n in zip(sampled, totals, responses)],
                  rollout_topk_token_ids=[h.indices for h in heads], rollout_topk_log_probs=[h.values.log() for h in heads])
-    batch["log_probs"] = [slice_log_prob_with_cp(q, t, n) for q,t,n in zip(sampled,totals,responses)]
     reduce = get_sum_of_sample_mean(totals, responses, masks, calculate_per_token_loss=True)
     count = sum(m.sum() for m in masks)
     actual, log = score_centering_loss_function(args, batch, local, reduce)
@@ -91,7 +91,7 @@ def _cp4(rank, mode, coefficient):
     assert all(torch.isfinite(value) for value in log.values())
 
 
-def _mis_tp4(rank, *, policy_tis=False):
+def _mis_tp4(rank, *, policy_tis=False, reinforce=False):
     set_parallel_state(SimpleNamespace(tp=SimpleNamespace(size=4, rank=rank, group=dist.group.WORLD)))
     args = Namespace(vocab_size=13, rollout_temperature=1., eps_clip=.2, eps_clip_high=.28,
                      eps_clip_c=10., tis_clip_low=.5, tis_clip=2.)
@@ -100,9 +100,14 @@ def _mis_tp4(rank, *, policy_tis=False):
     logp = full[:, :13].log_softmax(-1)
     selected = logp.gather(-1, samples[:, None]).squeeze(-1)
     old = selected.detach()-torch.tensor([.1, .5, -.6, 3., .2])
+    if reinforce:
+        args.loss_type = "reinforce"
+        old = selected.detach()
     q = old-torch.tensor([-2., 0., 2., -.2, 0.])
     advantage = torch.tensor([1., -1., .5, -2., 0.])
     native, _ = compute_policy_loss(old-selected, advantage, .2, .28, 10.)
+    if reinforce:
+        native = -advantage*selected
     ratio = (old-q).exp()
     tis = ratio.clamp(.5, 2.)
     mis = torch.where((ratio >= .5) & (ratio <= 2), ratio, 0.)
@@ -123,7 +128,7 @@ def _mis_tp4(rank, *, policy_tis=False):
         torch.testing.assert_close(actual[name], gradient[:, rank*4:(rank+1)*4], atol=2e-7, rtol=2e-5)
 
 
-def _mis_cp4(rank, root, *, policy_tis=False):
+def _mis_cp4(rank, root, *, policy_tis=False, reinforce=False):
     import os
 
     os.environ["MILES_SOURCE_COMMIT"] = "cpu-gloo-source"
@@ -136,6 +141,9 @@ def _mis_cp4(rank, root, *, policy_tis=False):
     if policy_tis:
         args.custom_tis_function_path = None
         args.sfc_audit_sign_aware = True
+    if reinforce:
+        args.loss_type = "reinforce"
+        args.skip_actor_forward_only = True
     full = torch.randn(64, 8, generator=torch.Generator().manual_seed(37))
     totals, responses, samples = [24, 38, 2], [20, 30, 0], [10, 11, 12]
     tokens = [torch.arange(total) % 7 for total in totals]
@@ -147,9 +155,13 @@ def _mis_cp4(rank, root, *, policy_tis=False):
         logp = full[start+total-n-1:start+total-1, :7].log_softmax(-1)
         selected = logp.gather(-1, token[-n:, None] if n else token[:0, None]).squeeze(-1)
         anchor = selected-.1
+        if reinforce:
+            anchor = selected.detach()
         ratio = torch.tensor([.1, .75, 1., 3.]*(n//4+1))[:n]
         q = anchor-ratio.log()
         native, _ = compute_policy_loss(anchor-selected, torch.full((n,), advantage), .2, .28, 10.)
+        if reinforce:
+            native = -advantage*selected
         native_ratio = (anchor-q).exp()
         weight = torch.where((native_ratio >= .5) & (native_ratio <= 2), native_ratio, 0.)
         if policy_tis:
@@ -191,6 +203,8 @@ def _worker(rank, rendezvous, observation_root):
         _mis_cp4(rank, observation_root)
         _mis_tp4(rank, policy_tis=True)
         _mis_cp4(rank, observation_root+"-tis", policy_tis=True)
+        _mis_tp4(rank, policy_tis=True, reinforce=True)
+        _mis_cp4(rank, observation_root+"-reinforce", policy_tis=True, reinforce=True)
     finally:
         dist.destroy_process_group()
 

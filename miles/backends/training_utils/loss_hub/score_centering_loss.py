@@ -218,5 +218,5 @@ def score_centering_loss_function(
                              metrics, entropy, token_loss, sampler_kl_tokens,
                              applied_weight=metrics.importance_weight,
                              pre_update_logp=(torch.cat(batch["log_probs"]).detach()
-                                              if args.score_centering_is == "mis" else None))
+                                              if args.score_centering_is == "mis" and batch.get("log_probs") is not None else None))
     return loss, log

@@ -1401,10 +1401,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss", "score_centering"],
+                choices=["policy_loss", "reinforce", "sft_loss", "custom_loss", "score_centering"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
+                    "Choose PPO policy_loss, direct reinforce, score_centering or sft_loss; "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
             )
@@ -1553,8 +1553,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Skip the standalone Megatron actor forward-only pass. With --use-rollout-logprobs, "
                     "those log-probs remain the old-policy baseline; otherwise detached training log-probs "
-                    "are reused and the actor importance log-ratio is exactly 0. This requires a single "
-                    "optimizer step. The skipped pass's rollout/log_probs metric is not emitted."
+                    "are reused for policy_loss/reinforce importance correction; score_centering uses "
+                    "its training candidate scores. This requires a single optimizer step. "
+                    "The skipped pass's rollout/log_probs metric is not emitted."
                 ),
             )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
@@ -3566,7 +3567,9 @@ def miles_validate_args(args):
 def validate_skip_actor_forward_only(args) -> None:
     option = "--skip-actor-forward-only"
     assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
-    assert args.loss_type == "policy_loss", f"{option} only supports --loss-type policy_loss"
+    assert args.loss_type in ("policy_loss", "reinforce", "score_centering"), (
+        f"{option} requires policy_loss, reinforce or score_centering"
+    )
     assert args.compute_advantages_and_returns, f"{option} requires actor advantage computation"
 
     incompatible_options = [

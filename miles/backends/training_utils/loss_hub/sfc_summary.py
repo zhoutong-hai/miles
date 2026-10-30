@@ -58,6 +58,9 @@ def _load_update(directory, *, expected_tokens, expected_samples, cp_size):
         seals.append(seal)
     if not frames or len({(f["source"], f["trainer_version"], f["rollout"], f["run"]) for f in frames}) != 1:
         raise ValueError("Mixed or absent paired-score source/model/update identities")
+    for key in ("loss_type", "trainer_score_source", "standalone_actor_forward"):
+        if len({frame.get(key) for frame in frames}) != 1:
+            raise ValueError("Mixed paired-score objective or scoring source: " + key)
     sample_metadata = {}
     for frame in frames:
         for identity, metadata, versions in zip(frame["sample_indices"], frame["samples"], frame["sampler_versions"], strict=True):
@@ -295,6 +298,9 @@ def summarize_update(directory, *, expected_tokens, expected_samples, cp_size, m
         output.update({f"sfc/logit_audit/{name}/entropy_direction_sum": value
                        for name, value in audit["entropy_direction_sum"].items()})
     complete = {"schema_version": 1, "state": "COMPLETE_ORIGINAL_TOKEN_DIAGNOSTICS", "metrics": output,
+                "loss_type": frames[0].get("loss_type"),
+                "trainer_score_source": frames[0].get("trainer_score_source"),
+                "standalone_actor_forward": frames[0].get("standalone_actor_forward"),
                 "categories": categories, "source": frames[0]["source"], "trainer_version": frames[0]["trainer_version"],
                 "completed_update": frames[0]["completed_update"], "ranks": cp_size,
                 "valid_tokens": n, "responses": len(expected_samples),

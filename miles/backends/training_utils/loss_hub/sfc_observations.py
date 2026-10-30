@@ -22,7 +22,7 @@ _CONTEXT = None
 
 
 def enabled(args):
-    return getattr(args, "loss_type", None) in ("score_centering", "policy_loss") and bool(getattr(args, "sfc_diagnostics_dir", None))
+    return getattr(args, "loss_type", None) in ("score_centering", "policy_loss", "reinforce") and bool(getattr(args, "sfc_diagnostics_dir", None))
 
 
 def audit_due(args):
@@ -134,7 +134,10 @@ def capture(args, batch, selected, rollout, advantages, active, ids, head, metri
                                expected_advantage[records["mask"]], rtol=1e-5, atol=1e-6)
     candidate_hash = hashlib.sha256(ids.detach().cpu().contiguous().numpy().tobytes() + head.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
     packet = {"schema_version": 2, "run": context["run"], "source": context["source"],
-              "mis_intervals": list(mis_intervals(args)) if args.loss_type == "policy_loss" or args.score_centering_is == "mis" else None,
+              "loss_type": args.loss_type,
+              "trainer_score_source": "training_forward" if args.loss_type == "score_centering" or getattr(args, "skip_actor_forward_only", False) else "separate_actor_forward",
+              "standalone_actor_forward": not getattr(args, "skip_actor_forward_only", False),
+              "mis_intervals": list(mis_intervals(args)) if args.loss_type in ("policy_loss", "reinforce") or args.score_centering_is == "mis" else None,
               "audit_selector": context["audit_selector"],
               "sfc_enabled": args.loss_type == "score_centering", "importance_mode": observation_importance_mode(args),
               "audit_updates": list(observation_updates(args)),

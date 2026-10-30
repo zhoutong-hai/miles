@@ -44,7 +44,7 @@ def validate_score_centering_args(args):
             or not all(math.isfinite(value) for value in mis_bounds)
             or not (0 < mis_bounds[0] <= mis_bounds[1] and 0 < mis_bounds[2] <= mis_bounds[3])):
             raise ValueError("Specify four finite positive ordered MIS advantage bounds")
-        policy_mis = (getattr(args, "loss_type", None) == "policy_loss" and getattr(args, "use_tis", False)
+        policy_mis = (getattr(args, "loss_type", None) in ("policy_loss", "reinforce") and getattr(args, "use_tis", False)
                       and getattr(args, "custom_tis_function_path", None)
                       == "miles.backends.training_utils.loss_hub.corrections.icepop_function")
         sfc_mis = (getattr(args, "loss_type", None) == "score_centering"
@@ -55,6 +55,11 @@ def validate_score_centering_args(args):
     if not math.isfinite(coefficient) or coefficient < 0:
         raise ValueError("--sampler-kl-coef must be finite and non-negative")
     diagnostics = getattr(args, "sfc_diagnostics_dir", None)
+    if getattr(args, "loss_type", None) == "reinforce":
+        if (not getattr(args, "skip_actor_forward_only", False)
+            or getattr(args, "use_rollout_logprobs", False)
+            or args.advantage_estimator != "grpo" or getattr(args, "use_opsm", False)):
+            raise ValueError("Direct REINFORCE requires single-step training-score reuse and GRPO advantages")
     if diagnostics:
         observation_updates(args, probe=True)
         observation_updates(args)
@@ -68,16 +73,18 @@ def validate_score_centering_args(args):
         if coefficient or getattr(args, "rollout_top_logprobs_num", 0):
             raise ValueError("The GLM sampler-KL/candidate backport requires --loss-type score_centering")
         if diagnostics:
-            if (args.loss_type != "policy_loss" or not getattr(args, "use_tis", False)
+            if args.loss_type == "policy_loss" and getattr(args, "skip_actor_forward_only", False):
+                raise ValueError("Historical PPO observations retain their separate scoring path; select reinforce for reuse")
+            if (args.loss_type not in ("policy_loss", "reinforce") or not getattr(args, "use_tis", False)
                 or getattr(args, "custom_tis_function_path", None) not in (
                     None, "miles.backends.training_utils.loss_hub.corrections.vanilla_tis_function",
                     "miles.backends.training_utils.loss_hub.corrections.icepop_function")
                 or args.tis_clip_low != .5 or args.tis_clip != 2):
                 raise ValueError("Policy observations bind native TIS or MIS [0.5,2] only")
-            unsupported = ("use_opsm", "use_rollout_logprobs", "skip_actor_forward_only", "true_on_policy_mode",
+            unsupported = ("use_opsm", "use_rollout_logprobs", "true_on_policy_mode",
                            "custom_pg_loss_reducer_function_path", "partial_rollout", "fully_async")
             if any(getattr(args, key, False) for key in unsupported) or args.advantage_estimator != "grpo":
-                raise ValueError("MIS observations require ordinary precomputed trainer scores and native GRPO reduction")
+                raise ValueError("Policy observations require native GRPO reduction and aligned trainer scores")
             if args.entropy_coef != 0 or getattr(args, "qkv_format", "thd") != "thd":
                 raise ValueError("MIS observation binding requires entropy0 and THD")
             validate_candidate_sampling({"top_p": args.rollout_top_p, "top_k": args.rollout_top_k},

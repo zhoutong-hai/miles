@@ -46,11 +46,14 @@ def component_gradients(logits, sampled_ids, logq, old_logp, advantages, *, args
         dist.all_reduce(sampled_logp, group=group)
     score = -p.clone()
     score.scatter_add_(-1, local_ids.clamp(0, width-1)[:, None], owned.float()[:, None])
-    with torch.enable_grad():
-        leaf = sampled_logp.detach().requires_grad_()
-        loss, _ = compute_policy_loss(old_logp.detach()-leaf, advantages.detach(),
-                                      args.eps_clip, args.eps_clip_high, args.eps_clip_c)
-        coefficient, = torch.autograd.grad(loss.sum(), leaf)
+    if getattr(args, "loss_type", "policy_loss") == "reinforce":
+        coefficient = -advantages.detach()
+    else:
+        with torch.enable_grad():
+            leaf = sampled_logp.detach().requires_grad_()
+            loss, _ = compute_policy_loss(old_logp.detach()-leaf, advantages.detach(),
+                                          args.eps_clip, args.eps_clip_high, args.eps_clip_c)
+            coefficient, = torch.autograd.grad(loss.sum(), leaf)
     ratio = (old_logp.detach()-logq.detach()).exp()
     tis = ratio.clamp(args.tis_clip_low, args.tis_clip)
     mis = mis_weights(args, ratio, advantages)

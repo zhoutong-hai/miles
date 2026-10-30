@@ -12,6 +12,7 @@ import torch.distributed as dist
 from miles.backends.training_utils.cp_utils import get_sum_of_sample_mean, slice_log_prob_with_cp
 from miles.backends.training_utils.loss_hub import sfc_observations
 from miles.backends.training_utils.loss_hub.score_centering_loss import score_centering_loss_function
+from miles.backends.training_utils.loss_hub.score_centering.importance_sampling import importance_sampling
 from miles.backends.training_utils.parallel import set_parallel_state
 from tools.qualify_policy_cp_empty import groups
 
@@ -41,7 +42,9 @@ def make_case(device, total, response, dtype, advantage):
     p = logp.exp()
     sampled_ids = tokens[-response:]
     sampled_p = p.gather(-1, sampled_ids[:, None]).squeeze(-1)
-    ratios = torch.tensor([.125, .25, .5, 1., 2., 4., 8.], device=device).repeat((response+6)//7)[:response]
+    # Keep derivative references off discontinuities: TP and dense softmax
+    # rounding can legitimately change an exact-threshold token’s mask.
+    ratios = torch.tensor([.125, .3, .75, 1., 1.5, 3., 8.], device=device).repeat((response+6)//7)[:response]
     sampled_q = sampled_p/ratios
     q = p*((1-sampled_q)/(1-sampled_p))[:, None]
     q.scatter_(-1, sampled_ids[:, None], sampled_q[:, None])
@@ -100,10 +103,29 @@ def case(rank, tp_group, cp_group, device, total, response, dtype, advantage, or
             'follow_on_collectives':True,'K128_transport_observer':True,'audit32':response>=32}
 
 
+def boundary_checks(device):
+    """Check inclusivity against the actual device ratio, without softmax drift."""
+    advantages=torch.tensor([1.,1.,-1.,-1.,0.],device=device)
+    ratios=torch.tensor([.25,4.,.5,2.,1.],device=device)
+    sampling=importance_sampling('mis',tis_clip=2.,mis_low=.5,mis_high=2.,
+        mis_intervals=(.25,4.,.5,2.),advantages=advantages)
+    actual=ratios.log().exp()
+    low=torch.tensor([.25,.25,.5,.5,.5],device=device)
+    high=torch.tensor([4.,4.,2.,2.,2.],device=device)
+    expected=torch.where((actual>=low)&(actual<=high),actual,0.)
+    torch.testing.assert_close(sampling.sample_weight(ratios.log()),expected,atol=0,rtol=0)
+    head_p=torch.full((5,2),.1,device=device)
+    head_q=head_p/ratios[:,None]
+    torch.testing.assert_close(sampling.head_mass(head_p,head_q,ratios.log()[:,None].expand_as(head_p)),head_p)
+    torch.testing.assert_close(sampling.tail_scale(ratios.reciprocal(),torch.float32),torch.ones_like(ratios))
+    return True
+
+
 def main():
     rank=int(os.environ['RANK']);device=torch.device('cuda',int(os.environ['LOCAL_RANK']))
     torch.cuda.set_device(device);dist.init_process_group('nccl',timeout=timedelta(seconds=180))
     tp_group,cp_group=groups(rank)
+    inclusive_boundaries=boundary_checks(device)
     cases=[]
     for dtype in (torch.float32,torch.bfloat16):
         for total,response in ((16,3),(1024,155)):
@@ -112,7 +134,8 @@ def main():
     output=Path(os.environ['E010_MIS_QUALIFICATION_OUTPUT']);output.mkdir(parents=True,exist_ok=True)
     with (output/f'rank-{rank}.json').open('x') as stream:
         json.dump({'state':'CUDA_TP4_CP4_SFC_ASYMMETRIC_MIS_PASS_NOT_MODEL_ACCEPTANCE','rank':rank,
-            'source_commit':os.environ['MILES_SOURCE_COMMIT'],'model_work':False,'cases':cases},stream,allow_nan=False)
+            'source_commit':os.environ['MILES_SOURCE_COMMIT'],'model_work':False,
+            'inclusive_sample_head_tail_boundaries':inclusive_boundaries,'cases':cases},stream,allow_nan=False)
     dist.barrier();dist.destroy_process_group()
 
 

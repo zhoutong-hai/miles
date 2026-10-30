@@ -380,3 +380,16 @@ def test_selected_log_probs_gradcheck_and_empty_response() -> None:
     assert result.shape == (0, 3)
     result.sum().backward()
     torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("support", [False, True])
+def test_empty_scores_match_populated_dtype_and_retain_gradient(dtype, support):
+    logits = torch.randn(2, 4, dtype=dtype, requires_grad=True)
+    ids = torch.tensor([[0, 1], [2, 3]])
+    populated = selected_log_probs_and_entropy(logits, ids, sampling_support=support, with_entropy=True)
+    empty = selected_log_probs_and_entropy(logits[:0], ids[:0], sampling_support=support, with_entropy=True)
+    assert all(x.dtype == y.dtype for x, y in zip(empty, populated, strict=True))
+    assert all(x.requires_grad for x in empty)
+    sum(x.sum() for x in empty).backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))

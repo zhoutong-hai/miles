@@ -164,8 +164,12 @@ def selected_log_probs_and_entropy(
         raise ValueError("Expected logits [T, V/TP] and selected token IDs [T, K]")
     if ((token_ids < -1) | (token_ids >= vocab_size)).any():
         raise ValueError("Score-centering token ID is outside the model vocabulary")
+    dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     if logits.size(0) == 0:
-        return logits.sum(-1, keepdim=True).expand_as(token_ids), logits.sum(-1)
+        # Empty CP owners must communicate the same score dtype as populated
+        # owners, while retaining the zero gradient connection to their logits.
+        empty = logits.to(dtype).sum(-1)
+        return empty.unsqueeze(-1).expand_as(token_ids), empty
     chunk_size = chunk_size if chunk_size > 0 else logits.size(0)
     dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     chunks = []

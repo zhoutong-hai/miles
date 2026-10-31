@@ -164,4 +164,3 @@ def finish_receiver(updater, success, abort):
     dist.all_gather_object(reports, report, group=updater.tp_cpu_group)
     failures = [message for ok, message in reports if not ok]
     return (False, failures[0]) if failures else (True, "Success")
-

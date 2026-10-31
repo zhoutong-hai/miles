@@ -34,7 +34,7 @@ def validate_policy_diagnostics_args(args):
         raise ValueError("Policy diagnostics require the native original-token reducer")
     if not args.policy_diagnostics_dir:
         if getattr(args, "save_full_lora_state", False):
-            raise ValueError("Selected terminal full-state save requires paired diagnostic bindings")
+            raise ValueError("Selected full-state saving requires paired diagnostic bindings")
         return
     if not args.calculate_per_token_loss or args.qkv_format != "thd":
         raise ValueError("Selected K3 diagnostics require THD original-token reduction")
@@ -57,11 +57,11 @@ def validate_policy_diagnostics_args(args):
         raise ValueError("Policy diagnostics require a sealed fixed-prefix probe")
     if getattr(args, "save_full_lora_state", False):
         if (
-            args.num_rollout != 10
-            or args.save_interval != 10
+            args.num_rollout != 40
+            or args.save_interval != 20
             or not args.save
             or args.no_save_optim
             or args.no_save_rng
             or args.async_save
         ):
-            raise ValueError("Selected full-state run requires10 updates, terminal sync save, optimizer and RNG")
+            raise ValueError("Selected full-state run requires40 updates, sync saves every20, optimizer and RNG")

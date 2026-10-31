@@ -1460,10 +1460,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument("--policy-diagnostics-dir", type=str, default=None)
-            parser.add_argument("--policy-audit-updates", type=int, nargs="+", default=[1, 5, 10])
+            parser.add_argument("--policy-audit-updates", type=int, nargs="+", default=[1, 5, 10, 20, 30, 40])
             parser.add_argument("--policy-fixed-probe", type=str, default=None)
             parser.add_argument("--policy-fixed-probe-sha256", type=str, default=None)
-            parser.add_argument("--policy-probe-updates", type=int, nargs="+", default=[0, 1, 5, 10])
+            parser.add_argument("--policy-probe-updates", type=int, nargs="+", default=[0, 1, 5, 10, 20, 30, 40])
             parser.add_argument("--save-full-lora-state", action="store_true")
 
             parser.add_argument(

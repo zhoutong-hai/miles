@@ -1,4 +1,4 @@
-"""Selected local terminal full-state save; completion is written after cursor validation."""
+"""Selected periodic/terminal local full-state saves; seal after cursor validation."""
 
 import json
 import os
@@ -14,19 +14,31 @@ import torch.distributed as dist
 from miles.backends.training_utils.loss_hub.policy_metrics import sha256, write_json
 
 
-def admit_terminal_save(path, *, expected_payload_bytes=1_511_634_979_713, reserve_bytes=100_000_000_000):
-    """One total generation slot, including inflight. No deletion or R2 fallback."""
+def admit_terminal_save(
+    path, *, expected_payload_bytes=1_511_634_979_713, reserve_bytes=100_000_000_000, remaining_generations=2
+):
+    """Reserve remaining saves; retain both generations including inflight. No deletion."""
+    if remaining_generations not in (1, 2):
+        raise ValueError("Selected saving run has exactly two total generation slots")
     root = Path(path)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     free = shutil.disk_usage(root).free
-    if free < expected_payload_bytes + reserve_bytes:
-        raise ValueError("Insufficient current free space for selected terminal full state plus reserve")
+    if free < remaining_generations * expected_payload_bytes + reserve_bytes:
+        raise ValueError("Insufficient current free space for remaining full states plus reserve")
     return {
         "free_bytes": free,
         "expected_payload_bytes": expected_payload_bytes,
         "reserve_bytes": reserve_bytes,
-        "total_slots_including_inflight": 1,
+        "total_slots_including_inflight": 2,
+        "remaining_generations": remaining_generations,
     }
+
+
+def _selected_boundary(args, rollout_id):
+    completed = int(rollout_id) + 1
+    if args.num_rollout != 40 or args.save_interval != 20 or completed not in (20, 40):
+        raise ValueError("Selected E012 full-state saves are completed updates20 and40 within40 updates")
+    return completed
 
 
 def seal_file(path):
@@ -51,9 +63,22 @@ def save_full_state(args, path, *, iteration, model, optimizer, scheduler):
     from miles.backends.megatron_utils.lora.resumable_optimizer import save_resumable_optimizer_state
     from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 
-    if iteration != 9 or args.num_rollout != 10:
-        raise ValueError("Selected E012 full-state save is terminal update10 only")
-    admit_terminal_save(args.save)
+    completed = _selected_boundary(args, iteration)
+    expected_payload = 1_511_634_979_713
+    if completed == 40:
+        prior_path = Path(args.save) / "iter_0000019" / "adapter" / "FULL_STATE_COMPLETE.json"
+        prior = json.loads(prior_path.read_text())
+        provenance = prior["provenance"]
+        if (
+            provenance["completed_update"] != 20
+            or provenance["run_id"] != os.environ["MILES_EXPERIMENT_RUN_ID"]
+            or provenance["source"] != os.environ["MILES_SOURCE_COMMIT"]
+        ):
+            raise ValueError("Retained update20 full state must belong to this same run and source")
+        expected_payload = max(expected_payload, prior["payload_bytes"])
+    admit_terminal_save(
+        args.save, expected_payload_bytes=expected_payload, remaining_generations=2 if completed == 20 else 1
+    )
     source = os.environ["MILES_SOURCE_COMMIT"]
     run_id = os.environ["MILES_EXPERIMENT_RUN_ID"]
     return {
@@ -71,8 +96,8 @@ def save_full_state(args, path, *, iteration, model, optimizer, scheduler):
         "provenance": {
             "run_id": run_id,
             "source": source,
-            "completed_update": 10,
-            "next_rollout_id": 10,
+            "completed_update": completed,
+            "next_rollout_id": completed,
             "topology": {
                 k: getattr(args, k, None)
                 for k in (
@@ -90,8 +115,13 @@ def save_full_state(args, path, *, iteration, model, optimizer, scheduler):
 
 
 def prepare_rank_receipt(path, *, rank, state):
-    if state.get("iteration") != 9 or not state.get("opt_param_scheduler") or not state.get("rng_state"):
-        raise ValueError("Terminal training state is incomplete")
+    if (
+        state.get("iteration") not in (19, 39)
+        or not state.get("opt_param_scheduler")
+        or not state.get("rng_state")
+        or state["provenance"]["completed_update"] != state["iteration"] + 1
+    ):
+        raise ValueError("Selected full training state is incomplete or has the wrong update")
     files = [
         seal_file(Path(path) / name)
         for name in (
@@ -106,13 +136,14 @@ def prepare_rank_receipt(path, *, rank, state):
 
 
 def seal_terminal_checkpoint(args, rollout_id):
-    if rollout_id != 9 or args.num_rollout != 10 or args.save_interval != 10:
-        raise ValueError("Unexpected full-state checkpoint boundary")
+    completed = _selected_boundary(args, rollout_id)
     root = Path(args.save)
     path = root / f"iter_{rollout_id:07d}" / "adapter"
     count = args.actor_num_nodes * args.actor_num_gpus_per_node
     receipts = [json.loads((path / f"full-state-rank-{rank}.json").read_text()) for rank in range(count)]
     reference = receipts[0]["provenance"]
+    if reference["completed_update"] != completed or reference["next_rollout_id"] != completed:
+        raise ValueError("Checkpoint state/provenance does not match the actual optimizer boundary")
     if any(receipt["rank"] != rank or receipt["provenance"] != reference for rank, receipt in enumerate(receipts)):
         raise ValueError("Full-state rank/provenance coverage differs")
     for receipt in receipts:
@@ -125,19 +156,21 @@ def seal_terminal_checkpoint(args, rollout_id):
     state = torch.load(cursor, map_location="cpu", weights_only=False)
     if not {"sample_offset", "epoch_id", "sample_group_index", "sample_index", "metadata"} <= state.keys():
         raise ValueError("Native dataset cursor is incomplete")
-    diagnostics = Path(args.policy_diagnostics_dir) / "paired_scores" / "update-000010" / "complete.json"
-    if json.loads(diagnostics.read_text())["binding"]["completed_update"] != 10:
-        raise ValueError("Terminal ordinary update diagnostics are incomplete")
+    diagnostics = Path(args.policy_diagnostics_dir) / "paired_scores" / f"update-{completed:06d}" / "complete.json"
+    if json.loads(diagnostics.read_text())["binding"]["completed_update"] != completed:
+        raise ValueError("Save-boundary ordinary update diagnostics are incomplete")
     marker = {
         "format": "e012-lora-full-v1",
         "state": "VALIDATED_LOCAL_SAVE_RESTORE_NOT_YET_PROVEN",
         "provenance": reference,
         "rank_count": count,
         "rank_receipts": receipts,
+        "checkpoint_role": "PERIODIC" if completed == 20 else "TERMINAL",
+        "payload_bytes": sum(saved["bytes"] for receipt in receipts for saved in receipt["files"]),
         "cursor": seal_file(cursor),
         "adapter_config": seal_file(path / "adapter_config.json"),
         "diagnostics": seal_file(diagnostics),
-        "restore_and_advance": "PENDING_SEPARATE_AUTHORITY",
+        "restore_and_advance": "UNPROVEN_NO_EXTENSION_BEYOND40",
     }
     write_json(path / "FULL_STATE_COMPLETE.json", marker)
 
@@ -160,7 +193,7 @@ def restore_full_state(path, state, *, model, optimizer, scheduler):
     rank = dist.get_rank() if dist.is_initialized() else 0
     for saved in marker["rank_receipts"][rank]["files"]:
         if sha256(Path(path) / saved["filename"]) != saved["sha256"]:
-            raise ValueError("Restore payload differs from sealed terminal generation")
+            raise ValueError("Restore payload differs from sealed full-state generation")
     restore_resumable_optimizer_state(path, state, model=model, optimizer=optimizer, scheduler=scheduler)
     rng = state["rng_state"]
     random.setstate(rng["python"])

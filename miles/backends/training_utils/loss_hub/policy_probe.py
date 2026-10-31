@@ -136,6 +136,8 @@ def run_fixed_probe(args, model, completed):
         "response_lengths": [1] * len(selected),
         "loss_masks": [torch.ones(1, dtype=torch.int, device=torch.cuda.current_device()) for _ in selected],
     }
+    if configuration.use_dynamic_global_batch_size:
+        data["dynamic_global_batch_size"] = 64
     rng_python, rng_numpy = random.getstate(), np.random.get_state()
     tracker = get_cuda_rng_tracker()
     rng_megatron = {k: v.clone() for k, v in tracker.get_states().items()}

@@ -253,6 +253,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self._init_training_state()
 
+        if os.environ.get("MILES_K3_LONGEST_PROBE"):
+            from miles.backends.training_utils.loss_hub.k3_startup import run_startup
+
+            run_startup(self.args, self.model, self.optimizer)
+
         # empty cache after initialization
         clear_memory()
 
@@ -655,6 +660,9 @@ class MegatronTrainRayActor(TrainRayActor):
             if getattr(self.args, "policy_diagnostics_dir", None):
                 policy_diagnostics.finish(self.args, train_step_outcome)
                 if train_step_outcome == TrainStepOutcome.NORMAL:
+                    from miles.backends.training_utils.loss_hub.k3_startup import verify_first_update
+
+                    verify_first_update(self.args, self.model, completed=rollout_id + 1)
                     run_fixed_probe(self.args, self.model, completed=rollout_id + 1)
 
             self.prof.step(rollout_id=rollout_id)

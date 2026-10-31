@@ -987,6 +987,11 @@ def calculate_log_probs_and_entropy(
     entropy = None
 
     def compute_entropy(logits_chunk: torch.Tensor) -> torch.Tensor:
+        if not entropy_requires_grad and vocab_size is not None:
+            from miles.backends.training_utils.loss_hub.policy_audit import distribution_statistics
+
+            return distribution_statistics(logits_chunk, vocab_size=vocab_size, group=tp_group,
+                temperature=temperature, with_top_mass=False)[0]
         if entropy_requires_grad:
             return compute_entropy_from_logits(_upcast_chunk_to_fp32(logits_chunk, temperature), tp_group)
         with torch.no_grad():

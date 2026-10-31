@@ -530,6 +530,10 @@ class MegatronTrainRayActor(TrainRayActor):
         attempt: int,
     ) -> TrainStepOutput:
         # Create data iterator for log_probs and train.
+        if getattr(self.args, "save_full_lora_state", False) and rollout_id == 0:
+            from miles.backends.megatron_utils.lora.terminal_checkpoint import admit_terminal_save
+
+            admit_terminal_save(self.args.save)
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         num_optimizer_steps = len(num_microbatches)
         skip_actor_forward_only = self.args.skip_actor_forward_only
@@ -622,6 +626,13 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
+            if getattr(self.args, "policy_diagnostics_dir", None):
+                from miles.backends.training_utils.loss_hub import policy_diagnostics
+                from miles.backends.training_utils.loss_hub.policy_probe import run_fixed_probe
+
+                run_fixed_probe(self.args, self.model, completed=rollout_id)
+                policy_diagnostics.configure(self.args, rollout_id, self.weight_updater.weight_version, rollout_data)
+
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
@@ -640,6 +651,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     attempt=attempt,
                     ft_test_action_executor=self._ft_test_action_executor,
                 )
+
+            if getattr(self.args, "policy_diagnostics_dir", None):
+                policy_diagnostics.finish(self.args, train_step_outcome)
+                if train_step_outcome == TrainStepOutcome.NORMAL:
+                    run_fixed_probe(self.args, self.model, completed=rollout_id + 1)
 
             self.prof.step(rollout_id=rollout_id)
 

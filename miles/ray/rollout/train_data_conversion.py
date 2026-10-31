@@ -18,6 +18,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "target_tokens": "int32",
     "loss_masks": "int32",
     "rollout_log_probs": "float32",
+    "policy_generation_log_probs": "float32",
     "rollout_sampling_mask_ids": "int32",
     "rollout_sampling_mask_offsets": "int64",
     "teacher_log_probs": "float32",
@@ -40,6 +41,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
+    "policy_sample_metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
@@ -102,6 +104,14 @@ def convert_samples_to_train_data(
     train_data["loss_masks"] = loss_masks
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+
+    if getattr(args, "policy_diagnostics_dir", None):
+        from miles.backends.training_utils.loss_hub.policy_diagnostics import sample_metadata
+
+        if any(sample.rollout_log_probs is None or not sample.weight_versions for sample in samples):
+            raise ValueError("Policy diagnostics require original generation q and sampler versions")
+        train_data["policy_sample_metadata"] = [sample_metadata(sample) for sample in samples]
+        train_data["policy_generation_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
     # overwriting the raw reward
     if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -382,6 +392,8 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "policy_sample_metadata",
+            "policy_generation_log_probs",
             "adapter_slots",
             "loss_weights",
             "advantages",

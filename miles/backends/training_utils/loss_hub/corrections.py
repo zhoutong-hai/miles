@@ -25,6 +25,9 @@ def vanilla_tis_function(
     tis_clipfrac = (tis_weights != tis).float()
     metrics = {
         "tis": tis.clone().detach(),
+        "tis_applied_weight": tis_weights.clone().detach(),
+        "tis_floorfrac": (tis < args.tis_clip_low).float().detach(),
+        "tis_capfrac": (tis > args.tis_clip).float().detach(),
         "tis_clipfrac": tis_clipfrac.clone().detach(),
         "tis_abs": tis_abs.clone().detach(),
     }

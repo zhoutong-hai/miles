@@ -91,6 +91,7 @@ def policy_loss_function(
         are enabled.
     """
     parallel_state = get_parallel_state()
+    reinforce = getattr(args, "loss_type", "policy_loss") == "reinforce"
     advantages_list = [advantage.detach() for advantage in batch["advantages"]]
     advantages = torch.cat(advantages_list, dim=0)
     rollout_old_log_probs = (
@@ -111,7 +112,7 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
-    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy or bool(getattr(args, "policy_diagnostics_dir", None))
     rollout_sampling_mask = get_rollout_sampling_masks(batch) if args.use_sampling_support_replay else None
 
     log_probs_and_entropy = get_log_probs_and_entropy(
@@ -207,9 +208,13 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
-    pg_loss, pg_clipfrac = compute_policy_loss(
-        ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
-    )
+    if reinforce:
+        pg_loss = -advantages * torch.where(active_tokens, log_probs, 0.)
+        pg_clipfrac = torch.zeros_like(pg_loss)
+    else:
+        pg_loss, pg_clipfrac = compute_policy_loss(
+            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
+        )
 
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
@@ -274,6 +279,14 @@ def policy_loss_function(
             max_seq_lens,
             denominators=batch.get("rollout_mask_sums", None),
         )
+
+    if getattr(args, "policy_diagnostics_dir", None):
+        from miles.backends.training_utils.loss_hub import policy_diagnostics
+
+        policy_diagnostics.observe(args, batch, logits, logp=torch.cat(trainer_scored_log_probs),
+            logq=torch.cat(rollout_old_log_probs), ratio=tis_metrics["tis"],
+            weight=tis_metrics["tis_applied_weight"], advantage=advantages, active=active_tokens,
+            entropy=torch.cat(log_probs_and_entropy["entropy"]))
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if args.custom_pg_loss_reducer_function_path is not None:
@@ -366,10 +379,11 @@ def policy_loss_function(
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
         "entropy_loss": entropy_loss.clone().detach(),
-        "pg_clipfrac": pg_clipfrac.clone().detach(),
-        "ppo_kl": ppo_kl.clone().detach(),
-        "ess_ratio": ess_ratio_sum.squeeze(),
     }
+
+    if not reinforce:
+        reported_loss.update(pg_clipfrac=pg_clipfrac.clone().detach(),
+                             ppo_kl=ppo_kl.clone().detach(), ess_ratio=ess_ratio_sum.squeeze())
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -382,7 +396,8 @@ def policy_loss_function(
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
-        reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
+        if not reinforce:
+            reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
         # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
@@ -514,7 +529,7 @@ def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFuncti
 
         return TINKER_LOSS_FUNCTIONS[loss_fn]
     match args.loss_type:
-        case "policy_loss":
+        case "policy_loss" | "reinforce":
             return policy_loss_function
         case "value_loss":
             return value_loss_function

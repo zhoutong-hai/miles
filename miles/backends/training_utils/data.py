@@ -205,6 +205,9 @@ def get_batch(
     # fetch it here so callers don't have to know. None for non-multi-LoRA runs.
     if "adapter_slots" not in keys:
         keys = [*keys, "adapter_slots"]
+    for diagnostic_key in ("policy_sample_metadata", "policy_generation_log_probs", "weight_versions"):
+        if diagnostic_key not in keys:
+            keys = [*keys, diagnostic_key]
     batch = data_iterator.get_next(keys)
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:

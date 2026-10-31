@@ -1459,6 +1459,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
+            parser.add_argument("--policy-diagnostics-dir", type=str, default=None)
+            parser.add_argument("--policy-audit-updates", type=int, nargs="+", default=[1, 5, 10])
+            parser.add_argument("--policy-fixed-probe", type=str, default=None)
+            parser.add_argument("--policy-fixed-probe-sha256", type=str, default=None)
+            parser.add_argument("--policy-probe-updates", type=int, nargs="+", default=[0, 1, 5, 10])
+            parser.add_argument("--save-full-lora-state", action="store_true")
+
             parser.add_argument(
                 "--kl-coef",
                 type=float,
@@ -1468,7 +1475,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "reinforce", "sft_loss", "custom_loss"],
                 default="policy_loss",
                 help=(
                     "Choose loss type, currently support ppo policy_loss or sft_loss, "
@@ -3618,6 +3625,11 @@ def miles_validate_args(args):
 
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)
+    if args.loss_type == "reinforce" or args.policy_diagnostics_dir:
+        from miles.utils.policy_diagnostics import validate_policy_diagnostics_args
+
+        validate_policy_diagnostics_args(args)
+
 
     _maybe_apply_dumper_overrides(args)
 
@@ -3631,7 +3643,7 @@ def miles_validate_args(args):
 def validate_skip_actor_forward_only(args) -> None:
     option = "--skip-actor-forward-only"
     assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
-    assert args.loss_type == "policy_loss", f"{option} only supports --loss-type policy_loss"
+    assert args.loss_type in ("policy_loss", "reinforce"), f"{option} requires a native policy objective"
     assert args.compute_advantages_and_returns, f"{option} requires actor advantage computation"
 
     incompatible_options = [

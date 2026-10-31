@@ -144,6 +144,11 @@ async def train(args):
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
             await save(rollout_id, force_sync=external_save)
+            if getattr(args, "save_full_lora_state", False):
+                from miles.backends.megatron_utils.lora.terminal_checkpoint import seal_terminal_checkpoint
+
+                seal_terminal_checkpoint(args, rollout_id)
+
             if os.environ.get("E007_ATTEMPT_PLAN"):
                 from e007.hooks import commit_checkpoint
                 commit_checkpoint(args, rollout_id)

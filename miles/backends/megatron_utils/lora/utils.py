@@ -456,6 +456,11 @@ def save_lora_checkpoint(
                 adapter_state[name] = param.data.cpu()
 
     native_path = save_path / f"adapter_megatron_rank{global_rank}.pt"
+    if getattr(args, "save_full_lora_state", False):
+        if any((save_path / name).exists() for name in (
+                f"adapter_megatron_rank{global_rank}.pt", f"training_state_rank{global_rank}.pt",
+                f"optimizer_full_state_rank{global_rank}.pt", "FULL_STATE_COMPLETE.json")):
+            raise FileExistsError("Full-state generation is immutable; reconcile inflight state before retry")
     torch.save(adapter_state, native_path)
     logger.info(f"Saved {len(adapter_state)} adapter tensors (native) to {native_path}")
 
@@ -533,6 +538,13 @@ def save_lora_checkpoint(
             "optimizer": optimizer.state_dict() if save_optimizer else None,
             "opt_param_scheduler": opt_param_scheduler.state_dict() if opt_param_scheduler else None,
         }
+        if getattr(args, "save_full_lora_state", False):
+            if not save_optimizer or opt_param_scheduler is None or not native:
+                raise RuntimeError("Full LoRA state requires native adapters, optimizer and scheduler")
+            from miles.backends.megatron_utils.lora.terminal_checkpoint import save_full_state
+
+            training_state.update(save_full_state(args, save_path, iteration=iteration,
+                model=model, optimizer=optimizer, scheduler=opt_param_scheduler))
         if os.environ.get("E007_ATTEMPT_PLAN"):
             if not save_optimizer or opt_param_scheduler is None:
                 raise RuntimeError("e007 requires optimizer and scheduler state")
@@ -547,6 +559,11 @@ def save_lora_checkpoint(
                 "torch_cpu": torch.get_rng_state(), "torch_cuda_all": torch.cuda.get_rng_state_all(),
             }
         torch.save(training_state, save_path / f"training_state_rank{rank}.pt")
+        if getattr(args, "save_full_lora_state", False):
+            from miles.backends.megatron_utils.lora.terminal_checkpoint import prepare_rank_receipt
+
+            prepare_rank_receipt(save_path, rank=rank, state=training_state)
+
         if os.environ.get("E007_ATTEMPT_PLAN"):
             if not native:
                 raise RuntimeError("e007 v62 requires native rank-sharded saves")
@@ -677,7 +694,15 @@ def _load_training_state(
     # param group metadata), so full unpickling is required here.
     training_state = torch.load(state_path, map_location="cpu", weights_only=False)
 
-    if os.environ.get("E007_ATTEMPT_PLAN"):
+    if training_state.get("full_state_format") == "e012-lora-full-v1":
+        if not load_optimizer or opt_param_scheduler is None:
+            raise RuntimeError("Full-state LoRA restore requires optimizer and scheduler")
+        from miles.backends.megatron_utils.lora.terminal_checkpoint import restore_full_state
+
+        restore_full_state(adapter_dir, training_state, model=model, optimizer=optimizer, scheduler=opt_param_scheduler)
+        from megatron.training.global_vars import get_args
+        get_args()._e007_scheduler_restored_from_adapter = True
+    elif os.environ.get("E007_ATTEMPT_PLAN"):
         if not load_optimizer or opt_param_scheduler is None:
             raise RuntimeError("e007 resume requires full optimizer and scheduler restore")
         from i004_resumable_optimizer import restore_resumable_optimizer_state

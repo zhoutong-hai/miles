@@ -518,7 +518,7 @@ def run_forward_backward_pass(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
-            output_tensor = model(**forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss"))
+            output_tensor = model(**forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "reinforce", "sft_loss"))
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
             m.stage = old_stage

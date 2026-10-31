@@ -193,3 +193,6 @@ _examples_synced/
 .DS_Store
 
 .humanize/
+
+# Local diagnostic dependencies and generated private probe artifacts
+.local/

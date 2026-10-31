@@ -156,6 +156,14 @@ both are decided on `put()`. Staleness depends on how long the group then sits i
 buffer, so it is decided on `get()`. Once the trainer has a full batch it sorts the
 groups by index and applies `--rollout-sample-filter-path` to the assembled batch.
 
+If a sample cancels itself (for example, a sandbox client raises `CancelledError`),
+its group is marked aborted after the sibling samples settle. The default buffer
+discards the entire group from training, counts it in
+`rollout/fully_async/aborted_groups_filtered`, and applies
+`--async-unused-samples-handler` to the original prompts. Other groups keep running.
+Cancelling the producer itself still propagates, and unexpected non-cancellation
+exceptions still fail the worker rather than being silently discarded.
+
 The buffer decouples the two loops. As long as it holds finished groups, the trainer
 never waits for generation. If it sits empty, rollout is still the bottleneck and async
 cannot hide it.
@@ -292,21 +300,41 @@ it lets the trainer export further ahead at the cost of one more snapshot on dis
 
 ### Async rollout metrics
 
-The buffer reports these metrics to wandb and the dashboard on every training step,
-alongside the standard rollout metrics:
+The buffer reports these metrics to wandb on every training step, alongside the
+standard rollout metrics:
 
 ```text
 rollout/fully_async/queue_size
 rollout/fully_async/aborted_groups_filtered
 rollout/fully_async/stale_groups_filtered
 rollout/fully_async/avg_staleness, rollout/fully_async/max_staleness
+rollout/fully_async/avg_post_generation_staleness, rollout/fully_async/max_post_generation_staleness
+rollout/fully_async/avg_generation_version_span, rollout/fully_async/max_generation_version_span
+rollout/fully_async/token_weighted_staleness
+rollout/fully_async/weight_version_sample_coverage
 rollout/fully_async/buffer_avg_staleness, rollout/fully_async/buffer_max_staleness
 rollout/dynamic_filter/drop_<reason>
 ```
 
-The `avg_staleness` and `max_staleness` pair covers the groups training actually
-consumed, while the `buffer_` pair covers the groups still sitting in the buffer when
-the step drained it.
+Staleness is measured in published rollout weight versions: with
+`--update-weights-interval 1`, one version normally corresponds to one optimizer step;
+otherwise it does not. The metrics separate three parts of policy provenance:
+
+- `avg_staleness` and `max_staleness` are the gap from the current version to the
+  oldest version in each selected group. `stale_groups_filtered` counts groups that
+  exceeded `--max-weight-staleness`; rejected groups do not enter these averages.
+- `post_generation_staleness` is the gap from the current version to the newest version
+  in each selected group. `generation_version_span` is the newest minus oldest version
+  within the group. Together they distinguish aging after generation from updates that
+  landed while a trajectory was being generated.
+- `token_weighted_staleness` averages `current_version - span.version`, weighting each
+  numeric version span by its number of generated tokens. It therefore describes the
+  typical version gap of stamped generation tokens rather than the oldest token only.
+
+`weight_version_sample_coverage` is the fraction of selected samples with at least one
+numeric version span. Missing provenance is excluded from lag averages, not treated as
+zero. The `buffer_` pair covers groups still sitting in the buffer when the step drained
+it.
 
 A `queue_size` pinned at zero means rollout is the bottleneck, so scale rollout capacity
 or lower per-sample generation cost. A `queue_size` pinned at capacity means training is
@@ -326,9 +354,8 @@ Every skipped point is logged at the step it would have landed on, with the reas
 | `eval/skipped_busy` | At `--eval-max-in-flight` under `--eval-overflow-policy skip` |
 | `eval/skipped_export_failed` | The snapshot export raised |
 | `eval/skipped_ckpt_missing` | No `.complete` marker in the snapshot directory |
-| `eval/skipped_unhealthy` | The fleet or its router was unreachable |
-| `eval/skipped_pin_violation` | The engines did not all report the expected weight version |
 | `eval/skipped_crashed` | Anything else the eval raised |
+| `eval/skipped_<reason>` | A `CheckpointEvalFn` raised `EvalSkip(reason)` |
 
 For a point that did run, `eval/{dataset}/weight_version/mean == eval/step` and
 `eval/{dataset}/weight_version/mixed_version_ratio == 0` together confirm it measured
@@ -339,10 +366,7 @@ last-broadcast version, which equals the actor's current weights when
 
 ### Performance metrics
 
-For performance work, the [Miles dashboard](/user-guide/dashboard) is the recommended
-view: its [Compute Utilization view](/user-guide/dashboard#compute-utilization) draws
-the rollout and training phases against per-engine SGLang state on one time axis. The
-metrics below are a basic reference for where to start:
+For performance work, use the metrics below as a basic reference:
 
 1. **Engine concurrency.** Watch `sglang_num_running_reqs` across engines. If some
    engines sit far below the others, or concurrency collapses without a weight update to
@@ -351,9 +375,8 @@ metrics below are a basic reference for where to start:
    `prefix_cache_hit_rate` in the rollout metrics. A coding-agent workload should stay
    above 90%, since every turn re-prefills its session prefix. If it is low, suspect the
    KV cache memory (`--sglang-mem-fraction-static`) and the router configuration.
-3. **Where the time goes.** Compare rollout time, train time, and the staleness metrics,
-   and check the timeline for bubbles where rollout and training do not overlap. If
-   rollout is slower, consider more GPUs for rollout, a higher
+3. **Where the time goes.** Compare rollout time, train time, and the staleness metrics.
+   If rollout is slower, consider more GPUs for rollout, a higher
    `--async-max-concurrent-samples`, and throughput-oriented SGLang settings. If
    training is slower, consider more GPUs for training, a lower concurrency, and
    latency-oriented SGLang settings.

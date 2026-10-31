@@ -26,11 +26,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     megatron_model_type: str = "deepseek-v32"
     from_bf16_ckpt: bool = False
     use_single_node: bool = False
-    num_gpus_per_node: int = 8
+    num_gpus_per_node: int | None = None
     actor_num_nodes: int | None = None
     actor_num_gpus_per_node: int | None = 8
     rollout_num_gpus: int | None = None
-    hardware: Literal["B200", "B300", "GB200", "GB300", "H100", "H200"] = "B200"
+    hardware: Literal["auto", "B200", "B300", "GB200", "GB300", "H100", "H200"] = "auto"
     enable_eval: bool = False
     extra_args: str = ""
     data_dir: str = "/root/datasets"
@@ -47,6 +47,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     tis_use_rs: bool = True
 
     def __post_init__(self):
+        self.hardware = U.resolve_hardware(self)
+        self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.use_single_node:
             self.actor_num_nodes = 1
             self.actor_num_gpus_per_node = 4
@@ -323,8 +325,8 @@ def _execute_train(args: ScriptArgs, before_ray_job_submit=None):
             sglang_args = (
                 "--sglang-mem-fraction-static 0.8 "
                 "--sglang-attention-backend nsa "
-                "--sglang-nsa-decode-backend flashmla_sparse "
-                "--sglang-nsa-prefill-backend flashmla_sparse "
+                "--sglang-dsa-decode-backend flashmla_sparse "
+                "--sglang-dsa-prefill-backend flashmla_sparse "
                 "--sglang-kv-cache-dtype bf16 "
                 # NSA KV cache requires page_size=64 on CUDA.
                 "--sglang-page-size 64 "
@@ -346,7 +348,7 @@ def _execute_train(args: ScriptArgs, before_ray_job_submit=None):
                     "--sglang-enable-dp-lm-head "
                     # f"--sglang-max-running-requests {sglang_world_size * sglang_decode_max_bs // sglang_attn_tp_size} "
                     # f"--sglang-chunked-prefill-size {sglang_world_size * sglang_decode_max_bs} "
-                    f"--sglang-cuda-graph-max-bs {sglang_decode_max_bs} "
+                    f"--sglang-cuda-graph-max-bs-decode {sglang_decode_max_bs} "
                     # "--sglang-moe-dense-tp-size 1 "
                 )
 
@@ -399,7 +401,7 @@ matchers:
                     "--sglang-enable-dp-lm-head "
                     # f"--sglang-max-running-requests {sglang_world_size * sglang_decode_max_bs // sglang_attn_tp_size} "
                     # f"--sglang-chunked-prefill-size {sglang_world_size * sglang_decode_max_bs} "
-                    f"--sglang-cuda-graph-max-bs {sglang_decode_max_bs} "
+                    f"--sglang-cuda-graph-max-bs-decode {sglang_decode_max_bs} "
                     # "--sglang-moe-dense-tp-size 1 "
                 )
         case _:

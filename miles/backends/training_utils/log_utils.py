@@ -97,16 +97,19 @@ def gather_log_data(
     parallel_state = get_parallel_state()
 
     pg = parallel_state.effective_dp_cp
-    log_structured(logger.info, op="cross_cell", phase="start", kind="log_gather", rank=pg.rank)
+    log_structured(logger.info, tag="ft", op="cross_cell", phase="start", kind="log_gather", rank=pg.rank)
     try:
         gathered_log_dict = MultiPGUtil.gather_object(
             obj=log_dict,
             groups_inner_to_outer=pg.gloo_groups_inner_to_outer,
         )
-        log_structured(logger.info, op="cross_cell", phase="end", kind="log_gather", rank=pg.rank, success=True)
+        log_structured(
+            logger.info, tag="ft", op="cross_cell", phase="end", kind="log_gather", rank=pg.rank, success=True
+        )
     except RuntimeError:
         log_structured(
             logger.warning,
+            tag="ft",
             op="cross_cell",
             phase="end",
             kind="log_gather",
@@ -192,11 +195,11 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "loss_masks",
                 "sample_indices",
                 "rollout_ids",
-                "sfc_sample_metadata",
-                "sfc_generation_log_probs",
                 "rollout_mask_sums",
                 "rollout_routed_experts",
                 "rollout_indexer_topk",
+                "rollout_sampling_mask_ids",
+                "rollout_sampling_mask_offsets",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "witness_ids",
@@ -207,9 +210,6 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "num_rollouts",
                 "n_adapters",
                 "adapter_slots",
-                "step_slots",
-                "step_adapter_names",
-                "step_adapter_batch_sizes",
                 "prompt_group_sizes",
             ]:
                 continue
@@ -485,11 +485,6 @@ def aggregate_train_losses(
     else:
         num_samples_or_tokens = values[0]
         cp_factor = parallel_state.cp.size
-
-    if num_samples_or_tokens == 0:
-        if any(value != 0 for value in values[1:]):
-            raise ValueError("Zero valid-token count with nonzero masked loss metrics")
-        return dict.fromkeys(keys, 0.0)
 
     for key, value in zip(keys, values[1:], strict=False):
         loss_reduced[key] = value * cp_factor / num_samples_or_tokens

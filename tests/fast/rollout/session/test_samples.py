@@ -14,7 +14,7 @@ import pytest
 from miles.rollout.generate_utils.sample_utils import merge_samples
 from miles.rollout.session.samples.merge import compute_samples_from_openai_records, merge_samples_with_addition_r3
 from miles.rollout.session.types import SessionRecord
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -40,6 +40,9 @@ def _make_record(
     weight_version: str | None = None,
     routed_experts: str | None = None,
     routed_experts_start_len: int | None = None,
+    weight_versions: list[dict[str, str | int]] | None = None,
+    sampling_masks: list[list[int]] | None = None,
+    sampling_log_probs: list[float] | None = None,
 ) -> SessionRecord:
     """Build a minimal session record mimicking SGLang's response format.
 
@@ -71,6 +74,12 @@ def _make_record(
     request = {"messages": [{"role": "user", "content": "hello"}], "input_ids": prompt_token_ids}
     if routed_experts_start_len is not None:
         request["routed_experts_start_len"] = routed_experts_start_len
+    if weight_versions is not None:
+        meta_info["weight_versions"] = weight_versions
+    if sampling_masks is not None:
+        request["return_sampling_mask"] = True
+        meta_info["output_token_sampling_mask"] = sampling_masks
+        meta_info["output_token_sampling_logprobs"] = sampling_log_probs
     return SessionRecord(
         timestamp=0.0,
         method="POST",
@@ -111,6 +120,128 @@ class TestComputeSamplesFromRecords:
         assert s.response_length == 2
         assert s.loss_mask == [1, 1]
         assert s.status == Sample.Status.COMPLETED
+
+    def test_single_record_scalar_weight_version_becomes_span(self):
+        """A scalar weight_version in the record's meta_info synthesizes one span over the output tokens."""
+        tok = _mock_tokenizer()
+        record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11], weight_version="v3")
+
+        samples = compute_samples_from_openai_records(_ARGS, [record], tok)
+
+        assert samples[0].weight_versions == [WeightVersionsPerCall(spans=[WeightVersionSpan("v3", 3, 5)])]
+
+    def test_single_record_per_token_weight_versions_become_spans(self):
+        """Per-token weight_versions in meta_info are shifted by the prompt length."""
+        tok = _mock_tokenizer()
+        record = _make_record(
+            prompt_token_ids=[1, 2, 3],
+            output_token_ids=[10, 11, 12],
+            weight_versions=[{"version": "v1", "start": 0, "end": 2}, {"version": "v2", "start": 2, "end": 3}],
+        )
+
+        samples = compute_samples_from_openai_records(_ARGS, [record], tok)
+
+        assert samples[0].weight_versions == [
+            WeightVersionsPerCall(spans=[WeightVersionSpan("v1", 3, 5), WeightVersionSpan("v2", 5, 6)])
+        ]
+
+    def test_trimmed_trailing_tokens_clip_the_weight_version_span(self):
+        """Spans are built over the untrimmed output, so trimming must clip the last span's end."""
+        tok = _mock_tokenizer()
+        records = [
+            _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10, STOP], weight_version="v3"),
+            _make_record(prompt_token_ids=[1, 2, 3, 10, 4], output_token_ids=[20], weight_version="v4"),
+        ]
+
+        samples = compute_samples_from_openai_records(
+            _ARGS,
+            records,
+            tok,
+            accumulated_token_ids=[1, 2, 3, 10, 4, 20],
+            max_trim_tokens=1,
+        )
+
+        assert samples[0].tokens == [1, 2, 3, 10]
+        assert samples[0].weight_versions == [WeightVersionsPerCall(spans=[WeightVersionSpan("v3", 3, 4)])]
+        assert samples[1].weight_versions == [WeightVersionsPerCall(spans=[WeightVersionSpan("v4", 5, 6)])]
+
+    def test_weight_version_span_past_output_tokens_is_rejected(self):
+        """A span reaching beyond the reported output tokens cannot be anchored, so no Sample is built."""
+        tok = _mock_tokenizer()
+        record = _make_record(
+            prompt_token_ids=[1, 2, 3],
+            output_token_ids=[10, 11],
+            weight_versions=[{"version": "v1", "start": 0, "end": 3}],
+        )
+
+        with pytest.raises(AssertionError, match="extend past the 2 output tokens"):
+            compute_samples_from_openai_records(_ARGS, [record], tok)
+
+    def test_record_without_any_weight_version_still_contributes_a_call(self):
+        """turns is len(weight_versions), so an unstamped call must appear as an empty call."""
+        tok = _mock_tokenizer()
+        record = _make_record(prompt_token_ids=[1, 2], output_token_ids=[10, 11])
+
+        samples = compute_samples_from_openai_records(_ARGS, [record], tok)
+
+        assert samples[0].weight_versions == [WeightVersionsPerCall(spans=[])]
+
+    def test_single_record_uses_native_sampling_support_and_log_probs(self):
+        tok = _mock_tokenizer()
+        record = _make_record(
+            prompt_token_ids=[1, 2, 3],
+            output_token_ids=[10, 11],
+            output_log_probs=[-2.5, -2.6],
+            sampling_masks=[[10, 4, 7], [11, 3]],
+            sampling_log_probs=[-0.5, -0.6],
+        )
+
+        (sample,) = compute_samples_from_openai_records(_ARGS, [record], tok)
+
+        assert sample.rollout_log_probs == [-0.5, -0.6]
+        ids, offsets = sample.rollout_sampling_mask._as_tensors()
+        assert ids.tolist() == [10, 4, 7, 11, 3]
+        assert offsets.tolist() == [0, 3, 5]
+        sample.validate()
+
+    def test_abort_without_sampling_metadata_is_non_trainable(self):
+        tok = _mock_tokenizer()
+        record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[], finish_reason="abort")
+        record.request["return_sampling_mask"] = True
+
+        (sample,) = compute_samples_from_openai_records(_ARGS, [record], tok)
+
+        assert sample.status == Sample.Status.ABORTED
+        assert sample.reward is None
+        assert len(sample.rollout_sampling_mask) == 0
+
+    def test_successful_turn_still_requires_sampling_metadata(self):
+        tok = _mock_tokenizer()
+        record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10])
+        record.request["return_sampling_mask"] = True
+
+        with pytest.raises(ValueError, match="missing output_token_sampling_mask"):
+            compute_samples_from_openai_records(_ARGS, [record], tok)
+
+    def test_later_abort_preserves_terminal_status(self):
+        tok = _mock_tokenizer()
+        records = [
+            _make_record(
+                prompt_token_ids=[1, 2],
+                output_token_ids=[10],
+                sampling_masks=[[10, 11]],
+                sampling_log_probs=[-0.2],
+            ),
+            _make_record(prompt_token_ids=[1, 2, 10, 20], output_token_ids=[], finish_reason="abort"),
+        ]
+        records[1].request["return_sampling_mask"] = True
+
+        samples = compute_samples_from_openai_records(_ARGS, records, tok)
+        merged = merge_samples(samples, tok)
+
+        assert merged.status == Sample.Status.ABORTED
+        assert merged.tokens == [1, 2, 10, 20]
+        assert len(merged.rollout_sampling_mask) == merged.response_length == 2
 
     def test_multiple_records_produce_multiple_samples(self):
         tok = _mock_tokenizer()

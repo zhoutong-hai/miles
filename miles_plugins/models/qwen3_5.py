@@ -16,7 +16,7 @@ except ImportError:
     pass
 
 from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
-from miles.backends.training_utils.cp_utils import build_gdn_cp_context
+from miles_plugins.models.cp_utils import build_gdn_cp_context
 
 from .hf_attention import HuggingfaceAttention
 from .qwen_gdn_backend import get_chunk_gated_delta_rule
@@ -190,6 +190,7 @@ class Attention(HuggingfaceAttention):
         layer_number: int,
         cp_comm_type: str = "p2p",
         pg_collection=None,
+        name: str | None = None,
     ):
         super().__init__(
             args,
@@ -197,6 +198,7 @@ class Attention(HuggingfaceAttention):
             layer_number,
             cp_comm_type,
             pg_collection,
+            name=name,
         )
         # Qwen3.5 is a VLM model with nested text_config
         self.hf_config = _get_text_config(self.hf_config)

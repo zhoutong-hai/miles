@@ -8,8 +8,10 @@ Live site: https://miles.radixark.com/docs
 docs/
 ├── docs.json        # Mintlify config: navigation, theme, redirects
 ├── index.md         # Homepage
-├── getting-started/ models/ user-guide/ advanced/
-├── examples/ developer/ ci/ blog/
+├── getting-started/ hardware-platforms/ models/ user-guide/ advanced/
+├── examples/ blog/
+├── developer/
+│   └── ci/
 └── assets/          # Images and stylesheets
 ```
 
@@ -55,6 +57,6 @@ Then open http://localhost:3000.
    the two ever diverge.
 5. Images and other assets go in `assets/` and are referenced the same way:
    `/assets/images/arch.png`. Group them into a subdirectory once a topic has more than
-   one image, named after the page or area that uses them: `assets/images/dashboard/` for
-   the dashboard screenshots, `assets/images/brand/` for the logo and favicon. A one-off
-   image stays at the top level.
+   one image, named after the page or area that uses them:
+   `assets/images/low-precision/` for low-precision charts, `assets/images/brand/` for
+   the logo and favicon. A one-off image stays at the top level.

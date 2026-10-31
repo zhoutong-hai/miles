@@ -3,15 +3,9 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
 
 from .parallel import get_parallel_state
-
-try:
-    from fla.ops.cp import build_cp_context as _fla_build_cp_context
-except ImportError:
-    _fla_build_cp_context = None
 
 logger = logging.getLogger(__name__)
 
@@ -104,18 +98,11 @@ def get_sum_of_sample_mean(
     max_seq_lens: list[int] | None = None,
     *,
     denominators: list[torch.Tensor] | torch.Tensor | None = None,
-    fixed_response_normalizer: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP; ``denominators`` overrides each
     sample's own ``loss_mask.sum()`` (e.g. pass ``rollout_mask_sums`` for
     per-rollout means)."""
-    if fixed_response_normalizer is not None:
-        if calculate_per_token_loss or fixed_response_normalizer <= 0:
-            raise ValueError("Fixed response normalization requires a positive budget and sample reduction")
-        # Dr. GRPO: preserve the masks in the numerator, never normalize by
-        # generated length or a post-TIS accepted-token count.
-        denominators = [m.new_tensor(fixed_response_normalizer) for m in loss_masks]
-    elif denominators is None:
+    if denominators is None:
         denominators = [m.sum() for m in loss_masks]
 
     parallel_state = get_parallel_state()
@@ -384,15 +371,15 @@ def allgather_cp_redistribute(
             if e <= s:
                 # This rank has no response logprobs for this sample
                 full_resp = torch.zeros(
-                    (response_length, *value.shape[1:]),
+                    response_length,
                     dtype=value.dtype,
                     device=value.device,
-                    requires_grad=value.requires_grad,
-                ) + value.sum() * 0
+                    requires_grad=True,
+                )
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start
-                full_resp = F.pad(value, (0, 0) * (value.ndim - 1) + (resp_start, response_length - resp_end))
+                full_resp = F.pad(value, (resp_start, response_length - resp_end))
 
             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
             full_resps.append(full_resp)
@@ -477,30 +464,3 @@ def assemble_log_prob_from_cp(
             taken += width
         assert taken == len(chunk), f"cp rank {cp_rank}: consumed {taken} of {len(chunk)} values"
     return out
-
-
-def build_gdn_cp_context(module: nn.Module, cu_seqlens: torch.Tensor, device: torch.device):
-    """Build fla CP context for a GatedDeltaNet module from packed sequence boundaries.
-
-    Args:
-        module: GDN module with ``cp_group`` / ``cp_world_size`` / ``conv_kernel_size``.
-        cu_seqlens: Global packed sequence boundaries (e.g. ``packed_seq_params.cu_seqlens_q``).
-        device: Target device.
-
-    Returns ``None`` when CP is not configured on the module (``cp_group`` not set).
-    Raises ``RuntimeError`` if hybrid CP is configured but ``fla.ops.cp`` is missing.
-    """
-    cp_group = getattr(module, "cp_group", None)
-    if cp_group is None:
-        return None
-    if _fla_build_cp_context is None:
-        raise RuntimeError(
-            "Hybrid CP requires fla.ops.cp (flash-linear-attention >= 0.4.2) " "but it could not be imported."
-        )
-    if cu_seqlens is None or cu_seqlens.numel() < 2:
-        raise ValueError(f"Hybrid CP requires valid cu_seqlens (at least 2 elements) but got {cu_seqlens}")
-    return _fla_build_cp_context(
-        cu_seqlens=cu_seqlens.to(device=device, dtype=torch.int32),
-        group=cp_group,
-        conv1d_kernel_size=module.conv_kernel_size,
-    )

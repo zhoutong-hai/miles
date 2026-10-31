@@ -3,7 +3,6 @@ from typing import Any
 
 import torch
 
-from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.multi_lora import is_multi_lora_enabled
@@ -16,11 +15,11 @@ logger = logging.getLogger(__name__)
 
 ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
+    "target_tokens": "int32",
     "loss_masks": "int32",
     "rollout_log_probs": "float32",
-    "sfc_generation_log_probs": "float32",
-    "rollout_topk_token_ids": "int32",
-    "rollout_topk_log_probs": "float32",
+    "rollout_sampling_mask_ids": "int32",
+    "rollout_sampling_mask_offsets": "int64",
     "teacher_log_probs": "float32",
     "opd_reverse_kl": "float32",
     "rollout_routed_experts": "int32",
@@ -42,7 +41,6 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
-    "sfc_sample_metadata": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
@@ -103,10 +101,6 @@ def convert_samples_to_train_data(
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
 
-    if getattr(args, "sfc_diagnostics_dir", None):
-        train_data["sfc_sample_metadata"] = [_sfc_sample_metadata(sample) for sample in samples]
-        train_data["sfc_generation_log_probs"] = [sample.rollout_log_probs for sample in samples]
-
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
     # overwriting the raw reward
@@ -121,11 +115,24 @@ def convert_samples_to_train_data(
     if samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
-    if k := getattr(args, "rollout_top_logprobs_num", 0):
-        for sample in samples:
-            validate_rollout_topk_logprobs_sample(sample, k)
-        train_data["rollout_topk_token_ids"] = [sample.rollout_topk_token_ids for sample in samples]
-        train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
+    has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
+    if has_sampling_mask:
+        sampling_mask_ids = []
+        sampling_mask_offsets = []
+        for position, sample in enumerate(samples):
+            sample.validate()
+            if sample.rollout_sampling_mask is None:
+                raise ValueError(
+                    "sampling-mask data must be present for every training sample; "
+                    f"missing at position={position}, sample_index={sample.index}, status={sample.status}"
+                )
+            ids, offsets = sample.rollout_sampling_mask._as_tensors()
+
+            sampling_mask_ids.append(ids)
+            sampling_mask_offsets.append(offsets)
+
+        train_data["rollout_sampling_mask_ids"] = sampling_mask_ids
+        train_data["rollout_sampling_mask_offsets"] = sampling_mask_offsets
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
@@ -140,25 +147,10 @@ def convert_samples_to_train_data(
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
     if any(sample.weight_versions for sample in samples):
-        train_data["weight_versions"] = [sample.weight_versions for sample in samples]
+        train_data["weight_versions"] = [[call.to_dicts() for call in sample.weight_versions] for sample in samples]
 
     if samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
-
-    if any(sample.adapter is not None for sample in samples):
-        assert all(sample.adapter is not None for sample in samples), "Cannot mix adapter and adapter-less samples"
-        train_data["adapter_slots"] = [sample.adapter.slot for sample in samples]
-        # Slots whose adapter batch completes with this batch: the trainer scales their
-        # accumulated gradients by 1/adapter-batch-size and advances the LR schedule.
-        step_slots = sorted(metadata.get("step_slots", []))
-        train_data["step_slots"] = step_slots
-        train_data["step_adapter_names"] = sorted(metadata.get("step_adapter_names", []))
-        step_slot_set = set(step_slots)
-        train_data["step_adapter_batch_sizes"] = {
-            sample.adapter.slot: sample.metadata["adapter_global_batch_size"]
-            for sample in samples
-            if sample.adapter.slot in step_slot_set
-        }
 
     if (prompt_group_sizes := metadata.get("prompt_group_sizes")) is not None:
         train_data["prompt_group_sizes"] = prompt_group_sizes
@@ -254,19 +246,11 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        # Compare original scalars; FP32 can merge genuinely distinct rewards.
-        # Check the converted values too, so FP32 overflow is not masked.
-        uniform_finite = bool(torch.isfinite(rollout_rewards).all()) and all(
-            reward == shared_rewards[0] for reward in shared_rewards[1:]
-        )
-        if uniform_finite:
-            normalized_rollout_rewards = torch.zeros_like(rollout_rewards)
-        else:
-            normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
-                rollout_std = rollout_rewards.std()
-                if rollout_std > 0:
-                    normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
+        normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization and len(rollout_rewards) > 1:
+            rollout_std = rollout_rewards.std()
+            if rollout_std > 0:
+                normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
 
         for (_, rollout_segments), normalized_reward in zip(
             rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True
@@ -389,10 +373,8 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rollout_ids",
             "rollout_mask_sums",
             "rollout_log_probs",
-            "rollout_topk_token_ids",
-            "rollout_topk_log_probs",
-            "sfc_generation_log_probs",
-            "sfc_sample_metadata",
+            "rollout_sampling_mask_ids",
+            "rollout_sampling_mask_offsets",
             "rollout_routed_experts",
             "rollout_indexer_topk",
             "prompt",
@@ -401,6 +383,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "seq_witness_ids",
             "weight_versions",
             "adapter_slots",
+            "loss_weights",
+            "advantages",
+            "target_tokens",
         ]:
             if key not in data:
                 continue
@@ -411,10 +396,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "raw_reward",
             "total_lengths",
             "dynamic_global_batch_size",
-            "step_slots",
-            "step_adapter_names",
-            "step_adapter_batch_sizes",
             "prompt_group_sizes",
+            "loss_fn",
+            "loss_fn_config",
         ]:
             if key not in data:
                 continue
@@ -436,15 +420,3 @@ def process_rollout_data_shard(args, rollout_data):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data
-
-
-def _sfc_sample_metadata(sample):
-    """Keep identities and numeric reward fields; omit prompt/verifier text."""
-    metadata = sample.metadata or {}
-    adaptive = metadata.get("miles_adaptive_sampling", {})
-    live = [i for i, active in enumerate(sample.loss_mask) if active]
-    return {"group_index": sample.group_index, "source_row": adaptive.get("row"),
-            "theme": metadata.get("theme", "UNBOUND"), "scenario": metadata.get("scenario", "UNBOUND"),
-            "rewards": {k: v for k, v in sample.reward.items() if isinstance(v, (int, float))}
-                       if isinstance(sample.reward, dict) else {"reward": sample.reward},
-            "valid_tokens": len(live), "first_valid_positions": live[:32]}

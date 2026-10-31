@@ -64,6 +64,11 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    if os.environ.get("E007_ATTEMPT_PLAN"):
+        if not args.wandb_run_id:
+            raise RuntimeError("e007 writer requires the admitted W&B child ID")
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "allow"
 
     # Configure settings based on offline/online mode
     if offline:
@@ -159,10 +164,6 @@ def init_wandb_secondary(args, router_addr=None):
 
 
 def _init_wandb_common():
-    wandb.define_metric("router_load/completed_updates")
-    wandb.define_metric("router_load/rollout_id")
-    wandb.define_metric("router_load/by_update/*", step_metric="router_load/completed_updates")
-    wandb.define_metric("router_load/by_rollout/*", step_metric="router_load/rollout_id")
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("rollout/step")

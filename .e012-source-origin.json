@@ -1,0 +1,6 @@
+{
+  "origin": "/Users/zhoutong/code/skypilot-infra/zhoutong-scripts/auto-experiments/e008-kimi-k3-seven-theme-lora/.local/attempts/r4/source/miles",
+  "file_count": 2176,
+  "tree_inventory_sha256": "36a01786ca4a9fc4722121cdd79b510f40016d03dcf48bc4dc1ceeec4a9c8597",
+  "description": "Exact E008 r4 source snapshot; GLM observer modules are ported separately."
+}

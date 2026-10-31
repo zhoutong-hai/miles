@@ -17,6 +17,7 @@ import miles.utils.external_utils.command_utils as command_utils
 from miles.utils.external_utils.model_args_utils import import_module_from_path
 
 FROZEN_RUN_ID = "260101-000000-000"
+FROZEN_HARDWARE = "H200"
 
 _GPU_COUNT_ANY_WAIT_LOOP_ACCEPTS = "1000000"
 _FROZEN_PID = 1000
@@ -70,8 +71,23 @@ class PyLaunchScript:
 
 
 def iter_py_launch_scripts() -> list[PyLaunchScript]:
-    paths = sorted((REPO_ROOT / "scripts").rglob("run_*.py"))
+    paths = sorted(
+        [*(REPO_ROOT / "scripts").rglob("run_*.py"), REPO_ROOT / "examples/multi_lora/serve_qwen3_30b_a3b_tinker.py"]
+    )
     return [PyLaunchScript(path=path, entrypoints=tuple(_entrypoint_names(path))) for path in paths]
+
+
+def launcher_hardware_literals() -> dict[str, tuple[str, ...]]:
+    """Every value each launcher's `--hardware` accepts, for the launchers that have the flag at all."""
+    literals = {}
+    for script in iter_py_launch_scripts():
+        for node in ast.walk(ast.parse(script.path.read_text())):
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "hardware":
+                values = node.annotation.slice
+                literals[script.rel] = tuple(
+                    e.value for e in (values.elts if isinstance(values, ast.Tuple) else [values])
+                )
+    return literals
 
 
 def iter_self_executing_launchers() -> list[Path]:
@@ -106,11 +122,12 @@ def install_shell_recorder(monkeypatch, sandbox: Path) -> Recording:
     return recording
 
 
-def freeze_environment(monkeypatch) -> None:
+def freeze_environment(monkeypatch, hardware: str = FROZEN_HARDWARE) -> None:
     for key, value in _FROZEN_ENV.items():
         monkeypatch.setenv(key, value)
     for key in CLEARED_ENV:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(command_utils, "detect_hardware", lambda: hardware)
 
 
 def install_command_recorder(monkeypatch) -> Recording:

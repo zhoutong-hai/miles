@@ -51,10 +51,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     model_org: str = "jdopensource"
     model_name: str = "JoyAI-LLM-Flash"
     megatron_model_type: str = "joyai-llm-flash"
-    num_gpus_per_node: int | None = 8
+    num_gpus_per_node: int | None = None
     actor_num_gpus_per_node: int | None = 4
     rollout_num_gpus: int | None = 4
-    hardware: Literal["B200", "B300", "GB200", "GB300"] = "B200"
+    hardware: Literal["auto", "B200", "B300", "GB200", "GB300"] = "auto"
     enable_eval: bool = False
     extra_args: str = ""
     data_dir: str = "/root/datasets"
@@ -74,6 +74,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     mxfp8_num_layers_at_end_in_bf16: int = 6
 
     def __post_init__(self):
+        self.hardware = U.resolve_hardware(self)
+        self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.train_mxfp8:
             assert self.rollout_mxfp8, "train_mxfp8 requires rollout_mxfp8"
 
@@ -237,7 +239,7 @@ def execute(args: ScriptArgs, *, wandb_file: str = __file__):
                     f"--sglang-tp-size {sglang_world_size} "
                     f"--sglang-dp-size {sglang_world_size} "
                     "--sglang-enable-dp-attention "
-                    f"--sglang-cuda-graph-max-bs {sglang_decode_max_bs} "
+                    f"--sglang-cuda-graph-max-bs-decode {sglang_decode_max_bs} "
                     # f"--sglang-max-running-requests {sglang_world_size * sglang_decode_max_bs // sglang_attn_tp_size} "
                     # f"--sglang-chunked-prefill-size {sglang_world_size * sglang_decode_max_bs} "
                 )
@@ -252,7 +254,7 @@ def execute(args: ScriptArgs, *, wandb_file: str = __file__):
                 )
                 misc_args += f"--te-precision-config-file {U.encode_pseudo_file(MXFP8_TE_PRECISION_CONFIG)} "
             else:
-                sglang_args += "--rollout-num-gpus-per-engine 1 " "--sglang-cuda-graph-max-bs 256 "
+                sglang_args += "--rollout-num-gpus-per-engine 1 " "--sglang-cuda-graph-max-bs-decode 256 "
         case _:
             raise NotImplementedError
 

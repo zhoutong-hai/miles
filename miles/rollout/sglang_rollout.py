@@ -13,22 +13,19 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
-from miles.rollout.generate_utils.rollout_topk_logprobs import (
-    append_rollout_topk_logprobs,
-    configure_rollout_topk_logprobs_request,
-)
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.filter_hub.base_types import MetricGatherer
+from miles.rollout.filter_hub.common_filters import apply_preput_filters
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.utils import dumper_utils
 from miles.utils.async_utils import run
 from miles.utils.data import Dataset
 from miles.utils.eval_config import EvalDatasetConfig
+from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
-from miles.utils.misc import SingletonMeta, call_agent_abort_hook, load_function
-from miles.utils.multi_lora import make_rid, slot_lora_name
+from miles.utils.misc import SingletonMeta, call_agent_abort_hook
 from miles.utils.processing_utils import (
     call_processor,
     encode_image_for_rollout_engine,
@@ -43,13 +40,50 @@ from .generate_utils.generate_endpoint_utils import (
     get_indexer_topk_from_response,
     policy_uses_routing_key,
 )
-from .generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
+from .generate_utils.prefill_logprobs import (
+    recompute_samples_rollout_logprobs_via_prefill, rollout_logprobs_need_recompute,
+)
 from .generate_utils.sample_utils import reward_log_summary, sample_text_preview
+from .generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+
+async def ensure_accepted_rollout_logprobs(args: Namespace, samples: list[Sample], *,
+                                           url: str, sampling_params: dict[str, Any]):
+    """Rescore the whole accepted batch only when a decode score is invalid."""
+    active = [sample for sample in samples if sample.response_length and sample.status != Sample.Status.ABORTED]
+    triggered = [sample for sample in active if rollout_logprobs_need_recompute(sample)]
+    repair = bool(triggered)
+    valid_before = {id(sample): list(sample.rollout_log_probs) for sample in active
+                    if not rollout_logprobs_need_recompute(sample)}
+    if repair:
+        logger.warning("Repairing incomplete/non-finite decode scores for %d/%d accepted samples",
+                       len(triggered), len(active))
+    await recompute_samples_rollout_logprobs_via_prefill(
+        args, active, url=url, sampling_params=sampling_params, force=repair
+    )
+    if any(rollout_logprobs_need_recompute(sample) for sample in active):
+        raise ValueError("accepted rollout still has incomplete/non-finite logprobs after repair")
+    if repair:
+        for sample in active:
+            original = valid_before.get(id(sample))
+            sample.metadata["rollout_logprobs_repair_triggered"] = True
+            sample.metadata["rollout_logprobs_repair_trigger_count"] = len(triggered)
+            sample.metadata["rollout_logprobs_rescored_count"] = len(active)
+            sample.metadata["rollout_logprobs_decode_valid_before_repair"] = original is not None
+            if original is not None:
+                differences = [abs(float(before) - float(after)) for before, after
+                               in zip(original, sample.rollout_log_probs, strict=True)]
+                sample.metadata["rollout_logprobs_decode_prefill_mean_abs_diff"] = (
+                    sum(differences) / len(differences) if differences else 0.0)
+                sample.metadata["rollout_logprobs_decode_prefill_max_abs_diff"] = max(differences, default=0.0)
+    return {"repair_triggered": repair, "trigger_count": len(triggered),
+            "rescored_count": len(active) if repair else 0,
+            "decode_valid_comparison_count": len(valid_before) if repair else 0}
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -142,7 +176,13 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+async def generate(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    *,
+    evaluation: bool = False,
+) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
@@ -175,41 +215,27 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
+    return_sampling_mask = should_return_sampling_mask(args, sampling_params, evaluation=evaluation)
+
     # Prepare payload for sglang server
     payload = {
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    if return_sampling_mask:
+        payload["return_sampling_mask"] = True
     opd_top_k = getattr(args, "opd_log_prob_top_k", 0) or 0
     opd_top_k_strategy = getattr(args, "opd_top_k_strategy", "only-student")
     if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
         payload["top_logprobs_num"] = opd_top_k
 
-    if sample.adapter is not None:
-        from miles.ray.multi_lora.controller import AdaptersCache
-
-        if (adapter := await AdaptersCache().get(sample.adapter.name)) is None:
-            # Adapter deregistered: don't POST, or an orphan the abort round can't see
-            # would keep decoding under the slot's next tenant and pollute its group.
-            logger.warning(
-                f"Dropping generation for adapter '{sample.adapter.name}' (slot {sample.adapter.slot}): "
-                "adapter is no longer sampleable"
-            )
-            sample.status = Sample.Status.ABORTED
-            return sample
-        payload["lora_path"] = slot_lora_name(sample.adapter.slot)
-        payload["rid"] = make_rid(sample.adapter.name)
-        payload["extra_key"] = f"{sample.adapter.name}:v{adapter.version}"
-    elif lora_rollout_enabled(args):
+    if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
     if getattr(args, "use_rollout_indexer_replay", False):
         payload["return_indexer_topk"] = True
-
-    if not evaluation:
-        configure_rollout_topk_logprobs_request(args, payload)
 
     if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
         image_data = sample.multimodal_inputs["images"]
@@ -245,12 +271,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     else:
         new_response_tokens, new_response_log_probs = [], []
 
+    if payload.get("return_sampling_mask", False):
+        new_response_log_probs = append_sampling_metadata(sample, new_response_tokens, output["meta_info"])
+
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
     sample.response_length += len(new_response_tokens)
     sample.response += output["text"]
-    if not evaluation:
-        append_rollout_topk_logprobs(sample, output["meta_info"], getattr(args, "rollout_top_logprobs_num", 0))
 
     # When partial rollout and masking off policy is enabled, update the loss mask
     if sample.loss_mask is not None:
@@ -332,7 +359,7 @@ async def generate_and_rm(
                 )
                 sample = output.samples
             else:
-                sample = await generate(args, sample, sampling_params)
+                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
 
     if sink is not None:
         sink.attempt_end(sample)
@@ -505,9 +532,9 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+            filter_output = apply_preput_filters(args, dynamic_filter, group)
+            if not filter_output.keep:
+                metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 state.remaining_batch_size -= 1
                 continue
 
@@ -546,7 +573,7 @@ async def generate_rollout_async(
         process_func = load_function(x)
         process_func(args, all_samples, data_source)
 
-    await recompute_samples_rollout_logprobs_via_prefill(
+    await ensure_accepted_rollout_logprobs(
         args,
         [sample for group in data for sample in group],
         url=get_model_url(args, "default"),

@@ -16,9 +16,10 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
     get_routed_experts_from_response,
 )
 from miles.rollout.generate_utils.sample_utils import merge_samples
+from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata
 from miles.rollout.session.types import SessionRecord
 from miles.utils.lifecycle import attach_lifecycle_metadata
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionsPerCall
 
 
 def compute_samples_from_openai_records(
@@ -102,6 +103,7 @@ def _compute_sample_from_openai_record(
     args: Namespace, record: SessionRecord, tokenizer, trim_count: int = 0, *, use_addition_r3: bool = False
 ) -> Sample:
     choice = record.response["choices"][0]
+    finish_reason = choice.get("finish_reason")
 
     prompt_token_ids = record.request.get("input_ids")
     if prompt_token_ids is None:
@@ -111,6 +113,13 @@ def _compute_sample_from_openai_record(
     output_log_probs = [item[0] for item in choice["meta_info"]["output_token_logprobs"]]
 
     sample = Sample()
+    if record.request.get("return_sampling_mask", False):
+        output_log_probs = append_sampling_metadata(
+            sample,
+            output_token_ids,
+            choice["meta_info"],
+            aborted=finish_reason == "abort",
+        )
     sample.tokens = prompt_token_ids + output_token_ids
     sample.rollout_log_probs = output_log_probs
     sample.response = tokenizer.decode(output_token_ids)
@@ -120,12 +129,13 @@ def _compute_sample_from_openai_record(
         None if use_addition_r3 else get_routed_experts_from_response(args, choice, len(sample.tokens) - 1)
     )
     sample.rollout_indexer_topk = get_indexer_topk_from_response(args, choice, sample)
+    sample.weight_versions = [WeightVersionsPerCall.from_meta_info(choice["meta_info"], output_end=len(sample.tokens))]
 
     if trim_count > 0:
         sample.strip_last_output_tokens(trim_count, tokenizer)
 
     # TODO unify with Sample.update_from_meta_info
-    match choice["finish_reason"]:
+    match finish_reason:
         case "stop" | "tool_calls":
             sample.status = Sample.Status.COMPLETED
         case "length":
@@ -136,8 +146,6 @@ def _compute_sample_from_openai_record(
     if args.sglang_speculative_algorithm:
         sample.spec_info.add(choice.get("meta_info", {}))
     sample.prefix_cache_info.add(choice.get("meta_info", {}))
-    if "weight_version" in choice["meta_info"]:
-        sample.weight_versions.append(choice["meta_info"]["weight_version"])
 
     return sample
 

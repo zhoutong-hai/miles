@@ -12,8 +12,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = U.create_run_id()
     model_name: str = "Qwen3.5-35B-A3B"
     megatron_model_type: str = "qwen3.5-35B-A3B"
-    num_gpus_per_node: int = 8
-    hardware: Literal["H200", "B300"] = "H200"
+    num_gpus_per_node: int | None = None
+    hardware: Literal["auto", "H200", "B300"] = "auto"
     enable_eval: bool = False
     extra_args: str = ""
     data_dir: str = "/root/datasets"
@@ -28,6 +28,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # sglang's own default (ep_size = engine tp size, max_running_requests from memory)
     sglang_ep_size: int | None = None
     sglang_max_running_requests: int | None = None
+
+    def __post_init__(self):
+        self.hardware = U.resolve_hardware(self)
+        self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def prepare(args: ScriptArgs):
@@ -126,7 +130,7 @@ def execute(args: ScriptArgs):
     sglang_args = (
         "--rollout-num-gpus-per-engine 8 "
         "--sglang-mem-fraction-static 0.7 "
-        "--sglang-cuda-graph-bs 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256 "
+        "--sglang-cuda-graph-bs-decode 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232 240 248 256 "
     )
 
     if args.sglang_ep_size is not None:
@@ -150,7 +154,7 @@ def execute(args: ScriptArgs):
             "--sglang-speculative-num-draft-tokens 3 "
         )
         if args.enable_spec_v2:
-            sglang_args += "--sglang-mamba-scheduler-strategy extra_buffer "
+            sglang_args += "--sglang-mamba-radix-cache-strategy extra_buffer "
 
     mtp_args = "--enable-mtp-training " "--mtp-num-layers 1 " "--mtp-loss-scaling-factor 0.2 "
 

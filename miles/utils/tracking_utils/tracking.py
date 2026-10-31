@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 
@@ -45,7 +46,16 @@ def define_step_key_metric_group(prefix: str, step_key: str) -> None:
 
 def log(args, metrics, step_key: str):
     step = metrics.get(step_key)
-    _manager.log(metrics, step=step, step_key=step_key)
+    if os.environ.get("E007_ATTEMPT_PLAN"):
+        from e007.hooks import spool_metrics, mark_tracking_degraded, tracking_degraded
+        spool_metrics(metrics, step_key)
+        if not tracking_degraded():
+            try:
+                _manager.log(metrics, step=step, step_key=step_key)
+            except Exception as error:
+                mark_tracking_degraded(error)
+    else:
+        _manager.log(metrics, step=step, step_key=step_key)
 
     if is_event_logger_initialized():
         serializable_metrics = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()}

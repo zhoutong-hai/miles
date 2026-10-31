@@ -21,6 +21,7 @@ register_cuda_ci(
     est_time=1400,
     suite="stage-c-2-gpu-h200",
     labels=["megatron", "model-scripts", "replay"],
+    hardware=["hopper", "blackwell"],
 )
 
 register_ci_gate(metric_key="train/grad_norm")
@@ -32,6 +33,7 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 def _args() -> ScriptArgs:
     return ScriptArgs(
+        hardware="H200",
         model_name="GLM-5_4layer",
         num_nodes=1,
         num_gpus_per_node=2,

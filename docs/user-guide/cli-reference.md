@@ -26,6 +26,7 @@ This page has two passes.
 | `--rollout-num-gpus` | derived | GPUs for SGLang rollout (ignored when `--colocate`). |
 | `--rollout-num-gpus-per-engine` | `1` | TP size of each SGLang engine. |
 | `--colocate` | off | Share GPUs between actor and rollout. |
+| `--run-uuid` | generated | Machine-readable id for this launch; 16 lowercase hex characters. |
 
 See [Training Backends](/user-guide/training-backend) for what `--colocate` flips on under the hood.
 
@@ -64,7 +65,7 @@ then push up until you OOM.
 
 | Flag | Default | What |
 |---|---|---|
-| `--advantage-estimator` | `grpo` | `grpo`, `gspo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `on_policy_distillation` |
+| `--advantage-estimator` | `grpo` | `grpo`, `gspo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`. On-policy distillation is not an estimator — enable it with `--use-opd` on top of any of these. |
 | `--use-kl-loss` | off | Compute KL against the reference model. |
 | `--kl-loss-coef` | `0.0` | Weight of KL in the loss (0 means monitor only). |
 | `--kl-loss-type` | `k1` | `k1`, `k2`, `k3`, `low_var_kl`. |
@@ -79,7 +80,8 @@ then push up until you OOM.
 | Flag | Default | What |
 |---|---|---|
 | `--rollout-temperature` | `1.0` | Sampling temperature. |
-| `--rollout-top-p` | `1.0` | Top-p truncation. |
+| `--rollout-top-p` | `1.0` | Top-p truncation. Values below `1` enable [sampling-support replay](/advanced/sampling-support-replay) and require a positive top-k. |
+| `--rollout-top-k` | `-1` | Top-k truncation. Positive values enable [sampling-support replay](/advanced/sampling-support-replay). |
 | `--rollout-max-response-len` | `–` | Max tokens per response. |
 | `--rollout-stop-token-ids` | model default | Stop token IDs. Override when generations don't stop. |
 | `--apply-chat-template` | off | Apply the tokenizer's chat template. |
@@ -112,8 +114,8 @@ Any flag accepted by `python -m sglang.launch_server` is accepted by Miles with 
 ```bash
 --sglang-log-level INFO
 --sglang-mem-fraction-static 0.8
---sglang-enable-overlap-schedule
---sglang-enable-ep-moe
+--sglang-ep-size 8
+--sglang-moe-a2a-backend deepep
 --sglang-enable-dp-attention
 ```
 
@@ -185,8 +187,8 @@ Sections mirror the launch-script argument groups.
 |---|---|---|---|
 | `--rollout-max-response-len` | int | – | Max tokens per response. |
 | `--rollout-temperature` | float | `1.0` | Sampling temperature. |
-| `--rollout-top-p` | float | `1.0` | Top-p truncation. |
-| `--rollout-top-k` | int | `-1` | Top-k truncation (-1 disables). |
+| `--rollout-top-p` | float | `1.0` | Top-p truncation. Values below `1` require bounded [sampling-support replay](/advanced/sampling-support-replay). |
+| `--rollout-top-k` | int | `-1` | Top-k truncation (`-1` disables). Positive values enable [sampling-support replay](/advanced/sampling-support-replay). |
 | `--rollout-stop` | str+ | – | Stop strings. |
 | `--rollout-stop-token-ids` | int+ | – | Stop token IDs. |
 
@@ -200,6 +202,7 @@ Sections mirror the launch-script argument groups.
 | `--eval-max-response-len` | int | – | Max eval response length. Inherits from rollout if unset. |
 | `--eval-temperature` | float | – | Eval temperature. Inherits from rollout if unset. |
 | `--eval-top-p` | float | – | Eval top-p. Inherits from rollout if unset. |
+| `--eval-top-k` | int | – | Eval top-k. Inherits from rollout if unset. |
 | `--eval-num-gpus` | int | `0` | Dedicated eval fleet size. `0` = shared-engine eval. Requires `train_async.py`. |
 | `--eval-num-gpus-per-engine` | int | `1` | Eval engine TP, independent of rollout TP. |
 | `--eval-hf-dir` | str | – | Staging dir for per-eval HF snapshots (tmpfs recommended). Unset + `--save-hf` = reuse mode. |
@@ -234,7 +237,7 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--advantage-estimator` | enum | `grpo` | `grpo`, `gspo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `on_policy_distillation` |
+| `--advantage-estimator` | enum | `grpo` | `grpo`, `gspo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`. |
 | `--use-kl-loss` | flag | off | Compute KL vs. reference. |
 | `--kl-loss-coef` | float | `0.0` | KL weight in loss (0 means monitor). |
 | `--kl-loss-type` | enum | `k1` | `k1`, `k2`, `k3`, `low_var_kl`. |
@@ -270,7 +273,7 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--rm-type` | enum | – | Built-in reward: `math`, `dapo`, `deepscaler`, `f1`, `gpqa`, `ifbench`, `remote_rm`, `random`. |
+| `--rm-type` | str | – | Built-in reward: `math`, `dapo`, `deepscaler`, `gemma_math`, `f1`, `gpqa`, `ifbench`, `remote_rm`, `random`, `deterministic_random`. A `boxed_` prefix (e.g. `boxed_math`) extracts `\boxed{}` from the response before grading. |
 | `--rm-url` | str | – | Endpoint when `--rm-type remote_rm`. |
 | `--group-rm` | flag | off | Batched reward computation. |
 | `--custom-rm-path` | str | – | Custom reward function (see [Customization](/user-guide/customization)). |
@@ -283,8 +286,8 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--sglang-router-ip` | str | – | External router IP. Miles starts its own router if unset. |
-| `--sglang-router-port` | int | – | External router port. |
+| `--sglang-router-ip` | str | – | Must stay unset: external router mode was removed. Miles always starts its own router. |
+| `--sglang-router-port` | int | – | Pins the port of the router miles starts; model `i` gets `port + i`. Unset lets it move off a busy port. |
 | `--sglang-*` | passthrough | | Any flag accepted by `python -m sglang.launch_server` works with this prefix. |
 | `--router-*` | passthrough | | Any flag accepted by the active router works with this prefix. |
 
@@ -294,11 +297,12 @@ Common `--sglang-*` flags:
 --sglang-mem-fraction-static 0.8
 --sglang-context-length 32768
 --sglang-log-level INFO
---sglang-enable-ep-moe
+--sglang-ep-size 8
 --sglang-enable-dp-attention
---sglang-enable-deepep
---sglang-enable-overlap-schedule
---sglang-cuda-graph-backend-prefill       # prefill graphs default to disabled in colocate mode
+--sglang-moe-a2a-backend deepep
+--sglang-moe-runner-backend triton
+--sglang-deepep-mode auto
+--sglang-cuda-graph-backend-prefill  # prefill graphs default to disabled in colocate mode
 ```
 
 ### Agentic sessions
@@ -315,7 +319,8 @@ contract, session behavior, and model-family selection.
 | `--tito-model` | enum | `default` | TITO model family. Named families load their registered fixed template; `default` is best-effort with a checkpoint-native or custom template. |
 | `--max-seq-len` | int | – | Total tokens per session, including prompts, completions, and environment responses. Registered with the agentic wrapper. |
 | `--session-server-ip` | str | router IP | Session-server bind address. |
-| `--session-server-port` | int or start/end | auto | One port, or a half-open port range `[start, end)` for multiple instances. |
+| `--session-server-port` | int | auto | First port for standalone session-server instances. When unset, each worker port is auto-allocated. |
+| `--session-server-workers` | int | `32` | Number of instances, at least 1; an explicit `--session-server-port` anchors a consecutive range. |
 | `--session-sample-picker-path` | `<module>.<fn>` | `drop_retries` | v2 only: selects leaf samples before post-processing. |
 | `--session-sample-postprocessor-path` | `<module>.<fn>` | `default_postprocess` | v2 only: finalizes loss masks and rewards. |
 

@@ -45,9 +45,6 @@ the largest models all live on Megatron-LM. See
 - **Fault tolerance.** When an SGLang engine dies, Miles
   [recovers it and resumes the run in place](/advanced/fault-tolerance): no restart, no
   pause.
-- **Miles dashboard.** A self-hosted web UI for a run's
-  [training dynamics and compute efficiency](/user-guide/dashboard): what every GPU was
-  doing during a step, and what each trajectory contained at the token level.
 
 ### What Miles runs
 
@@ -84,9 +81,15 @@ of the box, including older generations of the families below.
 | **Nemotron** | [Nemotron-3-Ultra-550B-A55B](/models/nemotron/nemotron-3-ultra)<br/>[Nemotron-3-Super-120B-A12B-FP8](/models/nemotron/nemotron-3-super)<br/>[Nemotron-3-Nano MoE](/models/nemotron/nemotron-3-nano-moe)<br/>[Nemotron-3-Nano](/models/nemotron/nemotron-3-nano) |
 | **Gemma** | [Gemma-4 26B-A4B](/models/gemma/gemma-4)<br/>[Gemma-4 31B](/models/gemma/gemma-4) |
 | **JoyAI** | [JoyAI-LLM-Flash](https://github.com/radixark/miles/blob/main/scripts/run_joy_ai_llm_flash.py) |
+| **Stable Diffusion** | [SD3.5](/diffusion/models/sd3/sd3) |
+| **Qwen-Image** | [Qwen-Image](/diffusion/models/qwen-image/qwen-image) |
+| **Wan** | [Wan2.2-T2V-A14B](/diffusion/models/wan/wan2-2) |
+| **LTX** | [LTX-2.3](/diffusion/models/ltx/ltx2) |
+| **Cosmos** | [Cosmos3-Nano](/diffusion/models/cosmos/cosmos3) |
+| **MiniMax** | [MiniMax H3](/diffusion/models/h3/h3) |
 
-See [Models](/models/index) for the full family lists, exact conversion commands, launch
-scripts, and parallelism settings.
+See [Models](/models/index) for LLM family guides and [Diffusion](/diffusion) for
+diffusion recipes and validation details.
 
 ## Supported hardware
 
@@ -98,6 +101,7 @@ and the container images for each.
 
 ## News
 
+- [2026/08] 🔥 Miles v0.1 is released! Read the blog post here: [Miles v0.1: Production-level Post-training](https://www.lmsys.org/blog/2026-08-18-miles-v0-1).
 - [2026/07] Towards Blackwell-Native 8-bit and 4-bit RL: End-to-End MXFP8 and NVFP4 RL in Miles ([blog](https://www.lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl)).
 - [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support)).
 - [2026/07] On-policy distillation lands in Miles ([blog](https://www.lmsys.org/blog/2026-07-18-opd-support-in-miles)).
@@ -133,5 +137,5 @@ from hardware and cloud to model labs, agent infrastructure, and academia:
 ## Contribute
 
 - GitHub: [github.com/radixark/miles](https://github.com/radixark/miles)
-- Slack: [slack.sglang.ai](https://slack.sglang.ai), channel `#miles`
+- Slack: [slack.sglang.ai](https://slack.sglang.ai), channel `#miles-rl`
 - Contributing: [developer guide](/developer/contributor-guide)

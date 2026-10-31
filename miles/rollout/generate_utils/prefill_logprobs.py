@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
@@ -7,15 +8,25 @@ from typing import Any
 from miles.rollout.generate_utils.generate_endpoint_utils import compute_routing_headers, policy_uses_routing_key
 from miles.utils.http_utils import post
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
-from miles.utils.multi_lora import slot_lora_name
 from miles.utils.processing_utils import encode_image_for_rollout_engine
 from miles.utils.types import Sample
 
 
+def rollout_logprobs_need_recompute(sample: Sample) -> bool:
+    """Only incomplete or non-finite accepted decode scores trigger repair."""
+    if sample.response_length == 0 or sample.status == Sample.Status.ABORTED:
+        return False
+    values = sample.rollout_log_probs
+    if values is None or len(values) != sample.response_length:
+        return True
+    try:
+        return any(value is None or not math.isfinite(float(value)) for value in values)
+    except (TypeError, ValueError):
+        return True
+
+
 def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
-    """Adapter name to score under: the sample slot's __miles_slot_{N} name, the fixed single-LoRA name, or None."""
-    if sample.adapter is not None:
-        return slot_lora_name(sample.adapter.slot)
+    """Adapter name to score under: the fixed single-LoRA name, or None."""
     if lora_rollout_enabled(args):
         return LORA_ADAPTER_NAME
     return None
@@ -106,8 +117,8 @@ def _extract_response_logprobs(sample: Sample, meta_info: Mapping[str, Any]) -> 
         )
 
     response_logprobs = [item[0] for item in response_items]
-    if any(logprob is None for logprob in response_logprobs):
-        raise ValueError("SGLang prefill scoring returned None for a response-token logprob")
+    if any(logprob is None or not math.isfinite(float(logprob)) for logprob in response_logprobs):
+        raise ValueError("SGLang prefill scoring returned a missing or non-finite response-token logprob")
 
     return response_logprobs
 
@@ -119,8 +130,9 @@ async def recompute_rollout_logprobs_via_prefill(
     url: str,
     sampling_params: Mapping[str, Any],
     headers: Mapping[str, str] | None = None,
+    force: bool = False,
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not force and not getattr(args, "recompute_logprobs_via_prefill", False):
         return
     if sample.response_length == 0:
         sample.rollout_log_probs = []
@@ -140,8 +152,9 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     *,
     url: str,
     sampling_params: Mapping[str, Any],
+    force: bool = False,
 ) -> None:
-    if not getattr(args, "recompute_logprobs_via_prefill", False):
+    if not force and not getattr(args, "recompute_logprobs_via_prefill", False):
         return
 
     samples_to_score = [
@@ -187,4 +200,5 @@ async def recompute_samples_rollout_logprobs_via_prefill(
             url=url,
             sampling_params=sampling_params,
             headers=headers,
+            force=force,
         )

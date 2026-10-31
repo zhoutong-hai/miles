@@ -73,7 +73,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     model_org: str = "zai-org"
     model_name: str = "GLM-5"
     megatron_model_type: str = "glm5-744B-A40B"
-    num_gpus_per_node: int = 8
+    num_gpus_per_node: int | None = None
     fp8_rollout: bool = False
     use_deepep: bool = True
     megatron_use_deepep: bool = True
@@ -87,9 +87,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     model_dir: str = "/root/models"
     model_local_dir: str = "/root/models"
     megatron_path: str = "/root/Megatron-LM"
-    hardware: Literal["H200", "B200", "GB300"] = "H200"
+    hardware: Literal["auto", "H200", "B200", "GB300"] = "auto"
 
     def __post_init__(self):
+        self.hardware = U.resolve_hardware(self)
+        self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.hardware == "GB300":
             assert not self.megatron_use_deepep, (
                 "Known issue: Megatron's DeepEP fail on GB300. " "Please specify --no-megatron-use-deepep."
@@ -344,12 +346,12 @@ def _execute_train(args: ScriptArgs):
         sglang_args += "--prefill-num-servers 1 "
     sglang_args += (
         # use flashmla backend for better precision
-        "--sglang-nsa-decode-backend flashmla_sparse "
-        "--sglang-nsa-prefill-backend flashmla_sparse "
+        "--sglang-dsa-decode-backend flashmla_sparse "
+        "--sglang-dsa-prefill-backend flashmla_sparse "
         "--sglang-kv-cache-dtype bf16 "
         "--sglang-attention-backend nsa "
         "--sglang-page-size 64 "
-        f"--sglang-cuda-graph-max-bs {sglang_decode_max_bs} "
+        f"--sglang-cuda-graph-max-bs-decode {sglang_decode_max_bs} "
         # concurrency
         f"--sglang-max-running-requests 512 "
         f"--sglang-chunked-prefill-size {2048 * sglang_world_size} "

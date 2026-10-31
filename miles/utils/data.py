@@ -229,7 +229,7 @@ class Dataset:
             else:
                 output_prompt = prompt
 
-            if processor:
+            if processor and isinstance(prompt, list):
                 from miles.utils.processing_utils import process_vision_info
 
                 assert isinstance(

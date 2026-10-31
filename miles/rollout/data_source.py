@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from miles.utils.data import Dataset
-from miles.utils.misc import load_function
+from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -140,13 +140,34 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        if self.args.load is None:
+        e007_cursor_root = os.environ.get("E007_CURSOR_ROOT")
+        if os.environ.get("E007_ATTEMPT_PLAN"):
+            from e007.hooks import attempt_plan
+            mode = attempt_plan()["progress"]["mode"]
+            if mode == "fresh":
+                if e007_cursor_root:
+                    raise RuntimeError("fresh e007 run must not inherit a dataset cursor")
+                return
+            if not e007_cursor_root:
+                raise RuntimeError("e007 continuation requires a bound dataset cursor")
+        cursor_root = e007_cursor_root or self.args.load
+        if cursor_root is None:
             return
-
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        if e007_cursor_root:
+            from e007.hooks import require_restore_update
+            require_restore_update(rollout_id + 1)
+            if not Path(cursor_root).is_absolute() or Path(cursor_root).is_symlink():
+                raise RuntimeError("unsafe e007 cursor root")
+        path = os.path.join(cursor_root, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        if e007_cursor_root:
+            path = os.path.join(cursor_root, f"global_dataset_state_dict_{rollout_id}.pt")
         if not os.path.exists(path):
+            if e007_cursor_root:
+                raise FileNotFoundError(f"required e007 cursor is absent: {path}")
             logger.info(f"Checkpoint {path} does not exist.")
             return
+        if e007_cursor_root and Path(path).is_symlink():
+            raise RuntimeError("e007 cursor cannot be a symlink")
 
         logger.info(f"load metadata from {path}")
         logger.info(f"load metadata: {self.metadata}")
@@ -156,6 +177,14 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = state_dict.get("sample_group_index", 0)
         self.sample_index = state_dict.get("sample_index", 0)
         self.metadata = state_dict.get("metadata", {})
+        if e007_cursor_root:
+            from e007.hooks import validate_cursor
+            next_batch = self.dataset.samples[self.sample_offset : self.sample_offset + self.args.rollout_batch_size]
+            if len(next_batch) < self.args.rollout_batch_size:
+                if self.args.rollout_shuffle:
+                    raise RuntimeError("e007 wrapped cursor requires the pinned unshuffled schedule")
+                next_batch += self.dataset.samples[:self.args.rollout_batch_size - len(next_batch)]
+            validate_cursor(state_dict, [sample.metadata for sample in next_batch])
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle:
             self.dataset.shuffle(self.epoch_id)

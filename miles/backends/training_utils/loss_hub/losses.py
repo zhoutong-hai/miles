@@ -10,7 +10,6 @@ from miles.backends.training_utils.cp_utils import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
-from miles.backends.training_utils.loss_hub import policy_observations
 from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss_hub.math_utils import (
     compute_approx_kl,
@@ -19,9 +18,9 @@ from miles.backends.training_utils.loss_hub.math_utils import (
     compute_opsm_mask,
     compute_policy_loss,
 )
-from miles.backends.training_utils.loss_hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
-from miles.utils.misc import load_function
+from miles.backends.training_utils.sampling_mask import get_rollout_sampling_masks
+from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
 
 
@@ -67,7 +66,7 @@ def policy_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute policy loss (PPO/GSPO or direct REINFORCE) and metrics.
+    """Compute policy loss (PPO/GSPO) and metrics.
 
     Computes current log-probabilities and entropy from model logits, then
     calculates PPO-style clipped policy gradient loss. For GSPO, gathers
@@ -92,7 +91,6 @@ def policy_loss_function(
         are enabled.
     """
     parallel_state = get_parallel_state()
-    reinforce = getattr(args, "loss_type", "policy_loss") == "reinforce"
     advantages_list = [advantage.detach() for advantage in batch["advantages"]]
     advantages = torch.cat(advantages_list, dim=0)
     rollout_old_log_probs = (
@@ -113,7 +111,8 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
-    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy or bool(getattr(args, "sfc_diagnostics_dir", None))
+    calculate_entropy = args.entropy_coef != 0 or args.observe_training_entropy
+    rollout_sampling_mask = get_rollout_sampling_masks(batch) if args.use_sampling_support_replay else None
 
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -124,6 +123,7 @@ def policy_loss_function(
         with_entropy=calculate_entropy,
         entropy_requires_grad=args.entropy_coef != 0,
         max_seq_lens=max_seq_lens,
+        rollout_sampling_mask=rollout_sampling_mask,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -207,15 +207,9 @@ def policy_loss_function(
         advantages.new_zeros(()),
     )
 
-    if reinforce:
-        # The correction below uses detached training scores. Differentiate
-        # only this score-function term, retaining the original token reducer.
-        pg_loss = -advantages * torch.where(active_tokens, log_probs, 0.0)
-        pg_clipfrac = torch.zeros_like(advantages)
-    else:
-        pg_loss, pg_clipfrac = compute_policy_loss(
-            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
-        )
+    pg_loss, pg_clipfrac = compute_policy_loss(
+        ppo_kl, advantages, args.eps_clip, args.eps_clip_high, getattr(args, "eps_clip_c", None)
+    )
 
     if getattr(args, "dump_details", None) is not None:
         from miles.backends.training_utils.debug_dump import maybe_dump_policy_loss_debug
@@ -257,7 +251,6 @@ def policy_loss_function(
         ois = (-ppo_kl).exp()
         tis_kwargs = {
             "args": args,
-            "advantages": advantages,
             "pg_loss": pg_loss,
             "train_log_probs": trainer_scored_log_probs,
             "rollout_log_probs": rollout_old_log_probs,
@@ -280,7 +273,6 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
             denominators=batch.get("rollout_mask_sums", None),
-            fixed_response_normalizer=getattr(args, "grpo_fixed_response_normalizer", None),
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
@@ -293,13 +285,6 @@ def policy_loss_function(
         )
     else:
         pg_loss_reducer = sum_of_sample_mean
-
-    if getattr(args, "sfc_diagnostics_dir", None):
-        policy_observations.observe(
-            args, batch, logits, logp=log_probs, trainer_logp=trainer_scored_log_probs,
-            rollout_logp=rollout_old_log_probs, advantages=advantages, active=active_tokens,
-            entropy=torch.cat(log_probs_and_entropy["entropy"]), token_loss=pg_loss,
-        )
 
     # ESS (Effective Sample Size) ratio from per-token IS weights
     # w = π_new/π_old = exp(-ppo_kl).  A value of 1.0 is on-policy; near 0
@@ -351,9 +336,9 @@ def policy_loss_function(
         if args.kl_loss_coef != 0:
             loss = loss + args.kl_loss_coef * kl_loss
 
-    # make sure the gradient could backprop correctly.
+    # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     train_scored_log_probs = old_log_probs
     train_rollout_logprob_abs_diff = None
@@ -381,10 +366,10 @@ def policy_loss_function(
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
         "entropy_loss": entropy_loss.clone().detach(),
+        "pg_clipfrac": pg_clipfrac.clone().detach(),
+        "ppo_kl": ppo_kl.clone().detach(),
+        "ess_ratio": ess_ratio_sum.squeeze(),
     }
-    if not reinforce:
-        reported_loss.update(pg_clipfrac=pg_clipfrac.clone().detach(),
-                             ppo_kl=ppo_kl.clone().detach(), ess_ratio=ess_ratio_sum.squeeze())
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -397,8 +382,7 @@ def policy_loss_function(
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
-        if not reinforce:
-            reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
+        reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
         # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
@@ -512,9 +496,9 @@ def sft_loss_function(
     log_probs = torch.cat(log_probs, dim=0)
     loss = -sum_of_sample_mean(log_probs)
 
-    # make sure the gradient could backprop correctly.
+    # make sure the gradient could backprop correctly; fp32 sum avoids fp16 inf -> nan
     if log_probs.numel() == 0:
-        loss += 0 * logits.sum()
+        loss += 0 * logits.sum(dtype=torch.float32)
 
     return (
         loss,
@@ -524,14 +508,16 @@ def sft_loss_function(
     )
 
 
-def get_loss_function(args: Namespace) -> LossFunction:
+def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFunction:
+    if loss_fn is not None:
+        from miles.backends.training_utils.loss_hub.tinker_losses import TINKER_LOSS_FUNCTIONS
+
+        return TINKER_LOSS_FUNCTIONS[loss_fn]
     match args.loss_type:
-        case "policy_loss" | "reinforce":
+        case "policy_loss":
             return policy_loss_function
         case "value_loss":
             return value_loss_function
-        case "score_centering":
-            return score_centering_loss_function
         case "sft_loss":
             return sft_loss_function
         case "custom_loss":

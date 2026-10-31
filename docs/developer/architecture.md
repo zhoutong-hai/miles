@@ -53,6 +53,7 @@ miles/
 │   ├── sglang_rollout.py # legacy v1 rollout function
 │   ├── data_source.py    # buffer + JSONL loader
 │   ├── filter_hub/       # built-in filters
+│   ├── rm_hub/           # built-in reward types (`--rm-type` dispatch)
 │   ├── fully_async_*.py  # queue-backed producer for train_async.py
 │   └── inference_rollout/# default class-based rollout
 ├── router/               # FastAPI proxy + worker load-balancer (router.py)
@@ -67,7 +68,7 @@ is loaded only when a run names its import path in a flag (`--spec`, or one of t
 per-architecture weight bridges, `megatron_bridge/` the `megatron.bridge` shims, and
 `optimizers/` optimizer plugins.
 
-`train.py`, `train_async.py` and `train_multi_lora_async.py` are the entry points. They are
+`train.py` and `train_async.py` are the entry points. They are
 thin; most logic lives in the modules above.
 
 ## A request's life
@@ -102,7 +103,7 @@ from the trainer loop and uses a continuously-running worker.
 | You want to … | Edit |
 |---|---|
 | Add a new RL algorithm | `miles/backends/training_utils/loss.py` and `loss_hub/`, plus the enum in `miles/utils/arguments.py` |
-| Add a new built-in reward type | `miles/rollout/sglang_rollout.py` (rm dispatch) |
+| Add a new built-in reward type | `miles/rollout/rm_hub/` (the `rm_type` dispatch lives in its `__init__.py`) |
 | Add a new built-in filter | `miles/rollout/filter_hub/` |
 | Support a new architecture on Megatron | `miles_plugins/models/<model>.py` + a bridge in `miles_plugins/mbridge/` |
 | Support a new architecture on FSDP | `miles/backends/fsdp_utils/adaptations/specs/<arch>.py` |

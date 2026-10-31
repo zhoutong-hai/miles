@@ -58,10 +58,10 @@ def validate_policy_diagnostics_args(args):
     if getattr(args, "save_full_lora_state", False):
         if (
             args.num_rollout != 40
-            or args.save_interval != 20
+            or args.save_interval not in (10, 20)
             or not args.save
             or args.no_save_optim
             or args.no_save_rng
             or args.async_save
         ):
-            raise ValueError("Selected full-state run requires40 updates, sync saves every20, optimizer and RNG")
+            raise ValueError("Selected full-state run requires40 updates, sync ten/twenty-update saves, optimizer and RNG")

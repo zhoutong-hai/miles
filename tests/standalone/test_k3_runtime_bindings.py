@@ -67,3 +67,24 @@ def test_structural_publication_has_exact_finite_version_bound(monkeypatch):
     for version in (0, 42, True, 1.):
         with pytest.raises(ValueError):
             publication_mode(version)
+
+
+@pytest.mark.parametrize("interval,accepted", [(10, True), (20, True), (5, False), (40, False)])
+def test_full_policy_validator_admits_selected_save_cadence(interval, accepted):
+    from miles.utils.policy_diagnostics import validate_policy_diagnostics_args
+
+    args = SimpleNamespace(loss_type="reinforce", advantage_estimator="grpo", skip_actor_forward_only=True,
+                           use_rollout_logprobs=False, use_tis=True, tis_clip_low=.5, tis_clip=2.,
+                           entropy_coef=0., kl_coef=0., use_kl_loss=False,
+                           policy_diagnostics_dir="/private/diagnostics", calculate_per_token_loss=True,
+                           qkv_format="thd", rollout_top_p=1., rollout_top_k=-1, rollout_temperature=1.,
+                           policy_audit_updates=[1, 5, 10, 20, 30, 40],
+                           policy_probe_updates=[0, 1, 5, 10, 20, 30, 40],
+                           policy_fixed_probe="/sealed/probe", policy_fixed_probe_sha256="sealed",
+                           save_full_lora_state=True, num_rollout=40, save_interval=interval, save="/private/save",
+                           no_save_optim=False, no_save_rng=False, async_save=False)
+    if accepted:
+        validate_policy_diagnostics_args(args)
+    else:
+        with pytest.raises(ValueError, match="ten/twenty-update"):
+            validate_policy_diagnostics_args(args)

@@ -738,8 +738,8 @@ def save_resumable_optimizer_state(
 
     global EXPECTED_OPTIMIZER_STEP
     EXPECTED_OPTIMIZER_STEP = int(iteration) + 1
-    if EXPECTED_OPTIMIZER_STEP not in (20, 40):
-        raise RuntimeError("E012 selected full-state saves are updates20 and40 only")
+    if EXPECTED_OPTIMIZER_STEP not in (10, 20, 30, 40):
+        raise RuntimeError("E012 selected full-state saves are updates10,20,30,40 only")
     rank = dist.get_rank() if dist.is_initialized() else 0
     manifest = _optimizer_manifest(model, optimizer, scheduler)
     raw_snapshots = manifest.pop("raw_snapshots")
@@ -1019,8 +1019,8 @@ def restore_resumable_optimizer_state(
     rank = dist.get_rank() if dist.is_initialized() else 0
     iteration = int(training_state.get("iteration", -1))
     EXPECTED_OPTIMIZER_STEP = iteration + 1
-    if EXPECTED_OPTIMIZER_STEP not in (20, 40):
-        raise RuntimeError("E012 restore expects selected update20 or40")
+    if EXPECTED_OPTIMIZER_STEP not in (10, 20, 30, 40):
+        raise RuntimeError("E012 restore expects selected update10,20,30,40")
     summary = validate_saved_optimizer_reference(
         adapter_dir,
         training_state.get("optimizer_full_state"),

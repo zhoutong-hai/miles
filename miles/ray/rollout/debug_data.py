@@ -1,11 +1,13 @@
 import json
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 
 import torch
 
 from miles.utils.types import Sample
+from miles.ray.rollout.private_dump import PrivateDumpWriter, load_rollout_payload
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +112,7 @@ def load_debug_rollout_data(args, rollout_id: int) -> tuple[list[Sample], dict]:
     return data, metadata
 
 
-def save_debug_rollout_data(args, data, rollout_id, evaluation: bool, metadata: dict | None = None) -> None:
+def save_debug_rollout_data(args, data, rollout_id, evaluation: bool, metadata: dict | None = None, *, writer=None) -> None:
     # TODO to be refactored (originally Buffer._set_data)
     if (path_template := args.save_debug_rollout_data) is not None:
         path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
@@ -122,9 +124,17 @@ def save_debug_rollout_data(args, data, rollout_id, evaluation: bool, metadata: 
         stem = ("eval_" if evaluation else "") + str(rollout_id)
         save_dashboard_columns(samples, path.parent.parent / "dashboard_columns" / f"rollout_{stem}.parquet")
 
-        # TODO may improve the format
-        dump_data = dict(samples=[sample.to_dict() for sample in samples])
-        torch.save(dict(rollout_id=rollout_id, metadata=metadata or {}, **dump_data), path)
+        if writer is not None:
+            writer.submit(path, samples, rollout_id=rollout_id, evaluation=evaluation, metadata=metadata)
+        elif os.environ.get("MILES_PRIVATE_ROLLOUT_FORMAT") == "sharded-v1":
+            synchronous_writer = PrivateDumpWriter()
+            try:
+                synchronous_writer.submit(path, samples, rollout_id=rollout_id, evaluation=evaluation, metadata=metadata)
+            finally:
+                synchronous_writer.close()
+        else:
+            dump_data = dict(samples=[sample.to_dict() for sample in samples])
+            torch.save(dict(rollout_id=rollout_id, metadata=metadata or {}, **dump_data), path)
 
 
 class RolloutDataInjectionUtil:
@@ -190,7 +200,7 @@ class RolloutDataInjectionUtil:
 
 
 def _load_rollout_data_file(path: Path) -> tuple[list[Sample], dict]:
-    payload = torch.load(path, weights_only=False)
+    payload = load_rollout_payload(path)
     data = [Sample.from_dict(sample) for sample in payload["samples"]]
     metadata = payload.get("metadata") or {}
     return data, metadata

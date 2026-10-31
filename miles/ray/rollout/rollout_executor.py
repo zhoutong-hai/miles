@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 
 import ray
@@ -8,6 +9,7 @@ from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleet
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
+from miles.ray.rollout.private_dump import PrivateDumpWriter
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.train_data_conversion import (
     ROLLOUT_DATA_VALUE_SPEC,
@@ -96,12 +98,20 @@ class RolloutExecutor:
         self._eval_fleet: EvalFleet | None = None
 
         self._metric_checker = MetricChecker.maybe_create(args)
+        self._private_dump_writer = None
+        if os.environ.get("MILES_PRIVATE_ROLLOUT_FORMAT") == "sharded-v1":
+            self._private_dump_writer = PrivateDumpWriter(
+                chunk_bytes=int(os.environ.get("MILES_PRIVATE_ROLLOUT_CHUNK_BYTES", 64 << 20)),
+                queue_chunks=int(os.environ.get("MILES_PRIVATE_ROLLOUT_QUEUE_CHUNKS", 2)),
+            )
 
     # -------------------------- lifecycle -----------------------------
     # TODO: may have a `async def init` here later
 
     def dispose(self):
         try:
+            if self._private_dump_writer is not None:
+                self._private_dump_writer.close()
             if (close := getattr(self.data_source, "close", None)) is not None:
                 close()
             event_analyzer.run_analysis_from_args(self.args)
@@ -126,8 +136,9 @@ class RolloutExecutor:
             dashboard_hooks.report_data_buffer(get_buffer_length())
         with timer("rollout"):
             data, metadata, metrics = await self._get_rollout_data(rollout_id=rollout_id)
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata)
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=False, metadata=metadata,
+                                writer=self._private_dump_writer)
         data = convert_samples_to_train_data(
             self.args,
             data,
@@ -170,8 +181,9 @@ class RolloutExecutor:
                     evaluation=True,
                 )
         data = result.data
-        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
         metrics = log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True,
+                                writer=self._private_dump_writer)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
         return metrics
@@ -200,13 +212,14 @@ class RolloutExecutor:
                 return self.report_eval_skip(rollout_id, e.reason)
 
             data = result.data
-            save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
             extra_metrics = dict(result.metrics or {})
             extra_metrics["eval/lag_steps"] = max(self.rollout_id - rollout_id, 0)
             extra_metrics["eval/duration_seconds"] = time.time() - start_time
             if export_time_seconds is not None:
                 extra_metrics["eval/export_time_seconds"] = export_time_seconds
             metrics = log_eval_rollout_data(rollout_id, self.args, data, extra_metrics)
+            save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True,
+                                    writer=self._private_dump_writer)
             if self._metric_checker is not None:
                 self._metric_checker.on_eval(metrics)
 

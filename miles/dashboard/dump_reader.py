@@ -28,6 +28,7 @@ import polars as pl
 import torch
 
 from miles.backends.training_utils.cp_utils import assemble_log_prob_from_cp, get_logits_and_tokens_offset_with_cp
+from miles.ray.rollout.private_dump import load_rollout_payload
 from miles.utils.types import LEGACY_WEIGHT_VERSIONS_KEY, Sample, WeightVersionsPerCall
 
 
@@ -878,7 +879,7 @@ class DumpReader:
 
     def _torch_load(self, path: Path, *, mmap: bool = False):
         try:
-            return torch.load(path, weights_only=False, map_location="cpu", mmap=mmap)
+            return load_rollout_payload(path, mmap=mmap)
         except FileNotFoundError:
             raise
         except Exception as e:

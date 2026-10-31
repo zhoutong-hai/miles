@@ -232,7 +232,7 @@ async def generate(
     if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
-    if args.use_rollout_routing_replay:
+    if args.use_rollout_routing_replay and not evaluation:
         payload["return_routed_experts"] = True
     if getattr(args, "use_rollout_indexer_replay", False):
         payload["return_indexer_topk"] = True

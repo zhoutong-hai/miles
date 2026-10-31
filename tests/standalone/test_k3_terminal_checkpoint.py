@@ -49,9 +49,10 @@ def fixture_checkpoint(root, completed=20):
     return args, path, cursor
 
 
-@pytest.mark.parametrize("completed", [20, 40])
+@pytest.mark.parametrize("completed", [10, 20, 30, 40])
 def test_complete_written_last_and_immutable(tmp_path, completed):
     args, path, _ = fixture_checkpoint(tmp_path, completed)
+    args.save_interval = 10
     assert not (path / "FULL_STATE_COMPLETE.json").exists()
     seal_terminal_checkpoint(args, completed - 1)
     marker = json.loads((path / "FULL_STATE_COMPLETE.json").read_text())
@@ -61,16 +62,16 @@ def test_complete_written_last_and_immutable(tmp_path, completed):
         seal_terminal_checkpoint(args, completed - 1)
 
 
-def test_capacity_includes_both_retained_and_inflight_generations(tmp_path, monkeypatch):
+def test_capacity_includes_four_retained_and_inflight_generations(tmp_path, monkeypatch):
     import shutil
 
-    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=179))
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=339))
     with pytest.raises(ValueError, match="Insufficient"):
         admit_terminal_save(tmp_path, expected_payload_bytes=80, reserve_bytes=20)
-    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=180))
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(free=340))
     assert (
         admit_terminal_save(tmp_path, expected_payload_bytes=80, reserve_bytes=20)["total_slots_including_inflight"]
-        == 2
+        == 4
     )
 
 
@@ -125,7 +126,7 @@ def test_unselected_save_positions_are_rejected(tmp_path, completed):
         seal_terminal_checkpoint(args, completed - 1)
 
 
-@pytest.mark.parametrize("completed", [20, 40])
+@pytest.mark.parametrize("completed", [10, 20, 30, 40])
 def test_full_optimizer_writer_admits_both_selected_positions(tmp_path, monkeypatch, completed):
     from miles.backends.megatron_utils.lora import resumable_optimizer
 
@@ -140,13 +141,13 @@ def test_full_optimizer_writer_admits_both_selected_positions(tmp_path, monkeypa
         resumable_optimizer.save_resumable_optimizer_state(
             tmp_path, iteration=completed - 1, model=[], optimizer=None, scheduler=None
         )
-    with pytest.raises(RuntimeError, match="updates20 and40"):
+    with pytest.raises(RuntimeError, match="updates10,20,30,40"):
         resumable_optimizer.save_resumable_optimizer_state(
-            tmp_path, iteration=9, model=[], optimizer=None, scheduler=None
+            tmp_path, iteration=8, model=[], optimizer=None, scheduler=None
         )
 
 
-@pytest.mark.parametrize("completed", [20, 40])
+@pytest.mark.parametrize("completed", [10, 20, 30, 40])
 def test_full_save_provenance_and_remaining_capacity(tmp_path, monkeypatch, completed):
     from miles.backends.megatron_utils.lora import resumable_optimizer, terminal_checkpoint
 
@@ -162,18 +163,18 @@ def test_full_save_provenance_and_remaining_capacity(tmp_path, monkeypatch, comp
     monkeypatch.setattr(resumable_optimizer, "save_resumable_optimizer_state", lambda *a, **k: {})
     admitted = []
     monkeypatch.setattr(terminal_checkpoint, "admit_terminal_save", lambda *a, **k: admitted.append(k))
-    if completed == 40:
-        prior = tmp_path / "save/iter_0000019/adapter/FULL_STATE_COMPLETE.json"
+    for previous in range(10, completed, 10):
+        prior = tmp_path / f"save/iter_{previous - 1:07d}/adapter/FULL_STATE_COMPLETE.json"
         prior.parent.mkdir(parents=True)
         write_json(
             prior,
             {
-                "provenance": {"completed_update": 20, "run_id": "i001", "source": "source"},
+                "provenance": {"completed_update": previous, "run_id": "i001", "source": "source"},
                 "payload_bytes": 3_000_000_000_000,
             },
         )
     state = save_full_state(
-        SimpleNamespace(num_rollout=40, save_interval=20, save=str(tmp_path / "save")),
+        SimpleNamespace(num_rollout=40, save_interval=10, save=str(tmp_path / "save")),
         tmp_path,
         iteration=completed - 1,
         model=[],
@@ -182,6 +183,19 @@ def test_full_save_provenance_and_remaining_capacity(tmp_path, monkeypatch, comp
     )
     assert state["provenance"]["completed_update"] == completed
     assert state["provenance"]["next_rollout_id"] == completed
-    assert admitted[0]["remaining_generations"] == (2 if completed == 20 else 1)
-    if completed == 40:
+    assert admitted[0]["remaining_generations"] == (50 - completed) // 10
+    assert admitted[0]["total_slots"] == 4
+    if completed > 10:
         assert admitted[0]["expected_payload_bytes"] == 3_000_000_000_000
+
+
+def test_all_four_generations_remain_after_terminal_seal(tmp_path):
+    seals = {}
+    for completed in (10, 20, 30, 40):
+        args, path, _ = fixture_checkpoint(tmp_path, completed)
+        args.save_interval = 10
+        seal_terminal_checkpoint(args, completed - 1)
+        marker = path / "FULL_STATE_COMPLETE.json"
+        seals[marker] = marker.read_bytes()
+    assert len(seals) == 4
+    assert all(path.read_bytes() == value for path, value in seals.items())

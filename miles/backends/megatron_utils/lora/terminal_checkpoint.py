@@ -15,11 +15,12 @@ from miles.backends.training_utils.loss_hub.policy_metrics import sha256, write_
 
 
 def admit_terminal_save(
-    path, *, expected_payload_bytes=1_511_634_979_713, reserve_bytes=100_000_000_000, remaining_generations=2
+    path, *, expected_payload_bytes=1_511_634_979_713, reserve_bytes=100_000_000_000,
+    remaining_generations=4, total_slots=4
 ):
-    """Reserve remaining saves; retain both generations including inflight. No deletion."""
-    if remaining_generations not in (1, 2):
-        raise ValueError("Selected saving run has exactly two total generation slots")
+    """Reserve only future writes; retain every selected generation. No deletion."""
+    if total_slots not in (2, 4) or not 1 <= remaining_generations <= total_slots:
+        raise ValueError("Selected saving run has two or four total generation slots")
     root = Path(path)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     free = shutil.disk_usage(root).free
@@ -29,15 +30,16 @@ def admit_terminal_save(
         "free_bytes": free,
         "expected_payload_bytes": expected_payload_bytes,
         "reserve_bytes": reserve_bytes,
-        "total_slots_including_inflight": 2,
+        "total_slots_including_inflight": total_slots,
         "remaining_generations": remaining_generations,
     }
 
 
 def _selected_boundary(args, rollout_id):
     completed = int(rollout_id) + 1
-    if args.num_rollout != 40 or args.save_interval != 20 or completed not in (20, 40):
-        raise ValueError("Selected E012 full-state saves are completed updates20 and40 within40 updates")
+    if (args.num_rollout != 40 or args.save_interval not in (10, 20)
+            or completed not in range(args.save_interval, 41, args.save_interval)):
+        raise ValueError("Selected E012 full-state save is outside its declared ten/twenty-update cadence")
     return completed
 
 
@@ -65,19 +67,21 @@ def save_full_state(args, path, *, iteration, model, optimizer, scheduler):
 
     completed = _selected_boundary(args, iteration)
     expected_payload = 1_511_634_979_713
-    if completed == 40:
-        prior_path = Path(args.save) / "iter_0000019" / "adapter" / "FULL_STATE_COMPLETE.json"
+    boundaries = tuple(range(args.save_interval, 41, args.save_interval))
+    for prior_update in (update for update in boundaries if update < completed):
+        prior_path = Path(args.save) / f"iter_{prior_update - 1:07d}" / "adapter" / "FULL_STATE_COMPLETE.json"
         prior = json.loads(prior_path.read_text())
         provenance = prior["provenance"]
         if (
-            provenance["completed_update"] != 20
+            provenance["completed_update"] != prior_update
             or provenance["run_id"] != os.environ["MILES_EXPERIMENT_RUN_ID"]
             or provenance["source"] != os.environ["MILES_SOURCE_COMMIT"]
         ):
-            raise ValueError("Retained update20 full state must belong to this same run and source")
+            raise ValueError("Every retained full state must belong to this same run and source")
         expected_payload = max(expected_payload, prior["payload_bytes"])
     admit_terminal_save(
-        args.save, expected_payload_bytes=expected_payload, remaining_generations=2 if completed == 20 else 1
+        args.save, expected_payload_bytes=expected_payload,
+        remaining_generations=sum(update >= completed for update in boundaries), total_slots=len(boundaries)
     )
     source = os.environ["MILES_SOURCE_COMMIT"]
     run_id = os.environ["MILES_EXPERIMENT_RUN_ID"]
@@ -116,7 +120,7 @@ def save_full_state(args, path, *, iteration, model, optimizer, scheduler):
 
 def prepare_rank_receipt(path, *, rank, state):
     if (
-        state.get("iteration") not in (19, 39)
+        state.get("iteration") not in (9, 19, 29, 39)
         or not state.get("opt_param_scheduler")
         or not state.get("rng_state")
         or state["provenance"]["completed_update"] != state["iteration"] + 1
@@ -165,7 +169,7 @@ def seal_terminal_checkpoint(args, rollout_id):
         "provenance": reference,
         "rank_count": count,
         "rank_receipts": receipts,
-        "checkpoint_role": "PERIODIC" if completed == 20 else "TERMINAL",
+        "checkpoint_role": "TERMINAL" if completed == args.num_rollout else "PERIODIC",
         "payload_bytes": sum(saved["bytes"] for receipt in receipts for saved in receipt["files"]),
         "cursor": seal_file(cursor),
         "adapter_config": seal_file(path / "adapter_config.json"),

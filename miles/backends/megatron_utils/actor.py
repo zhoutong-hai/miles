@@ -538,7 +538,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if getattr(self.args, "save_full_lora_state", False) and rollout_id == 0:
             from miles.backends.megatron_utils.lora.terminal_checkpoint import admit_terminal_save
 
-            admit_terminal_save(self.args.save)
+            slots = self.args.num_rollout // self.args.save_interval
+            admit_terminal_save(self.args.save, remaining_generations=slots, total_slots=slots)
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         num_optimizer_steps = len(num_microbatches)
         skip_actor_forward_only = self.args.skip_actor_forward_only

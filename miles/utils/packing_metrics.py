@@ -58,7 +58,15 @@ def record_actor_packing(*, rollout_id, args, rollout_data, data_iterator, micro
         tp_size=parallel_state.tp.size,
         pad_multiplier=args.data_pad_size_multiplier,
     )
-    phase_seconds = {name: timers[name] for name in ("log_probs", "actor_train", "train")}
+    # A single-step actor can reuse its mandatory training forward instead of
+    # running a separate scoring pass. In that path no log_probs timer exists;
+    # report the omitted phase explicitly rather than inventing a duration.
+    skipped = (
+        ["log_probs"]
+        if getattr(args, "skip_actor_forward_only", False) and "log_probs" not in timers
+        else []
+    )
+    phase_seconds = {name: timers[name] for name in ("log_probs", "actor_train", "train") if name not in skipped}
     if any(not math.isfinite(value) or value <= 0 for value in phase_seconds.values()):
         raise ValueError("Missing or invalid actual actor phase times")
     receipt = {
@@ -73,6 +81,8 @@ def record_actor_packing(*, rollout_id, args, rollout_data, data_iterator, micro
         "phase_timers_overlap": True,
         **summary,
     }
+    if skipped:
+        receipt.update(schema=2, skipped_phases=skipped)
     root = Path(os.environ["MILES_RUN_DIR"]) / "performance" / "packing"
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"rollout-{rollout_id}-dp-{parallel_state.effective_dp.rank}.json"

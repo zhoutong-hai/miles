@@ -119,3 +119,38 @@ def test_observer_is_after_actor_optimization_and_before_dump():
     actor_timer = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == "timer" and isinstance(node.args[0], ast.Constant) and node.args[0].value == "actor_train")
     dump = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "save_debug_train_data")
     assert actor_timer.lineno < observer.lineno < dump.lineno
+
+
+def test_training_score_reuse_omits_unexecuted_scoring_timer(monkeypatch, tmp_path):
+    monkeypatch.setenv("MILES_RECORD_THROUGHPUT", "1")
+    monkeypatch.setenv("MILES_RUN_DIR", str(tmp_path))
+    data = record_inputs()
+    data["args"].skip_actor_forward_only = True
+    del data["timers"]["log_probs"]
+    before = copy.deepcopy(data["timers"])
+    record_actor_packing(**data)
+    result = json.loads((tmp_path / "performance/packing/rollout-3-dp-0.json").read_text())
+    assert result["schema"] == 2 and result["skipped_phases"] == ["log_probs"]
+    assert result["phase_seconds"] == {"actor_train": 413.0, "train": 466.0}
+    assert data["timers"] == before
+
+
+def test_missing_required_scoring_timer_still_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("MILES_RECORD_THROUGHPUT", "1")
+    monkeypatch.setenv("MILES_RUN_DIR", str(tmp_path))
+    data = record_inputs()
+    del data["timers"]["log_probs"]
+    with pytest.raises(KeyError, match="log_probs"):
+        record_actor_packing(**data)
+
+
+@pytest.mark.parametrize("phase,value", [("actor_train", 0.), ("train", float("nan")), ("train", float("inf"))])
+def test_reuse_still_requires_finite_positive_executed_phases(monkeypatch, tmp_path, phase, value):
+    monkeypatch.setenv("MILES_RECORD_THROUGHPUT", "1")
+    monkeypatch.setenv("MILES_RUN_DIR", str(tmp_path))
+    data = record_inputs()
+    data["args"].skip_actor_forward_only = True
+    del data["timers"]["log_probs"]
+    data["timers"][phase] = value
+    with pytest.raises(ValueError, match="phase times"):
+        record_actor_packing(**data)

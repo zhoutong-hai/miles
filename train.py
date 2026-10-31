@@ -74,7 +74,7 @@ async def train(args):
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
         await inference_controller.prepare_eval()
-        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint, accepted_optimizer_update=0)
 
     async def offload_train():
         if args.use_critic:
@@ -103,9 +103,9 @@ async def train(args):
     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
         if args.start_rollout_id == 0:
-            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint, accepted_optimizer_update=0)
         else:
-            await eval_dispatcher.dispatch(args.start_rollout_id - 1)
+            await eval_dispatcher.dispatch(args.start_rollout_id - 1, accepted_optimizer_update=args.start_rollout_id)
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -174,7 +174,7 @@ async def train(args):
 
         if eval_due:
             await inference_controller.prepare_eval()
-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1, accepted_optimizer_update=rollout_id + 1)
 
         if os.environ.get("E007_EARLY_STOP_REQUEST") and eval_due:
             from e007.validation_stop import maybe_stop

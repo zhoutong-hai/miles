@@ -25,10 +25,16 @@ class EvalDispatcher:
         self.pending: deque[tuple[int, ray.ObjectRef, str | None]] = deque()
         self._exported: list[str] = []
 
-    async def dispatch(self, rollout_id: int, hf_dir: str | None = None, force: bool = False) -> None:
+    async def dispatch(self, rollout_id: int, hf_dir: str | None = None, force: bool = False, accepted_optimizer_update: int | None = None) -> None:
         """A caller-supplied ``hf_dir`` is an existing checkpoint, not one of our exports."""
         if not self.args.eval_uses_snapshots:
-            await self.rollout_manager.eval.remote(rollout_id)
+            metrics = await self.rollout_manager.eval.remote(rollout_id)
+            if accepted_optimizer_update is None or not isinstance(metrics, dict):
+                raise RuntimeError("driver evaluation is missing its accepted-update identity or numeric row")
+            from miles.utils.tracking_utils import tracking
+            tracking.define_step_key_metric_group("eval", "eval/optimizer_update")
+            metrics = dict(metrics, **{"eval/optimizer_update": accepted_optimizer_update})
+            tracking.log(self.args, metrics, step_key="eval/step")
             return
 
         await self._reap_finished()

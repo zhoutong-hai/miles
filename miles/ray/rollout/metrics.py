@@ -51,6 +51,10 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
                 f"eval/{key}-",
             )
 
+    if args.policy_diagnostics_dir:
+        from miles.utils.k3_reward_metrics import summarize_evaluation
+
+        log_dict.update(summarize_evaluation(data))
     logger.info(f"eval {rollout_id}: {log_dict}")
 
     step = compute_rollout_step(args, rollout_id)

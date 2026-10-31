@@ -46,7 +46,12 @@ def define_step_key_metric_group(prefix: str, step_key: str) -> None:
 
 def log(args, metrics, step_key: str):
     step = metrics.get(step_key)
-    if os.environ.get("E007_ATTEMPT_PLAN"):
+    if os.environ.get("MILES_METRICS_SPOOL_ROOT"):
+        from miles.utils.tracking_utils.durable_metrics import log_durable
+
+        deliver = step_key != "eval/step" or "eval/optimizer_update" in metrics
+        log_durable(metrics, step_key=step_key, deliver=deliver, writer=_manager.log)
+    elif os.environ.get("E007_ATTEMPT_PLAN"):
         from e007.hooks import spool_metrics, mark_tracking_degraded, tracking_degraded
         spool_metrics(metrics, step_key)
         if not tracking_degraded():

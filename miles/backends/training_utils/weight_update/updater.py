@@ -6,8 +6,9 @@ buckets (senders transmit, other ranks join the gathers), and orchestrates
 LoRA adapter pushes.
 """
 
-from e008.publication_paths import publication_root_matches
+from miles.backends.training_utils.k3_publication.publication_paths import publication_root_matches
 
+from miles.backends.training_utils.k3_publication.publication import publication_mode
 import hashlib
 import json
 import logging
@@ -105,7 +106,7 @@ class WeightUpdater:
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return
         self.weight_version += 1
-        e007_hash_mode = "original" if self.weight_version == 1 else "direct"
+        e007_hash_mode = publication_mode(self.weight_version)
 
         e007_phase = {
             "session_prepare_s": 0.0, "pre_stream_barrier_s": 0.0,

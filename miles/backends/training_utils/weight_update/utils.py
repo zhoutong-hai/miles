@@ -1,6 +1,6 @@
 import hashlib
 import time
-from e007.shard_manifest import encode_sender_shards, is_routed_inner
+from miles.backends.training_utils.k3_publication.shard_manifest import encode_sender_shards, is_routed_inner
 
 import torch
 import torch.distributed as dist
@@ -22,6 +22,9 @@ def get_data_replica_rank_and_size(parallel_state: ParallelState, placement: Wei
 
 
 def record_lora_checksums(bucket, checksums, *, mode: str, profile=None) -> None:
+    if mode == "structural":
+        from miles.backends.training_utils.k3_publication.publication import record_structural
+        return record_structural(bucket, checksums, profile)
     if mode not in ("original", "direct"):
         raise ValueError("unknown diagnostic sender checksum mode")
     """Accumulate the sha256 checksums the engines verify at end_weight_update."""

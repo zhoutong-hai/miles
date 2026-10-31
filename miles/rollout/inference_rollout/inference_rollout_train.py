@@ -125,7 +125,8 @@ async def generate_rollout_async(
                 group: list[Sample] = task.result()
             except Exception as e:
                 logger.error(f"[rollout] Task raised exception: {e!r}", exc_info=True)
-                continue
+                # This exact full-coverage canary must not replace failed groups.
+                raise
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]

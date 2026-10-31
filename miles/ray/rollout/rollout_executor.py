@@ -174,6 +174,7 @@ class RolloutExecutor:
         metrics = log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
+        return metrics
 
     async def _eval_checkpoint(
         self, rollout_id: int, hf_dir: str | None, export_time_seconds: float | None, require_marker: bool

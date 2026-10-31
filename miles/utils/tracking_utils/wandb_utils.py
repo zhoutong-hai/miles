@@ -70,6 +70,12 @@ def init_wandb_primary(args):
         init_kwargs["id"] = args.wandb_run_id
         init_kwargs["resume"] = "allow"
 
+    if os.environ.get("MILES_METRICS_SPOOL_ROOT"):
+        if not args.wandb_run_id:
+            raise ValueError("The admitted primary writer requires a stable W&B identity")
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "never"
+
     # Configure settings based on offline/online mode
     if offline:
         init_kwargs["settings"] = _wandb_settings(mode="offline")
@@ -84,6 +90,10 @@ def init_wandb_primary(args):
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
     wandb.init(**init_kwargs)
+    if os.environ.get("MILES_METRICS_SPOOL_ROOT"):
+        from miles.utils.tracking_utils.durable_metrics import record_online_identity
+
+        record_online_identity(wandb.run, args)
 
     _init_wandb_common()
 

@@ -1,7 +1,7 @@
 """Megatron implementations' shared base and factory for the backend-neutral
 HF weight iterator API."""
 
-from e008.publication_paths import publication_root_matches
+from miles.backends.training_utils.k3_publication.publication_paths import publication_root_matches
 
 import json
 import logging

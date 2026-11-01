@@ -236,7 +236,7 @@ def finish(args, outcome):
                 "samples": context["samples"],
                 "capture_seconds": context["capture_seconds"],
                 "audit_seconds": context["audit_seconds"],
-                "outcome": str(outcome).split(".")[-1],
+                "outcome": getattr(outcome, "name", str(outcome).split(".")[-1]),
             },
         )
         if parallel.effective_dp.size > 1:

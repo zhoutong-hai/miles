@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.training_utils.loss_hub import policy_metrics as metrics
 from miles.backends.training_utils.loss_hub.corrections import vanilla_tis_function
 from miles.backends.training_utils.loss_hub.policy_audit import component_statistics, distribution_statistics
@@ -95,7 +96,8 @@ def test_actor_replay_advantage_and_observer_lifecycle(monkeypatch, optimizer_st
 
 
 @pytest.mark.parametrize("advantage", [-0.5, 0.0, 0.5])
-def test_real_native_loss_logging_preserves_gradients(tmp_path, monkeypatch, advantage):
+@pytest.mark.parametrize("outcome", [TrainStepOutcome.NORMAL, TrainStepOutcome.DISCARDED_SHOULD_RETRY])
+def test_real_native_loss_logging_preserves_gradients(tmp_path, monkeypatch, advantage, outcome):
     from miles.backends.training_utils import cp_utils, parallel
     from miles.backends.training_utils.loss_hub import losses, policy_diagnostics
 
@@ -187,7 +189,14 @@ def test_real_native_loss_logging_preserves_gradients(tmp_path, monkeypatch, adv
 
     monkeypatch.setattr(tracking, "define_step_key_metric_group", lambda *a: None)
     monkeypatch.setattr(tracking, "log", lambda *a, **k: None)
-    policy_diagnostics.finish(args, "NORMAL")
+    if outcome != TrainStepOutcome.NORMAL:
+        with pytest.raises(ValueError, match="Invalid policy shard"):
+            policy_diagnostics.finish(args, outcome)
+        seal = json.loads((tmp_path / "paired_scores/update-000001/dp-0.complete.json").read_text())
+        assert seal["outcome"] == outcome.name
+        assert not (tmp_path / "paired_scores/update-000001/complete.json").exists()
+        return
+    policy_diagnostics.finish(args, outcome)
     complete = json.loads((tmp_path / "paired_scores/update-000001/complete.json").read_text())
     assert complete["metrics"]["policy/audit/positions"] == 4
     assert complete["artifact_sha256"]
@@ -247,7 +256,7 @@ def _distributed_observer_worker(rank, root):
     )
     tracking.define_step_key_metric_group = lambda *a: None
     tracking.log = lambda *a, **k: None
-    policy_diagnostics.finish(args, "NORMAL")
+    policy_diagnostics.finish(args, TrainStepOutcome.NORMAL)
     from miles.backends.training_utils.loss_hub.policy_probe import _persist_probe
 
     selected_probe = list(range(rank, 64, 4))

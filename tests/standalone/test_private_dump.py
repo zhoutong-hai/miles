@@ -5,6 +5,7 @@ import asyncio
 from argparse import Namespace
 import base64
 from contextlib import nullcontext
+from copy import deepcopy
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -231,3 +232,49 @@ def test_actor_dispose_flushes_real_writer_before_tracking_finish(tmp_path, monk
                   CheckpointEvalFn=type("CheckpointEvalFn", (), {}))
     method("dispose", values)(owner)
     assert events == ["tracking-finished-after-dump"]
+
+
+@pytest.mark.parametrize("evaluation,replay", [(False, True), (True, True), (False, False), (True, False)])
+def test_selected_single_turn_request_and_response_preserve_q_and_training_r3(evaluation, replay):
+    root = Path(__file__).parents[2]
+    values = dict(Any=Any, Sample=Sample, deepcopy=deepcopy, np=np, pybase64=base64,
+                  should_return_sampling_mask=lambda *a, **k: False,
+                  lora_rollout_enabled=lambda args: False,
+                  GenerateFnInput=SimpleNamespace, GenerateFnOutput=SimpleNamespace)
+    endpoint = root / "miles/rollout/generate_utils/generate_endpoint_utils.py"
+    names = {"compute_request_payload", "update_sample_from_response", "get_routed_experts_from_response",
+             "get_indexer_topk_from_response", "_decode_topk_buffer"}
+    functions = [node for node in ast.parse(endpoint.read_text()).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(endpoint), "exec"), values)
+    routes = np.arange(8, dtype=np.int32).reshape(2, 2, 2)
+
+    async def post(url, payload, headers):
+        assert payload["return_logprob"] is True
+        assert payload["return_routed_experts"] is (replay and not evaluation)
+        info = dict(output_token_logprobs=[[-.25, 13, None]], prompt_tokens=2,
+                    weight_version="1", finish_reason={"type": "stop"})
+        if payload["return_routed_experts"]:
+            info["routed_experts"] = base64.b64encode(routes.tobytes()).decode("ascii")
+        return dict(text="fixture", meta_info=info)
+
+    values.update(post=post, compute_prompt_ids_from_sample=lambda *a: [11, 12],
+                  compute_routing_headers=lambda *a: None)
+    source = root / "miles/rollout/generate_hub/single_turn.py"
+    function = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.AsyncFunctionDef) and node.name == "generate")
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), values)
+    args = Namespace(rollout_max_response_len=512, rollout_max_context_len=65536,
+                     use_rollout_routing_replay=replay, use_rollout_indexer_replay=False,
+                     sglang_router_ip="127.0.0.1", sglang_router_port=1,
+                     num_layers=2, sglang_speculative_algorithm=None)
+    sample = Sample(prompt="fixture", metadata={})
+    result = asyncio.run(values["generate"](SimpleNamespace(
+        args=args, sample=sample, state=None, sampling_params={"max_new_tokens": 1}, evaluation=evaluation)))
+    assert result.samples.tokens == [11, 12, 13]
+    assert result.samples.rollout_log_probs == [-.25]
+    assert result.samples.weight_versions[0].spans[0].version == "1"
+    if replay and not evaluation:
+        assert np.array_equal(result.samples.rollout_routed_experts, routes)
+    else:
+        assert result.samples.rollout_routed_experts is None

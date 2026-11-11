@@ -101,7 +101,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["save_checkpoint", "save_checkpoint_with_lora", "load_checkpoint"]
 
 
-def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
+def _load_checkpoint_existing(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
 
@@ -225,3 +225,8 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
 def _is_dir_nonempty(path):
     with os.scandir(path) as it:
         return any(it)
+
+
+def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
+    from miles.backends.training_utils.e012_resume import load_checkpoint as native_resume_load
+    return native_resume_load(_load_checkpoint_existing, get_args(), ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt, load_lora_adapter)

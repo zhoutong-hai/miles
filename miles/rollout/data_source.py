@@ -150,7 +150,8 @@ class RolloutDataSource(DataSource):
                 return
             if not e007_cursor_root:
                 raise RuntimeError("e007 continuation requires a bound dataset cursor")
-        cursor_root = e007_cursor_root or self.args.load
+        from miles.backends.training_utils.e012_resume import cursor_root as e012_cursor_root
+        cursor_root = e007_cursor_root or e012_cursor_root(self.args.load)
         if cursor_root is None:
             return
         if e007_cursor_root:
@@ -188,6 +189,8 @@ class RolloutDataSource(DataSource):
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle:
             self.dataset.shuffle(self.epoch_id)
+        from miles.backends.training_utils.e012_resume import validate_cursor as validate_e012_cursor
+        validate_e012_cursor(self.args, state_dict, self.dataset.samples[self.sample_offset:self.sample_offset + self.args.rollout_batch_size])
 
 
 class RolloutDataSourceWithBuffer(RolloutDataSource):

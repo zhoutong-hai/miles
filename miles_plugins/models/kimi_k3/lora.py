@@ -100,6 +100,24 @@ def _register_param(
     )
 
 
+class _ExpertFC2LoRAAdd(torch.autograd.Function):
+    """Reuse the private LoRA delta buffer without mutating TE's output view."""
+
+    @staticmethod
+    def forward(ctx, output, delta, scale):
+        if output.shape != delta.shape or output.dtype != delta.dtype:
+            raise ValueError("Expert fc2 base and LoRA delta must have equal shape and dtype")
+        ctx.scale = scale
+        ctx.mark_dirty(delta)
+        return torch.add(output, delta, alpha=scale, out=delta)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_base = grad_output if ctx.needs_input_grad[0] else None
+        grad_delta = grad_output * ctx.scale if ctx.needs_input_grad[1] else None
+        return grad_base, grad_delta, None
+
+
 def _dropout(inputs: torch.Tensor, probability: float, training: bool) -> torch.Tensor:
     if probability and training:
         return F.dropout(inputs, p=probability, training=True)
@@ -461,7 +479,7 @@ def _apply_expert_lora(
                 tokens_per_expert,
             )
             delta = F.linear(inner, adapter.w2_lora_B)
-            return torch.add(output, delta, alpha=scale), bias
+            return _ExpertFC2LoRAAdd.apply(output, delta, scale), bias
 
         fc2.forward = expert_fc2_forward
     experts.lora_adapter = adapter

@@ -3137,8 +3137,11 @@ def miles_validate_args(args):
             args.load = args.ref_load
             if args.ref_ckpt_step is not None:
                 args.ckpt_step = args.ref_ckpt_step
-            if not (os.environ.get("E007_ATTEMPT_PLAN") and args.lora_adapter_path):
+            if not ((os.environ.get("E007_ATTEMPT_PLAN") and args.lora_adapter_path) or os.environ.get("MILES_E012_RESUME_PLAN")):
                 args.start_rollout_id = 0
+
+    from miles.backends.training_utils.e012_resume import validate_args as validate_e012_resume_args
+    validate_e012_resume_args(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."

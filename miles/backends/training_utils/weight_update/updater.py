@@ -71,7 +71,8 @@ class WeightUpdater:
             quantization_config=quantization_config,
         )
         self.weights_getter = weights_getter
-        self.weight_version = 0
+        from miles.backends.training_utils.e012_resume import resume_update
+        self.weight_version = resume_update(args)
         self.is_lora = is_lora
         if is_lora:
             assert lora_sync_config is not None

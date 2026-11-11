@@ -1,0 +1,67 @@
+{
+  "Miles_runtime_file_sha256": {
+    "miles/backends/megatron_utils/actor.py": "97bddd09264dc1085c79c7f7b2810be102f1155f8d729b4ce8d1932e47efcbf4",
+    "miles/backends/megatron_utils/checkpoint.py": "66accb055ea38300762cf59bbb7ec2d2c568248f463ca8c2e1a31e80f9f56033",
+    "miles/backends/megatron_utils/lora/resumable_optimizer.py": "4929d93298745e9195af3f7adbada3e1634164d36ba665bb1282178fca6a49aa",
+    "miles/backends/megatron_utils/lora/terminal_checkpoint.py": "408ae9251c766acbfa8c444db791ab1e542091282c9eb835436c179b565428ea",
+    "miles/backends/training_utils/e012_resume.py": "02396dde0cc09ce5c5e91706a591f6acd5a2218e92151738d99809e5142ac361",
+    "miles/backends/training_utils/loss_hub/k3_startup.py": "acd0f5cfa2f6ad48bfdc87c2070fb08c52578612af2e53f1abdb0f9fa00df3ec",
+    "miles/backends/training_utils/loss_hub/policy_diagnostics.py": "7a1dd1a1d6617383b5e153f03cdcb310445ff93cd0a05bec34daa4f1b9d9f472",
+    "miles/backends/training_utils/loss_hub/policy_probe.py": "7bfd40f6dbe8f583d8a59f8b1de8ef9cfe7ec9d8c84cddd057d40041ce499af3",
+    "miles/backends/training_utils/weight_update/updater.py": "05fba1f272e05313d4cd6f0335065718e29d3414fc70498380b33c39fb4e5d92",
+    "miles/dashboard/dump_reader.py": "8b7a9e2b4d3afc0f0109ccdda3cc7b32394e2c4e75e5fb08c882f51fda108ed9",
+    "miles/ray/rollout/debug_data.py": "b63cabc2b5dcf176e20efc217e697e8e39223d737dc5599fe13ecc106b49a2a1",
+    "miles/ray/rollout/private_dump.py": "9923601e9dced33a10f25a772b53a5f5f3766fb45e688bac4ed4e3195221e4e2",
+    "miles/ray/rollout/rollout_executor.py": "02d8d1102d51f2f28b7f20510a4ee908d23a1f88178beb85a7004d670179c1f3",
+    "miles/rollout/data_source.py": "433730390f5e13d196e6344a2773daa20aeab71fb930f2ace02f9475cea6050b",
+    "miles/rollout/generate_utils/generate_endpoint_utils.py": "ccf1aafd6470b4e84ff5db2fab30801c49c4179d9aa7a62cf2cf74cccd9f456e",
+    "miles/rollout/sglang_rollout.py": "783af751652d011c7ee03738c8a2af8b292ad6e7b20c565419c0b36b6a2e43c4",
+    "miles/utils/arguments.py": "6c83a9ccaecbcb8f15d98f9e5e3e9b8e2b9e088938bc87666d711aec1bf9554e",
+    "miles/utils/policy_diagnostics.py": "88704d2d9746f03d1b60ce67e69a80e84dd9f08da0bebaec89315fa64b264f2d",
+    "miles_plugins/models/kimi_k3/lora.py": "1631968d9106445fe573327e8e3866c7069f1d66302c05d501d10ec015d0bbaf",
+    "miles_plugins/models/kimi_k3/ops.py": "98a790d240a9aeceb2e9944a01600cd7162e34b44e11be9f8812d8be31b43c57"
+  },
+  "base_archive_source_commit": "87d896d782eb8c47b7073cebe1d7c3fb212ab5e7",
+  "historical_git_pin": "d8de2f80f980695d1ae8f328b982cb999d835d33",
+  "historical_manifest_sha256": "d2d51b1ac91bc3abd53179ed1f7a3fe41c33ee2e0ba7516d94de8eb34f2ee172",
+  "publication_checks": {
+    "GPU_tests": "NOT_RUN",
+    "all_20_Miles_runtime_hashes": "MATCH_ORIGINAL_R16_MANIFEST",
+    "changed_python_AST": "PASS",
+    "focused_CPU_tests": {
+      "failed": 0,
+      "files": [
+        "tests/standalone/test_k3_terminal_checkpoint.py",
+        "tests/standalone/test_k3_runtime_bindings.py",
+        "tests/standalone/test_k3_startup_observer.py"
+      ],
+      "passed": 36
+    },
+    "provider_calls": 0
+  },
+  "purpose": "Historical E012 K3 R16 Miles source snapshot; no new launch or runtime qualification",
+  "qualification": "Preserves earlier receipt-bound payloads; publication itself is not fresh GPU acceptance. Not K3.1 migration.",
+  "related_runtime_files_not_in_this_Miles_snapshot": {
+    "arrakis/projects/miles_rl/main_model/common/launch.py": "905a8129e1503e93ba50494fea7ed393cb5968f3125e4bd306a065dfcb4f290b",
+    "arrakis/projects/miles_rl/main_model/common/rewards/adapter.py": "dcf2a8002197199ce1525fc13e27be3bbc541f1aee38eeb0d3c2c8fb63af55ca",
+    "arrakis/projects/miles_rl/main_model/common/rewards/config.py": "f18e35bf1b2501bae4d9227c86f76b7281a800a3730820b4cc2829b891d7c8a9",
+    "arrakis/projects/miles_rl/main_model/common/rewards/logging.py": "2c803b8cdba83203fa957255cab84c011bf04478bae3bf6f49d34cec7d02789b",
+    "arrakis/projects/miles_rl/main_model/common/rewards/normalization.py": "eb961b81f1d523efc9c1a91fc3db954cad2f9becd05f824aea543b087a5ccd07",
+    "arrakis/projects/miles_rl/main_model/common/rewards/protocol_failures.py": "340c7d01c7dffb7c22c25a806e177367e1adecd4e71aef8d7297b3686679b666",
+    "arrakis/projects/miles_rl/main_model/common/rewards/runtime.py": "fbcbd64fcc68ed3af38a350d731e2093180ec3c8764c3831aa840d101078761a",
+    "arrakis/projects/miles_rl/main_model/common/rewards/tests/test_kimik3_context.py": "a9d97a6d7b20f3435688fbd277959861468efb1da27f39e5c6158703e669a1a9",
+    "arrakis/projects/miles_rl/main_model/common/rewards/tests/test_kimik3_rewards.py": "2ceea54d59172cab1c2d2b464054988b11378862a5d959c0df46842f6decd07f",
+    "arrakis/projects/miles_rl/main_model/common/rewards/tests/test_protocol_failures.py": "e9e5eafc57ccb9f9fa58cf475726b3594bf8f4cdbe9c56f338cd244de8a7a65f",
+    "arrakis/projects/miles_rl/main_model/common/tests/test_kimik3_recipe.py": "123e03976d6e3ebc30f2157a1423aeeff21155cc56e159f7ac99f349443f9e19",
+    "arrakis/projects/verifiers/all_verifiers/style/style_verifiable_functions.py": "75ce4a9a6b68fb570ca39065951bd4a76b0bab3fa53d3afcc78eee0e2a70e945",
+    "arrakis/projects/verifiers/registry.py": "23072d54b7a88296b9bedfc35b53964df9fe31346d436bfa63481029218cddf4",
+    "arrakis/projects/verifiers/test_registry.py": "44417e781f59584d6672878efcb129cc50d34bd48c56c18dc55cf51b40111769"
+  },
+  "runtime_dependencies": {
+    "arrakis": "78063ae667fc4baca60bde4f4e63639d31ba6d46",
+    "megatron": "96fe16ecb280f0365f68fe0dc8a33e2e27b4cb95",
+    "sglang": "67e4cd1885155bf9b08366b348c59d5b79a7fb7b"
+  },
+  "schema_version": 1,
+  "source_manifest": "hippocraticaidev/skypilot-infra:zhoutong-scripts/auto-experiments/e012-kimi-k3-prototye/.local/launches/training-r16/launch-manifest.json (private local staging; intentionally excluded from Git)"
+}

@@ -39,7 +39,7 @@ def kda(
     return output
 
 
-def situ_and_mul(
+def _situ_and_mul_reference(
     x: torch.Tensor,
     beta: float = 4.0,
     linear_beta: float = 25.0,
@@ -48,6 +48,68 @@ def situ_and_mul(
     gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
     linear = linear_beta * torch.tanh(linear / linear_beta)
     return (gate * linear).to(x.dtype)
+
+
+_SITU_CHUNK_ELEMENTS = 16_777_216
+
+
+class _ChunkedSiTU(torch.autograd.Function):
+    """Bound FP32 pointwise temporaries while retaining native SiTU math."""
+
+    @staticmethod
+    def forward(ctx, x, beta, linear_beta):
+        ctx.save_for_backward(x)
+        ctx.beta, ctx.linear_beta = beta, linear_beta
+        width = x.shape[-1]
+        rows = max(1, _SITU_CHUNK_ELEMENTS // width)
+        flat = x.view(-1, width)
+        output = torch.empty((*x.shape[:-1], width // 2), dtype=x.dtype, device=x.device)
+        target = output.view(-1, width // 2)
+        for start in range(0, flat.shape[0], rows):
+            target[start : start + rows].copy_(
+                _situ_and_mul_reference(flat[start : start + rows], beta, linear_beta)
+            )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        width = x.shape[-1]
+        rows = max(1, _SITU_CHUNK_ELEMENTS // width)
+        flat = x.view(-1, width)
+        incoming = grad_output.reshape(-1, width // 2)
+        if torch.is_grad_enabled():
+            # Higher derivatives are not the bounded training path; retain the native whole graph.
+            with torch.enable_grad():
+                output = _situ_and_mul_reference(x, ctx.beta, ctx.linear_beta)
+                (gradient,) = torch.autograd.grad(output, x, grad_output, create_graph=True)
+            return gradient, None, None
+        gradient = torch.empty_like(x)
+        target = gradient.view(-1, width)
+        for start in range(0, flat.shape[0], rows):
+            with torch.enable_grad():
+                chunk = flat[start : start + rows].detach().requires_grad_(True)
+                output = _situ_and_mul_reference(chunk, ctx.beta, ctx.linear_beta)
+                (value,) = torch.autograd.grad(output, chunk, incoming[start : start + rows])
+            target[start : start + rows].copy_(value)
+        return gradient, None, None
+
+
+def situ_and_mul(
+    x: torch.Tensor,
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
+) -> torch.Tensor:
+    # Keep all tokens and the original FP32 expression; only tile large contiguous inputs.
+    if (
+        x.numel() <= _SITU_CHUNK_ELEMENTS
+        or not x.is_contiguous()
+        or x.shape[-1] % 2
+        or not isinstance(beta, (int, float))
+        or not isinstance(linear_beta, (int, float))
+    ):
+        return _situ_and_mul_reference(x, beta, linear_beta)
+    return _ChunkedSiTU.apply(x, beta, linear_beta)
 
 
 class KimiRMSNorm(nn.Module):

@@ -205,3 +205,5 @@ def restore_full_state(path, state, *, model, optimizer, scheduler):
     torch.set_rng_state(rng["torch_cpu"])
     torch.cuda.set_rng_state_all(rng["torch_cuda_all"])
     get_cuda_rng_tracker().set_states(rng["megatron"])
+    from miles.backends.training_utils.e012_resume import verify_rng
+    verify_rng(args, rng)

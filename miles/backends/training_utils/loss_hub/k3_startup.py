@@ -64,6 +64,8 @@ def run_startup(args, model, optimizer):
 
     parallel = get_parallel_state()
     assert (parallel.tp.size, parallel.pp.size, parallel.cp.size, parallel.effective_dp.size, parallel.ep.size) == (8, 4, 1, 4, 32)
+    from miles.backends.training_utils.e012_resume import resume_update
+    start_update = resume_update(args)
     path = Path(os.environ["MILES_K3_LONGEST_PROBE"])
     assert hashlib.sha256(path.read_bytes()).hexdigest() == os.environ["MILES_K3_LONGEST_PROBE_SHA256"]
     packet = torch.load(path, map_location="cpu", weights_only=False)
@@ -95,7 +97,7 @@ def run_startup(args, model, optimizer):
     try:
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]), torch.no_grad():
             iterator, microbatches = get_data_iterator(configuration, model, data)
-            result = forward_only(_probe_callback, configuration, model, iterator, microbatches, rollout_id=0)
+            result = forward_only(_probe_callback, configuration, model, iterator, microbatches, rollout_id=start_update)
             torch.cuda.synchronize()
             if parallel.is_pp_last_stage:
                 assert sum(int(value.sum()) for value in result["probe_count"]) == 512
@@ -117,20 +119,21 @@ def run_startup(args, model, optimizer):
         "rank": dist.get_rank(), "world": dist.get_world_size(), **trainable,
         "longest_native_prompt_tokens": 46033, "synthetic_memory_only_response_tokens": 512,
         "forward_seconds": time.perf_counter() - started, "backward_memory_qualified": False,
-        "optimizer_updates": 0, "frozen_parameters_excluded_from_optimizer": True,
+        "optimizer_updates": start_update, "frozen_parameters_excluded_from_optimizer": True,
         "router_tensor_sha256": before, "router_preserved": True,
         "source": os.environ["MILES_SOURCE_COMMIT"], "probe_sha256": os.environ["MILES_K3_LONGEST_PROBE_SHA256"],
         "cuda_allocated_bytes": torch.cuda.memory_allocated(), "cuda_reserved_bytes": torch.cuda.memory_reserved()})
-    run_fixed_probe(args, model, completed=0)
+    run_fixed_probe(args, model, completed=start_update)
     assert rng_seal(tracker) == initial_rng_seal
     assert router_seals(model) == before
     write_json(directory / f"probe-neutrality-rank-{dist.get_rank():03d}.json", {
         "rank": dist.get_rank(), "longest_and_fixed64_RNG_neutral": True,
-        "router_weights_and_loaded_biases_preserved": True, "optimizer_updates": 0})
+        "router_weights_and_loaded_biases_preserved": True, "optimizer_updates": start_update})
 
 
 def verify_first_update(args, model, completed):
-    if completed != 1 or not os.environ.get("MILES_K3_LONGEST_PROBE"):
+    from miles.backends.training_utils.e012_resume import resume_update
+    if completed != resume_update(args) + 1 or not os.environ.get("MILES_K3_LONGEST_PROBE"):
         return
     assert router_seals(model) == _ROUTER_SEALS
     validate_trainable(model)

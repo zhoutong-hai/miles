@@ -87,13 +87,21 @@ class AlgoConfig(BaseConfig):
     loss_type: A[
         str,
         Arg(
-            choices=["policy_loss", "sft_loss", "custom_loss", "score_centering"],
+            choices=["policy_loss", "sft_loss", "custom_loss", "score_centering", "reinforce"],
             help=(
                 "Choose loss type, currently support ppo policy_loss or sft_loss, "
                 "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
             ),
         ),
     ] = "policy_loss"
+    policy_loss_aggregation: A[str, Arg(choices=["global-token", "prompt-mean"])] = "global-token"
+    mis_positive_low: A[float, Arg()] = 0.2
+    mis_positive_high: A[float, Arg()] = 5.0
+    mis_negative_low: A[float, Arg()] = 0.5
+    mis_negative_high: A[float, Arg()] = 2.0
+    reinforce_diagnostics_dir: A[str | None, Arg()] = None
+    reinforce_router_interval: A[int, Arg()] = 0
+    reinforce_sparse_interval: A[int, Arg()] = 0
     score_centering_is: A[str, Arg(choices=["none", "tis", "mis"])] = "none"
     score_centering_tis_clip: A[float, Arg()] = 2.0
     score_centering_mis_low: A[float, Arg()] = 0.5

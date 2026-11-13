@@ -164,9 +164,14 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
             if args.offload_rollout:
                 await inference_controller.onload_kv()
 
+        if args.loss_type == "reinforce" and args.reinforce_diagnostics_dir:
+            from miles.utils.reinforce_observations import finalize
+
+            finalize(args, rollout_id)
+
         if eval_due:
             await inference_controller.prepare_eval()
-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+            await eval_dispatcher.dispatch(rollout_id + (1 if args.loss_type == "reinforce" else 0), force=rollout_id == args.num_rollout - 1)
 
         if (
             args.debug_exit_after_rollout is not None

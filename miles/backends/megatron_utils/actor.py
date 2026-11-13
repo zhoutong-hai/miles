@@ -857,6 +857,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 fn_args = compute_custom_function_config(self.args, self.args.rollout_data_postprocess_path)
                 self.rollout_data_postprocess(fn_args)
 
+            if self.args.loss_type == "reinforce" and self.args.reinforce_diagnostics_dir:
+                from miles.utils.reinforce_observations import configure
+
+                configure(self.args, rollout_id, rollout_data, self.model, self.optimizer, attempt)
+
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
@@ -884,6 +889,11 @@ class MegatronTrainRayActor(TrainRayActor):
         for m in all_replay_managers:
             if m.enabled:
                 m.clear_all()
+
+        if self.args.loss_type == "reinforce" and self.args.reinforce_diagnostics_dir:
+            from miles.utils.reinforce_observations import finish
+
+            finish(self.model, train_step_outcome)
 
         if train_step_outcome == TrainStepOutcome.NORMAL:
             # update the cpu actor weight to the latest model

@@ -503,6 +503,9 @@ def run_forward_backward_pass(
                 "loss_weights",
                 "target_tokens",
                 "sample_indices",
+                "prompt_group_indices",
+                "prompt_group_tokens",
+                "prompt_loss_scales",
                 *sampling_mask_keys,
             ],
             args.data_pad_size_multiplier,
@@ -548,7 +551,7 @@ def run_forward_backward_pass(
                 forward_kwargs.update(x)
 
             output_tensor = model(
-                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
+                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering", "reinforce")
             )
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):

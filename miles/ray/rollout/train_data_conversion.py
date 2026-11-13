@@ -50,6 +50,9 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
+    "prompt_group_indices": ValueSpec(codec="ndarray", dtype="int64"),
+    "prompt_group_tokens": ValueSpec(codec="ndarray", dtype="int64"),
+    "prompt_loss_scales": ValueSpec(codec="ndarray", dtype="float64"),
     "lineage_source_sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_output_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_output_counts": ValueSpec(codec="ndarray", dtype="int64"),
@@ -124,6 +127,13 @@ def convert_samples_to_train_data(
     }
 
     train_data["loss_masks"] = loss_masks
+    if args.loss_type == "reinforce":
+        from miles.utils.reinforce import prompt_factors
+
+        groups = [sample.group_index for sample in samples]
+        factors, totals = prompt_factors(groups, loss_masks, groups=args.rollout_batch_size, siblings=args.n_samples_per_prompt)
+        train_data.update(prompt_group_indices=groups, prompt_loss_scales=factors, prompt_group_tokens=totals)
+
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -516,6 +526,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "loss_masks",
             "round_number",
             "sample_indices",
+            "prompt_group_indices",
+            "prompt_group_tokens",
+            "prompt_loss_scales",
             "lineage_source_sample_indices",
             "lineage_output_indices",
             "lineage_output_counts",

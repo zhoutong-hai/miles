@@ -486,6 +486,10 @@ def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFuncti
     match args.loss_type:
         case "score_centering":
             return score_centering_loss_function
+        case "reinforce":
+            from miles.backends.training_utils.loss.hub.reinforce import reinforce_loss_function
+
+            return reinforce_loss_function
         case "policy_loss":
             return policy_loss_function
         case "value_loss":

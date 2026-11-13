@@ -1960,6 +1960,8 @@ def miles_validate_args(args):
         validate_compile_warmup(args)
 
     validate_score_centering_args(args)
+    if args.loss_type == "reinforce":
+        validate_reinforce_args(args)
 
     _maybe_apply_dumper_overrides(args)
 
@@ -1972,10 +1974,29 @@ def miles_validate_args(args):
     _validate_deploy_component(args)
 
 
+def validate_reinforce_args(args) -> None:
+    """Fail before model startup when the selected pure objective cannot be honored."""
+    required = {
+        "Megatron CP1/PP1": args.train_backend == "megatron" and args.context_parallel_size == args.pipeline_model_parallel_size == 1,
+        "prompt mean and original-token reduction": args.policy_loss_aggregation == "prompt-mean" and args.calculate_per_token_loss,
+        "one fresh group-centered batch": args.advantage_estimator == "grpo" and args.rewards_normalization and not args.grpo_std_normalization,
+        "training-forward score reuse": args.skip_actor_forward_only,
+        "pure detached fixed MIS": not (args.entropy_coef or args.kl_coef or args.use_kl_loss or args.normalize_advantages or args.use_opd),
+        "one captured native loss invocation": not args.recompute_loss_function,
+        "fixed topology and batch": not (args.use_dynamic_global_batch_size or args.multi_lora or args.fully_async),
+        "torch response layout": args.log_probs_backend == "torch" and args.qkv_format == "thd",
+    }
+    if missing := [name for name, met in required.items() if not met]:
+        raise ValueError("REINFORCE requires " + ", ".join(missing))
+    bounds = (args.mis_positive_low, args.mis_positive_high, args.mis_negative_low, args.mis_negative_high)
+    if not (0 < bounds[0] <= bounds[1] and 0 < bounds[2] <= bounds[3]):
+        raise ValueError("Invalid fixed MIS bounds")
+
+
 def validate_skip_actor_forward_only(args) -> None:
     option = "--skip-actor-forward-only"
     assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
-    assert args.loss_type == "policy_loss", f"{option} only supports --loss-type policy_loss"
+    assert args.loss_type in ("policy_loss", "reinforce"), f"{option} requires policy_loss or reinforce"
     assert args.compute_advantages_and_returns, f"{option} requires actor advantage computation"
 
     incompatible_options = [

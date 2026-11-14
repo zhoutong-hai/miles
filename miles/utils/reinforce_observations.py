@@ -64,6 +64,7 @@ def configure(args, rollout_id, rollout_data, model, optimizer, attempt):
         root / f"rank-{rank}-binding.json",
         {
             "rank": rank,
+            "world_size": torch.distributed.get_world_size(),
             "host": os.uname().nodename,
             "source": os.environ["MILES_SOURCE_COMMIT"],
             "LoRA_trainable_numel": numel,
@@ -125,13 +126,26 @@ def finish(model, outcome):
     _write_once(_context["root"] / f"rank-{_context['rank']}-complete.json", {"rank": _context["rank"], "completed_update": _context["rollout"] + 1, "outcome": outcome.name, "bias_before_after": bias, "LoRA_numel": numel})
 
 
+def _normal_receipts(root, completed_update):
+    # Scaling fields belong to the launcher, not the v0.2 OrchestratorConfig.
+    # Each actual trainer records its distributed world before doing any work.
+    bindings = [json.loads(path.read_text()) for path in root.glob("rank-*-binding.json")]
+    worlds = {binding["world_size"] for binding in bindings}
+    if len(worlds) != 1:
+        raise ValueError("Missing or inconsistent native trainer world")
+    [world] = worlds
+    if type(world) is not int or world < 1 or sorted(binding["rank"] for binding in bindings) != list(range(world)):
+        raise ValueError("Incomplete native trainer bindings")
+    receipts = [json.loads((root / f"rank-{rank}-complete.json").read_text()) for rank in range(world)]
+    if any(x["rank"] != rank or x["outcome"] != "NORMAL" or x["completed_update"] != completed_update for rank, x in enumerate(receipts)):
+        raise ValueError("REINFORCE requires every rank's successful ordinary update")
+    return world
+
+
 def finalize(args, rollout_id):
     """Seal only after native training and learned publication both returned successfully."""
     root = Path(args.reinforce_diagnostics_dir) / f"update-{rollout_id + 1:06d}" / "attempt-0"
-    world = args.actor_num_nodes * args.actor_num_gpus_per_node
-    receipts = [json.loads((root / f"rank-{rank}-complete.json").read_text()) for rank in range(world)]
-    if any(x["outcome"] != "NORMAL" or x["completed_update"] != rollout_id + 1 for x in receipts):
-        raise ValueError("REINFORCE requires every rank's successful ordinary update")
+    world = _normal_receipts(root, rollout_id + 1)
     original, actual = {}, {}
     for path in root.glob("rank-*-input.json"):
         for row in json.loads(path.read_text())["rows"]:

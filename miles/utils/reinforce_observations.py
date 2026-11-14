@@ -6,6 +6,7 @@ import math
 import os
 from collections import Counter, defaultdict
 from pathlib import Path
+from urllib.parse import quote
 
 import torch
 
@@ -84,6 +85,7 @@ def configure(args, rollout_id, rollout_data, model, optimizer, attempt):
                     "group": int(rollout_data["prompt_group_indices"][i]),
                     "group_tokens": int(rollout_data["prompt_group_tokens"][i]),
                     "factor": float(rollout_data["prompt_loss_scales"][i]),
+                    "tags": rollout_data["prompt_group_tags"][i],
                     "tokens": rollout_data["tokens"][i][-length:].tolist(),
                     "mask": rollout_data["loss_masks"][i].tolist(),
                     "q": rollout_data["rollout_log_probs"][i].float().tolist(),
@@ -153,6 +155,7 @@ def finalize(args, rollout_id):
     if len(counts) != args.rollout_batch_size or set(counts.values()) != {args.n_samples_per_prompt}:
         raise ValueError("Original complete prompt/sibling population differs")
     tokens, pg, entropy_sum, response_H, mass, square = 0, 0.0, 0.0, 0.0, 0.0, 0.0
+    groups_H, eligible_groups, category_H = defaultdict(list), set(), defaultdict(list)
     for sid, row in actual.items():
         source = original[sid]
         expected_factor = float(torch.tensor(sum(totals.values()) / (len(totals) * totals[source["group"]]), dtype=torch.float32))
@@ -181,7 +184,14 @@ def finalize(args, rollout_id):
             entropy_sum += row["entropy"][j]
             mass += w
             square += w * w
-        response_H += sum(h * m for h, m in zip(row["entropy"], row["mask"], strict=True)) / sum(row["mask"])
+        h = sum(h * m for h, m in zip(row["entropy"], row["mask"], strict=True)) / sum(row["mask"])
+        response_H += h
+        groups_H[row["group"]].append(h)
+        if any(a != 0 for a, m in zip(row["A"], row["mask"], strict=True) if m):
+            eligible_groups.add(row["group"])
+        for key, value in source["tags"].items():
+            if value is not None:
+                category_H[(key, str(value))].append(h)
     metrics = {
         "train/step": rollout_id,
         "train/completed_optimizer_updates": rollout_id + 1,
@@ -191,6 +201,10 @@ def finalize(args, rollout_id):
         "train/sfc/raw_original_tokens": tokens,
         "train/sfc/applied_weight_ess_fraction": mass * mass / (tokens * square) if square else 0.0,
     }
+    metrics["train/sfc/original_nonzero_advantage_group_count"] = len(eligible_groups)
+    if eligible_groups:
+        metrics["train/sfc/entropy_original_nonzero_advantage_groups"] = sum(sum(groups_H[g]) / len(groups_H[g]) for g in eligible_groups) / len(eligible_groups)
+    metrics.update({f"train/sfc/entropy_by_{key}/{quote(value, safe='')}/equal_response_mean": sum(values) / len(values) for (key, value), values in category_H.items()})
     files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.iterdir() if p.is_file()}
     _write_once(root / "complete.json", {"completed_update": rollout_id + 1, "native_NORMAL_ranks": world, "learned_publication_returned": True, "files": files, "metrics": metrics})
     from miles.utils.tracking_utils import tracking

@@ -53,6 +53,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "prompt_group_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "prompt_group_tokens": ValueSpec(codec="ndarray", dtype="int64"),
     "prompt_loss_scales": ValueSpec(codec="ndarray", dtype="float64"),
+    "prompt_group_tags": ValueSpec(codec="msgpack_ragged"),
     "lineage_source_sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_output_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "lineage_output_counts": ValueSpec(codec="ndarray", dtype="int64"),
@@ -133,6 +134,9 @@ def convert_samples_to_train_data(
         groups = [sample.group_index for sample in samples]
         factors, totals = prompt_factors(groups, loss_masks, groups=args.rollout_batch_size, siblings=args.n_samples_per_prompt)
         train_data.update(prompt_group_indices=groups, prompt_loss_scales=factors, prompt_group_tokens=totals)
+        train_data["prompt_group_tags"] = [
+            {key: (sample.metadata or {}).get(key) for key in ("theme", "scenario")} for sample in samples
+        ]
 
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
@@ -529,6 +533,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "prompt_group_indices",
             "prompt_group_tokens",
             "prompt_loss_scales",
+            "prompt_group_tags",
             "lineage_source_sample_indices",
             "lineage_output_indices",
             "lineage_output_counts",

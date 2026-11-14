@@ -52,12 +52,10 @@ def configure(args, rollout_id, rollout_data, model, optimizer, attempt):
     if (root / f"rank-{rank}-complete.json").exists():
         raise ValueError("Unresolved REINFORCE receipt identity cannot be reused")
     bias, numel = _bias_digest(model)
-    from miles.utils.reinforce_audits import attach_routers, optimizer_model_parameters
+    from miles.utils.reinforce_audits import attach_routers, optimizer_membership
     from miles.utils.replay_base import all_replay_managers
 
-    trainable = {id(p) for chunk in model for p in chunk.parameters() if p.requires_grad}
-    if {id(p) for p in optimizer_model_parameters(optimizer)} != trainable:
-        raise ValueError("Native optimizer model groups do not equal the LoRA trainable parameters")
+    membership = optimizer_membership(model, optimizer, state.intra_dp)
     _context = {"root": root, "rank": rank, "writer": state.tp.rank == 0, "rollout": rollout_id, "bias": bias, "trainable_numel": numel}
     interval = args.reinforce_router_interval
     if interval and (rollout_id == 0 or (rollout_id + 1) % interval == 0):
@@ -70,6 +68,7 @@ def configure(args, rollout_id, rollout_data, model, optimizer, attempt):
             "source": os.environ["MILES_SOURCE_COMMIT"],
             "LoRA_trainable_numel": numel,
             "optimizer_excludes_all_frozen_parameters": True,
+            "optimizer_membership": membership,
             "loaded_bias_before": bias,
             "use_rollout_routing_replay": args.use_rollout_routing_replay,
             "replay_layers": {manager.name: len(manager.replays) for manager in all_replay_managers if manager.enabled},

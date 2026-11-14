@@ -1,5 +1,6 @@
 """Bounded CUDA/Megatron diagnostics, independent of the applied REINFORCE graph."""
 
+import hashlib
 import json
 
 import torch
@@ -17,6 +18,45 @@ def optimizer_model_parameters(optimizer):
         return [p for group in groups for p in group]
     return [p for group in optimizer.param_groups for p in group["params"]]
 
+
+def optimizer_membership(model, optimizer, dp):
+    """Prove source membership across the optimizer's actual DP shard population.
+
+    DistributedOptimizer.model_*_groups contain only source parameters with a
+    shard on this DP rank, not the complete trainable inventory on every rank.
+    Never compare FP32 master/shard tensor identities with model parameters.
+    """
+
+    def leaves(value):
+        if hasattr(value, "chained_optimizers"):
+            return [child for item in value.chained_optimizers for child in leaves(item)]
+        return [value]
+
+    children = leaves(optimizer)
+    sharded = [hasattr(child, "model_float16_groups") for child in children]
+    if any(sharded) and not all(sharded):
+        raise ValueError("Mixed sharded/unsharded optimizer membership is unsupported")
+    if any(sharded):
+        expected_ranks = torch.distributed.get_process_group_ranks(dp.group)
+        for child in children:
+            if torch.distributed.get_process_group_ranks(child.data_parallel_group) != expected_ranks:
+                raise ValueError("Optimizer shard DP group differs from model DP group")
+    named = {id(p): (f"chunk{i}/{name}", p) for i, chunk in enumerate(model) for name, p in chunk.named_parameters() if p.requires_grad}
+    ordered = sorted(named.values(), key=lambda item: item[0])
+    local = {id(p) for p in optimizer_model_parameters(optimizer)}
+    catalog = [(name, tuple(p.shape), str(p.dtype)) for name, p in ordered]
+    signature = hashlib.sha256(json.dumps(catalog).encode()).hexdigest()
+    signatures = [None] * dp.size
+    torch.distributed.all_gather_object(signatures, signature, group=dp.group)
+    if len(set(signatures)) != 1:
+        raise ValueError("Trainable source catalogs differ across optimizer DP replicas")
+    device = ordered[0][1].device if ordered else torch.device("cpu")
+    flags = torch.tensor([int(id(p) in local) for _, p in ordered] + [int(bool(local - named.keys()))], dtype=torch.int32, device=device)
+    if any(sharded):
+        torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MAX, group=dp.group)
+    if flags[-1].item() or not bool((flags[:-1] == 1).all()):
+        raise ValueError("Optimizer DP source membership differs from the LoRA trainable inventory")
+    return {"source_parameters": len(named), "local_shard_source_parameters": len(local), "DP_union_verified": bool(any(sharded)), "DP_size": dp.size, "source_catalog_sha256": signature}
 
 def attach_routers(model):
     """Counts describe executed routing, including padding and recomputation."""

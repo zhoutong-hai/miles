@@ -501,6 +501,8 @@ def run_forward_backward_pass(
                 "opd_reverse_kl",
                 "rollout_mask_sums",
                 "loss_weights",
+                "prompt_loss_scale",
+                "entropy_response_scale",
                 "target_tokens",
                 "sample_indices",
                 *sampling_mask_keys,

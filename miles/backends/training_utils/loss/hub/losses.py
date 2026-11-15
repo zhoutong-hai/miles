@@ -15,9 +15,11 @@ from miles.backends.training_utils.loss.hub.math_utils import (
 )
 from miles.backends.training_utils.loss.hub.response_layout import response_layout
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
+from miles.backends.training_utils.loss.hub.sign_metrics import advantage_sign_metrics
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.function_registry import load_function
+from miles.utils.prompt_mean import scale_prompt_losses
 from miles.utils.types import RolloutBatch
 
 
@@ -164,6 +166,10 @@ def policy_loss_function(
 
     local_loss_masks = layout.loss_masks()
     active_tokens = local_loss_masks.bool()
+    if args.policy_loss_aggregation == "prompt-mean" and not all(
+        torch.isfinite(value[active_tokens]).all() for value in (advantages, log_probs, rollout_old_log_probs)
+    ):
+        raise ValueError("Nonfinite original prompt-mean advantages or policy scores")
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
     if args.advantage_estimator == "gspo":
         ppo_kl = compute_gspo_kl(
@@ -252,6 +258,13 @@ def policy_loss_function(
         # [decouple IS and rejection] modified masks correct the numerator only;
         # denominators stay the precomputed rollout_mask_sums.
         sum_of_sample_mean = layout.reducer(modified_response_masks)
+
+    if args.policy_loss_aggregation == "prompt-mean":
+        pg_loss = scale_prompt_losses(
+            pg_loss,
+            batch.get("prompt_loss_scale"),
+            [part.numel() for part in layout.per_sample(pg_loss)],
+        )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if args.custom_pg_loss_reducer_function_path is not None:
@@ -365,6 +378,36 @@ def policy_loss_function(
     if batch.get("opd_reverse_kl") is not None:
         opd_reverse_kl = layout.rows(batch["opd_reverse_kl"])
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+
+    if args.policy_loss_aggregation == "prompt-mean":
+        # The score-reuse ratio is identically one; PPO update metrics are inapplicable.
+        for key in ("pg_clipfrac", "ppo_kl", "ess_ratio", "ois"):
+            reported_loss.pop(key, None)
+    if args.observe_advantage_sign_metrics:
+        ratio = torch.exp(trainer_scored_log_probs.float() - rollout_old_log_probs.float()).detach()
+        weight = ratio.clamp(args.tis_clip_low, args.tis_clip)
+        reported_loss["entropy/equal_nonempty_response_mean"] = sum(
+            (values.detach() * mask).sum() / original.sum().clamp_min(1) * float(scale)
+            for values, mask, original, scale in zip(
+                layout.per_sample(entropy),
+                layout.per_sample(local_loss_masks),
+                batch["loss_masks"],
+                batch["entropy_response_scale"],
+                strict=True,
+            )
+        )
+        reported_loss.update(
+            advantage_sign_metrics(
+                advantages,
+                active_tokens,
+                entropy,
+                weight,
+                ratio,
+                low=args.tis_clip_low,
+                high=args.tis_clip,
+                reduce=sum_of_sample_mean_for_mismatch_metrics,
+            )
+        )
 
     return loss, reported_loss
 

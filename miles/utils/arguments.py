@@ -59,6 +59,7 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_vanilla,
 )
 from miles.utils.output_store.config import check_output_store_args
+from miles.utils.prompt_mean import validate_prompt_mean_args
 from miles.utils.rollout_data_config import RolloutDatasetConfig, check_dataset_length_limits, load_rollout_data_config
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
 from miles.utils.run_uuid import generate_run_uuid, validate_run_uuid
@@ -1960,6 +1961,14 @@ def miles_validate_args(args):
         validate_compile_warmup(args)
 
     validate_score_centering_args(args)
+    validate_prompt_mean_args(args)
+    if args.observe_advantage_sign_metrics and not (
+        args.policy_loss_aggregation == "prompt-mean"
+        and args.use_tis
+        and args.observe_training_entropy
+        and 0 < args.tis_clip_low <= 1 <= args.tis_clip
+    ):
+        raise ValueError("sign metrics require prompt-mean, native TIS spanning one, and training entropy observation")
 
     _maybe_apply_dumper_overrides(args)
 

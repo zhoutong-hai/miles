@@ -320,6 +320,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
             return
 
         await self._refresh_inference_runtime_mut_state()
+        published_versions = dict(self._weight_versions_of_model_id)
         with timer("eval_rollout"):
             if not self.use_legacy_rollout_v1:
                 result = await maybe_await(self.eval_generate_rollout(RolloutFnEvalInput(rollout_id=rollout_id)))
@@ -335,7 +336,14 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
                 )
         data = result.data
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
-        metrics = log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        extra_metrics = dict(result.metrics or {})
+        extra_metrics.pop("eval/optimizer_step", None)
+        # Native actor versions count completed optimizer updates, including after
+        # restore. A rollout ID does not: baseline and the first post-update eval
+        # can share it. Omit the counter for ambiguous or changing live policies.
+        if len(published_versions) == 1 and published_versions == self._weight_versions_of_model_id:
+            extra_metrics["eval/optimizer_step"] = next(iter(published_versions.values()))
+        metrics = log_eval_rollout_data(rollout_id, self.args, data, extra_metrics)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 

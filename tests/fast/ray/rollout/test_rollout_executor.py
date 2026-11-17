@@ -211,6 +211,35 @@ class TestDispose:
 
         assert disposed == ["train", "eval", "sweep"]
 
+    @pytest.mark.parametrize("fail_cleanup", [False, True])
+    async def test_tracking_finishes_once_even_when_cleanup_raises(self, monkeypatch, fail_cleanup) -> None:
+        events = []
+        executor = _inited_executor()
+        executor._disposed = False
+        executor.use_legacy_rollout_v1 = False
+        executor.generate_rollout = None
+        executor.eval_generate_rollout = None
+        executor.data_source = object()
+        executor.args = Namespace()
+        executor._metric_checker = None
+        executor._delete_store_refs = None
+
+        def cleanup(*, args):
+            events.append("cleanup")
+            if fail_cleanup:
+                raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(rollout_executor_module.event_analyzer, "run_sample_ownership_analysis", cleanup)
+        monkeypatch.setattr(rollout_executor_module.event_analyzer, "run_analysis_from_args", lambda args: None)
+        monkeypatch.setattr(rollout_executor_module, "finish_tracking", lambda: events.append("finish"))
+        if fail_cleanup:
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                await executor.dispose()
+        else:
+            await executor.dispose()
+        await executor.dispose()
+        assert events == ["cleanup", "finish"]
+
     async def test_the_final_ownership_check_runs_before_the_run_ends(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Violations that only mature after the last get would otherwise never be checked."""
         checked: list[Namespace] = []

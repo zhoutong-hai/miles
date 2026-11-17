@@ -295,7 +295,7 @@ class AlgoConfig(PolicyAggregationConfig):
     ] = 1e-4
 
 
-class AlgoRolloutOnlyConfig(PolicyAggregationConfig):
+class AlgoRolloutOnlyConfig(BaseConfig):
     grpo_std_normalization: A[
         bool,
         Arg(

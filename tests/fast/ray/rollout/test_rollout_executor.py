@@ -236,6 +236,47 @@ class TestDispose:
         assert checked == [executor.args]
 
 
+class TestLiveEvalOptimizerStep:
+    @pytest.mark.parametrize(
+        "versions,change_version,expected",
+        [
+            ({None: 0}, False, 0),
+            ({None: 2}, False, 2),
+            ({}, False, None),
+            ({"a": 2, "b": 2}, False, None),
+            ({None: 2}, True, None),
+        ],
+    )
+    async def test_uses_stable_published_optimizer_counter_instead_of_rollout_id(
+        self, monkeypatch: pytest.MonkeyPatch, versions: dict, change_version: bool, expected: int | None
+    ) -> None:
+        executor = _inited_executor()
+        executor.args = Namespace(eval_uses_snapshots=False, debug_train_only=False, starts_inference_engines=False)
+        executor.use_legacy_rollout_v1 = False
+        executor._weight_versions_of_model_id = dict(versions)
+        executor._metric_checker = None
+        original_metrics = {"generation_seconds": 1.5}
+
+        async def generate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            if change_version:
+                executor._weight_versions_of_model_id[None] = 3
+            return RolloutFnEvalOutput(data={}, metrics=original_metrics)
+
+        logged = []
+        executor.eval_generate_rollout = generate
+        monkeypatch.setattr(rollout_executor_module, "save_debug_rollout_data", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            rollout_executor_module,
+            "log_eval_rollout_data",
+            lambda rollout_id, args, data, metrics: logged.append((rollout_id, metrics)),
+        )
+        await executor.eval(27)
+        assert logged[0][0] == 27
+        assert logged[0][1].get("eval/optimizer_step") == expected
+        assert logged[0][1]["generation_seconds"] == 1.5
+        assert original_metrics == {"generation_seconds": 1.5}
+
+
 class TestSetEvalFleetInfo:
     async def test_setting_and_clearing_eval_fleet_info_changes_checkpoint_evaluation_routing(
         self, monkeypatch: pytest.MonkeyPatch

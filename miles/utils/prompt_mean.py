@@ -12,7 +12,9 @@ def validate_prompt_mean_args(args):
         args.train_backend == "megatron"
         and args.loss_type == "policy_loss"
         and args.calculate_per_token_loss
-        and args.skip_actor_forward_only
+        # R3 needs a scoring forward to record routing. Its scores are not the
+        # PG baseline: prompt-mean still reuses detached training-forward scores.
+        and (args.skip_actor_forward_only or (args.use_routing_replay and not args.use_rollout_routing_replay))
         and not args.use_rollout_logprobs
         and args.use_tis
         and args.num_steps_per_rollout == 1
@@ -36,7 +38,7 @@ def validate_prompt_mean_args(args):
     )
     if not required:
         raise ValueError(
-            "prompt-mean requires one complete Megatron GRPO score-reuse update, original-token reduction, and no custom shaping/reducers"
+            "prompt-mean requires one complete Megatron GRPO score-reuse update (optional R3 scoring forward), original-token reduction, and no custom shaping/reducers"
         )
 
 

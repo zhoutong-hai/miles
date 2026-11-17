@@ -121,7 +121,9 @@ def policy_loss_function(
     log_probs, entropy = layout.score(
         logits, with_entropy=calculate_entropy, entropy_requires_grad=args.entropy_coef != 0
     )
-    if args.skip_actor_forward_only:
+    # An R3 forward records routes, but must not change the selected direct
+    # REINFORCE gradient or the detached training/q TIS weight in prompt-mean.
+    if args.skip_actor_forward_only or args.policy_loss_aggregation == "prompt-mean":
         trainer_scored_log_probs = log_probs.detach()
     else:
         trainer_scored_log_probs = (

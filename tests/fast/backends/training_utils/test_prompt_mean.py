@@ -86,6 +86,8 @@ def _args(**updates):
         loss_type="policy_loss",
         calculate_per_token_loss=True,
         skip_actor_forward_only=True,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
         use_rollout_logprobs=False,
         num_steps_per_rollout=1,
         global_batch_size=6,
@@ -124,7 +126,8 @@ def _args(**updates):
 
 @pytest.mark.parametrize("split", ["whole", "unequal_microbatches", "dp_cp_slices"])
 @pytest.mark.parametrize("empty_response", [False, True])
-def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empty_response):
+@pytest.mark.parametrize("routing_forward", [False, True])
+def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empty_response, routing_forward):
     torch.manual_seed(42)
     masks = [torch.ones(n) for n in (1, 3, 2, 2, 1, 5)]
     if empty_response:
@@ -157,11 +160,20 @@ def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empt
                 prompt_loss_scale=[factors[i] for i in rows],
                 entropy_response_scale=[response_scale] * len(rows),
             )
+            if routing_forward:
+                # The standalone forward exists to record R3 routes. Deliberately
+                # perturb its scores: PG/TIS must still use the training forward.
+                batch["log_probs"] = list((logits[token_ids].detach().log_softmax(-1)[:, 0] - 3).split(
+                    [len(x) for x in local_masks]
+                ))
 
             def reduce(values, masks=local_masks):
                 return (values * torch.cat(masks)).sum()
 
-            part, frame = _loss_function()(_args(), batch, logits[token_ids], reduce)
+            part, frame = _loss_function()(
+                _args(skip_actor_forward_only=not routing_forward, use_routing_replay=routing_forward),
+                batch, logits[token_ids], reduce,
+            )
             loss = loss + part / normalizer
             for name, value in frame.items():
                 metrics[name] = metrics.get(name, 0) + value / normalizer
@@ -219,6 +231,27 @@ def test_refuse_unsupported_objective_compositions(updates):
     validate_prompt_mean_args(_args())
     with pytest.raises(ValueError):
         validate_prompt_mean_args(_args(**updates))
+
+
+def test_r3_scoring_forward_is_admitted_without_rollout_replay():
+    validate_prompt_mean_args(_args(skip_actor_forward_only=False, use_routing_replay=True))
+    with pytest.raises(ValueError):
+        validate_prompt_mean_args(_args(skip_actor_forward_only=False))
+    with pytest.raises(ValueError):
+        validate_prompt_mean_args(_args(skip_actor_forward_only=False, use_routing_replay=True,
+                                        use_rollout_routing_replay=True))
+
+
+def test_composed_algorithm_cli_registers_prompt_mean_once():
+    import argparse
+    from miles.utils.args.configs.algo import AlgoConfig, AlgoRolloutOnlyConfig
+
+    parser = argparse.ArgumentParser()
+    AlgoConfig.add_arguments(parser)
+    AlgoRolloutOnlyConfig.add_arguments(parser)
+    args = parser.parse_args(["--policy-loss-aggregation", "prompt-mean", "--disable-grpo-std-normalization"])
+    assert args.policy_loss_aggregation == "prompt-mean"
+    assert args.rewards_normalization and not args.grpo_std_normalization
 
 
 def test_empty_group_and_original_denominators():

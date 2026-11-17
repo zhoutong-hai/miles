@@ -44,6 +44,7 @@ from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.test_utils.det_process_group import DET_NCCL_BACKEND_NAME, register_det_nccl_backend
 from miles.utils.test_utils.fault_injector.controller import FaultHookCommand, fault_hook_controller
 from miles.utils.test_utils.fault_injector.models import FaultHookRecord
+from miles.utils.tracking_utils.tracking import finish_tracking
 from miles.utils.workers.env_vars import CELL_INDEX_ENV_VAR
 from miles.utils.workers.rpc.common.metadata import rpc
 from miles.utils.workers.rpc.common.wire_types import Pickled
@@ -96,6 +97,10 @@ class TrainRayActor(NodeProbeMixin):
     token_space_processor: TrainerProcessor | None = None
     # This worker's reader of the SGLang output store; set in __init__ with --use-output-store.
     output_store_read: Callable | None = None
+
+    def finish_tracking(self) -> None:
+        """Drain this worker's tracking backends before its process is stopped."""
+        finish_tracking()
 
     def __init__(
         self,

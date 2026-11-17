@@ -2,7 +2,17 @@ from miles.utils.args.custom_function import CustomFunctionConfig
 from miles.utils.args.schema import A, Arg, BaseConfig
 
 
-class AlgoConfig(BaseConfig):
+class PolicyAggregationConfig(BaseConfig):
+    policy_loss_aggregation: A[
+        str,
+        Arg(
+            choices=["native", "prompt-mean"],
+            help="PG reduction: native defaults or equal original-token means per prompt presentation.",
+        ),
+    ] = "native"
+
+
+class AlgoConfig(PolicyAggregationConfig):
     use_critic: bool
 
     ref_load: A[
@@ -170,6 +180,10 @@ class AlgoConfig(BaseConfig):
                 "When the coefficient is 0, the observed entropy is detached and does not affect backward."
             )
         ),
+    ] = False
+    observe_advantage_sign_metrics: A[
+        bool,
+        Arg(help="Log original-token sign/zero TIS distributions and training entropy masses for prompt-mean PG."),
     ] = False
     get_mismatch_metrics: A[
         bool,

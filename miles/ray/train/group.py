@@ -83,6 +83,7 @@ class TrainerController:
         self._provider = cell_provider
         self._cell_operations = cell_operations
         self._watcher_disposer: StopWatchFn | None = None
+        self._disposed = False
 
         self._indep_dp_quorum_id = 0
         self._indep_dp_store: Any | None = None
@@ -173,9 +174,22 @@ class TrainerController:
         return cell
 
     async def dispose(self) -> None:
-        if (disposer := self._watcher_disposer) is not None:
-            await disposer()
-            self._watcher_disposer = None
+        if self._disposed:
+            return
+        self._disposed = True
+        try:
+            if (disposer := self._watcher_disposer) is not None:
+                await disposer()
+                self._watcher_disposer = None
+        finally:
+            cells = [cell for cell in self._cells if cell.is_alive]
+            results = await asyncio.gather(
+                *(cell.execute("finish_tracking", kill_on_failure=False, timeout=60.0) for cell in cells),
+                return_exceptions=True,
+            )
+            for cell, result in zip(cells, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.warning("Failed to finish tracking for trainer cell %s: %s", cell.cell_id, result)
 
     # ------------------------ API :: train ------------------------
 

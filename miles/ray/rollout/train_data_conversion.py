@@ -18,6 +18,7 @@ from miles.utils.media_refs import has_media
 from miles.utils.object_store import ValueSpec
 from miles.utils.output_store.dropped import has_inline_replay
 from miles.utils.output_store.plan import FIELDS, SamplingMaskSegments, StorePlanError
+from miles.utils.prompt_mean import prompt_mean_scales
 from miles.utils.rollout_topk_logprobs import requests_support_logprobs
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.timer import Timer
@@ -47,6 +48,8 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "seq_witness_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "response_lengths": ValueSpec(codec="ndarray", dtype="int64"),
     "rewards": ValueSpec(codec="ndarray", dtype="float32"),
+    "prompt_loss_scale": ValueSpec(codec="ndarray", dtype="float32"),
+    "entropy_response_scale": ValueSpec(codec="ndarray", dtype="float32"),
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
@@ -124,6 +127,15 @@ def convert_samples_to_train_data(
     }
 
     train_data["loss_masks"] = loss_masks
+    if args.policy_loss_aggregation == "prompt-mean":
+        factors, response_scale = prompt_mean_scales(
+            [sample.group_index for sample in samples],
+            loss_masks,
+            expected_groups=args.rollout_batch_size,
+            expected_fanout=args.n_samples_per_prompt,
+        )
+        train_data["prompt_loss_scale"] = factors
+        train_data["entropy_response_scale"] = [response_scale] * len(samples)
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -351,7 +363,11 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
+        # Mean reduction roundoff must not invent a gradient for a uniform group.
+        if torch.isfinite(rollout_rewards).all() and torch.all(rollout_rewards == rollout_rewards[0]):
+            normalized_rollout_rewards = torch.zeros_like(rollout_rewards)
+        else:
+            normalized_rollout_rewards = rollout_rewards - rollout_rewards.mean()
         # In all-correct groups the only signal is length. Standardizing it would
         # amplify arbitrarily small penalties into full-strength advantages.
         length_only = unshaped_rewards is not None and all(
@@ -537,6 +553,8 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "weight_versions",
             "adapter_slots",
             "loss_weights",
+            "prompt_loss_scale",
+            "entropy_response_scale",
             "advantages",
             "target_tokens",
         ]:

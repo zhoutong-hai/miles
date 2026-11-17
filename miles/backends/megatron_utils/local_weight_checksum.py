@@ -103,13 +103,25 @@ def _collect_optimizer_hashes(
     """Collect optimizer state snapshots with tensors replaced by hashes."""
     from miles.utils.audit_utils.event_logger.models import OptimizerStateInfo
 
-    name_by_tensor_id = _build_name_by_tensor_id(model, skip_no_grad_param=True)
+    model_param_names = {
+        _MainParamId.from_tensor(param): f"pp{pp_idx}.{name}"
+        for pp_idx, chunk in enumerate(model)
+        for name, param in chunk.named_parameters()
+        if param.requires_grad
+    }
     result: list[OptimizerStateInfo] = []
 
     for sub_opt in _iter_sub_optimizers(optimizer):
         inner = sub_opt.optimizer
         assert isinstance(inner, torch.optim.Optimizer), f"Expected torch.optim.Optimizer, got {type(inner)}"
 
+        # DistributedOptimizer owns the installed shard order. FP32 model
+        # parameters have no main_param alias, and precision-aware FusedAdam
+        # owns BF16 parameters' masters internally instead of exposing one.
+        if (group_indices := getattr(sub_opt, "model_param_group_index_map", None)) is not None:
+            name_by_tensor_id = _build_distributed_shard_names(inner, group_indices, model_param_names)
+        else:
+            name_by_tensor_id = _build_name_by_tensor_id(model, skip_no_grad_param=True)
         param_names = _build_param_names_for_optimizer(inner, name_by_tensor_id=name_by_tensor_id)
         sd = inner.state_dict()
         hashed_sd = _transform_tensor_to_hash(sd)
@@ -122,6 +134,22 @@ def _collect_optimizer_hashes(
         )
 
     return result
+
+
+def _build_distributed_shard_names(
+    inner: torch.optim.Optimizer,
+    group_indices: dict[torch.Tensor, tuple[int, int]],
+    model_param_names: dict[_MainParamId, str],
+) -> dict[_MainParamId, str]:
+    names: dict[_MainParamId, str] = {}
+    for model_param, (group_index, group_order) in group_indices.items():
+        name = model_param_names.get(_MainParamId.from_tensor(model_param))
+        assert name is not None, "Distributed optimizer maps a parameter absent from the trainable model"
+        shard = inner.param_groups[group_index]["params"][group_order]
+        key = _MainParamId.from_tensor(shard)
+        assert key not in names, "Distributed optimizer maps several model parameters to the same shard"
+        names[key] = name
+    return names
 
 
 def _build_name_by_tensor_id(model: Sequence[DDP], *, skip_no_grad_param: bool) -> dict[_MainParamId, str]:
@@ -169,6 +197,11 @@ def _transform_tensor_to_hash(obj: Any) -> Any:
     """Recursively replace all tensors in a nested structure with their SHA-256 hashes."""
     if isinstance(obj, torch.Tensor):
         return hash_tensor_sha256(obj)
+    if isinstance(obj, type):
+        # HybridDeviceOptimizer records CPU/GPU optimizer classes in group
+        # defaults. Preserve their identity without an unserializable object or
+        # a process-specific repr in the JSON checksum event.
+        return {"python_class": f"{obj.__module__}.{obj.__qualname__}"}
     if isinstance(obj, dict):
         return {k: _transform_tensor_to_hash(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

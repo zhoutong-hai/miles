@@ -62,6 +62,54 @@ def _make_mock_optimizer_with_state_dict(
 
 
 class TestComputeWeightChecksums:
+    def test_hybrid_optimizer_class_metadata_is_json_serializable(self) -> None:
+        weight = torch.nn.Parameter(torch.ones(2))
+        optimizer = _make_mock_optimizer_with_state_dict([weight])
+        inner = optimizer.chained_optimizers[0].optimizer
+        sd = inner.state_dict()
+        sd["param_groups"][0].update(cpu_optimizer_cls=torch.optim.AdamW, gpu_optimizer_cls=torch.optim.Adam)
+        state = _compute_weight_checksum_state([_make_mock_model_chunk({"weight": weight})], optimizer)
+        group = state.model_dump(mode="json")["optimizer_hashes"][0]["state_dict"]["param_groups"][0]
+        assert group["cpu_optimizer_cls"] == {"python_class": "torch.optim.adamw.AdamW"}
+        assert group["gpu_optimizer_cls"] == {"python_class": "torch.optim.adam.Adam"}
+        assert inner.state_dict()["param_groups"][0]["cpu_optimizer_cls"] is torch.optim.AdamW
+
+    def test_distributed_mixed_precision_uses_owned_shard_order(self) -> None:
+        """Real K3 has FP32 A_log and FusedAdam-owned BF16 masters without main_param aliases."""
+        fp32 = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
+        bf16 = torch.nn.Parameter(torch.arange(8, dtype=torch.bfloat16))
+        bf16.main_param = None
+        bf16.main_param_sharded = True
+        unowned = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        chunk = MagicMock()
+        chunk.named_parameters.return_value = [("A_log", fp32), ("weight", bf16), ("unowned", unowned)]
+        chunk.named_buffers.return_value = []
+        # Installed order deliberately differs from the model iteration order.
+        shards = [bf16.detach()[2:6], fp32.detach()[2:6]]
+        optimizer = _make_mock_optimizer_with_state_dict(shards)
+        sub = MagicMock(spec=["optimizer", "model_param_group_index_map"])
+        sub.optimizer = optimizer.chained_optimizers[0].optimizer
+        sub.model_param_group_index_map = {fp32: (0, 1), bf16: (0, 0)}
+        optimizer.chained_optimizers = [sub]
+
+        state = _compute_weight_checksum_state(model=[chunk], optimizer=optimizer)
+
+        assert state.optimizer_hashes[0].param_names == {0: "pp0.weight", 1: "pp0.A_log"}
+        assert set(state.param_hashes) == {"pp0.A_log", "pp0.weight", "pp0.unowned"}
+
+    def test_distributed_unknown_model_parameter_fails_closed(self) -> None:
+        model_param = torch.nn.Parameter(torch.ones(2))
+        other = torch.nn.Parameter(torch.zeros(2))
+        chunk = _make_mock_model_chunk({"weight": model_param})
+        optimizer = _make_mock_optimizer_with_state_dict([other])
+        sub = MagicMock(spec=["optimizer", "model_param_group_index_map"])
+        sub.optimizer = optimizer.chained_optimizers[0].optimizer
+        sub.model_param_group_index_map = {other: (0, 0)}
+        optimizer.chained_optimizers = [sub]
+
+        with pytest.raises(AssertionError, match="absent from the trainable model"):
+            _compute_weight_checksum_state(model=[chunk], optimizer=optimizer)
+
     def test_param_hashes_keys_match_expected_names(self) -> None:
         params = {
             "module.layers.0.weight": torch.randn(4, 4),

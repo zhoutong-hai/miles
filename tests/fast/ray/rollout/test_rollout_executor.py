@@ -211,6 +211,35 @@ class TestDispose:
 
         assert disposed == ["train", "eval", "sweep"]
 
+    @pytest.mark.parametrize("fail_cleanup", [False, True])
+    async def test_tracking_finishes_once_even_when_cleanup_raises(self, monkeypatch, fail_cleanup) -> None:
+        events = []
+        executor = _inited_executor()
+        executor._disposed = False
+        executor.use_legacy_rollout_v1 = False
+        executor.generate_rollout = None
+        executor.eval_generate_rollout = None
+        executor.data_source = object()
+        executor.args = Namespace()
+        executor._metric_checker = None
+        executor._delete_store_refs = None
+
+        def cleanup(*, args):
+            events.append("cleanup")
+            if fail_cleanup:
+                raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(rollout_executor_module.event_analyzer, "run_sample_ownership_analysis", cleanup)
+        monkeypatch.setattr(rollout_executor_module.event_analyzer, "run_analysis_from_args", lambda args: None)
+        monkeypatch.setattr(rollout_executor_module, "finish_tracking", lambda: events.append("finish"))
+        if fail_cleanup:
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                await executor.dispose()
+        else:
+            await executor.dispose()
+        await executor.dispose()
+        assert events == ["cleanup", "finish"]
+
     async def test_the_final_ownership_check_runs_before_the_run_ends(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Violations that only mature after the last get would otherwise never be checked."""
         checked: list[Namespace] = []
@@ -234,6 +263,47 @@ class TestDispose:
         await executor.dispose()
 
         assert checked == [executor.args]
+
+
+class TestLiveEvalOptimizerStep:
+    @pytest.mark.parametrize(
+        "versions,change_version,expected",
+        [
+            ({None: 0}, False, 0),
+            ({None: 2}, False, 2),
+            ({}, False, None),
+            ({"a": 2, "b": 2}, False, None),
+            ({None: 2}, True, None),
+        ],
+    )
+    async def test_uses_stable_published_optimizer_counter_instead_of_rollout_id(
+        self, monkeypatch: pytest.MonkeyPatch, versions: dict, change_version: bool, expected: int | None
+    ) -> None:
+        executor = _inited_executor()
+        executor.args = Namespace(eval_uses_snapshots=False, debug_train_only=False, starts_inference_engines=False)
+        executor.use_legacy_rollout_v1 = False
+        executor._weight_versions_of_model_id = dict(versions)
+        executor._metric_checker = None
+        original_metrics = {"generation_seconds": 1.5}
+
+        async def generate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            if change_version:
+                executor._weight_versions_of_model_id[None] = 3
+            return RolloutFnEvalOutput(data={}, metrics=original_metrics)
+
+        logged = []
+        executor.eval_generate_rollout = generate
+        monkeypatch.setattr(rollout_executor_module, "save_debug_rollout_data", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            rollout_executor_module,
+            "log_eval_rollout_data",
+            lambda rollout_id, args, data, metrics: logged.append((rollout_id, metrics)),
+        )
+        await executor.eval(27)
+        assert logged[0][0] == 27
+        assert logged[0][1].get("eval/optimizer_step") == expected
+        assert logged[0][1]["generation_seconds"] == 1.5
+        assert original_metrics == {"generation_seconds": 1.5}
 
 
 class TestSetEvalFleetInfo:

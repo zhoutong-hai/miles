@@ -54,7 +54,7 @@ from miles.utils.output_store.dropped import store_refs_of, take_dropped_refs
 from miles.utils.output_store.plan import StorePlanError
 from miles.utils.simple_checkpointer import atomic_save_folder
 from miles.utils.timer import timer
-from miles.utils.tracking_utils.tracking import init_tracking
+from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
 from miles.utils.workers.rpc.common.metadata import DedicatedRpcLoopWorker
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
@@ -178,21 +178,25 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
             return
         self._disposed = True
 
-        if self.generate_rollout is not None and not self.use_legacy_rollout_v1:
-            await maybe_await(self.generate_rollout.dispose())
-        if (
-            close := getattr(self.data_source, "close", None)
-        ) is not None:  # config-access-exempt: custom data sources may omit this lifecycle method
-            close()
-        event_analyzer.run_sample_ownership_analysis(args=self.args)
-        event_analyzer.run_analysis_from_args(self.args)
-        if self._metric_checker is not None:
-            self._metric_checker.dispose()
-        if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
-            await maybe_await(self.eval_generate_rollout.dispose())
-        # Last, so a failed CI check raises after the rest of this dispose; only once init reached the store.
-        if self._delete_store_refs is not None:
-            await asyncio.to_thread(self._sweep_output_store)
+        try:
+            if self.generate_rollout is not None and not self.use_legacy_rollout_v1:
+                await maybe_await(self.generate_rollout.dispose())
+            if (
+                close := getattr(self.data_source, "close", None)
+            ) is not None:  # config-access-exempt: custom data sources may omit this lifecycle method
+                close()
+            event_analyzer.run_sample_ownership_analysis(args=self.args)
+            event_analyzer.run_analysis_from_args(self.args)
+            if self._metric_checker is not None:
+                self._metric_checker.dispose()
+            if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
+                await maybe_await(self.eval_generate_rollout.dispose())
+            # Last, so a failed CI check raises after the rest of this dispose; only once init reached the store.
+            if self._delete_store_refs is not None:
+                await asyncio.to_thread(self._sweep_output_store)
+        finally:
+            # Secondary writers must drain before the worker manager kills their process.
+            finish_tracking()
 
     def _sweep_output_store(self) -> None:
         """Remove what the run left in the output store, which nothing reads once it ends."""
@@ -320,6 +324,7 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
             return
 
         await self._refresh_inference_runtime_mut_state()
+        published_versions = dict(self._weight_versions_of_model_id)
         with timer("eval_rollout"):
             if not self.use_legacy_rollout_v1:
                 result = await maybe_await(self.eval_generate_rollout(RolloutFnEvalInput(rollout_id=rollout_id)))
@@ -335,7 +340,14 @@ class RolloutExecutor(DedicatedRpcLoopWorker):
                 )
         data = result.data
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
-        metrics = log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        extra_metrics = dict(result.metrics or {})
+        extra_metrics.pop("eval/optimizer_step", None)
+        # Native actor versions count completed optimizer updates, including after
+        # restore. A rollout ID does not: baseline and the first post-update eval
+        # can share it. Omit the counter for ambiguous or changing live policies.
+        if len(published_versions) == 1 and published_versions == self._weight_versions_of_model_id:
+            extra_metrics["eval/optimizer_step"] = next(iter(published_versions.values()))
+        metrics = log_eval_rollout_data(rollout_id, self.args, data, extra_metrics)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 

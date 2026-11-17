@@ -197,6 +197,11 @@ def _transform_tensor_to_hash(obj: Any) -> Any:
     """Recursively replace all tensors in a nested structure with their SHA-256 hashes."""
     if isinstance(obj, torch.Tensor):
         return hash_tensor_sha256(obj)
+    if isinstance(obj, type):
+        # HybridDeviceOptimizer records CPU/GPU optimizer classes in group
+        # defaults. Preserve their identity without an unserializable object or
+        # a process-specific repr in the JSON checksum event.
+        return {"python_class": f"{obj.__module__}.{obj.__qualname__}"}
     if isinstance(obj, dict):
         return {k: _transform_tensor_to_hash(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

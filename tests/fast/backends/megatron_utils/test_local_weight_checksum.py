@@ -62,6 +62,18 @@ def _make_mock_optimizer_with_state_dict(
 
 
 class TestComputeWeightChecksums:
+    def test_hybrid_optimizer_class_metadata_is_json_serializable(self) -> None:
+        weight = torch.nn.Parameter(torch.ones(2))
+        optimizer = _make_mock_optimizer_with_state_dict([weight])
+        inner = optimizer.chained_optimizers[0].optimizer
+        sd = inner.state_dict()
+        sd["param_groups"][0].update(cpu_optimizer_cls=torch.optim.AdamW, gpu_optimizer_cls=torch.optim.Adam)
+        state = _compute_weight_checksum_state([_make_mock_model_chunk({"weight": weight})], optimizer)
+        group = state.model_dump(mode="json")["optimizer_hashes"][0]["state_dict"]["param_groups"][0]
+        assert group["cpu_optimizer_cls"] == {"python_class": "torch.optim.adamw.AdamW"}
+        assert group["gpu_optimizer_cls"] == {"python_class": "torch.optim.adam.Adam"}
+        assert inner.state_dict()["param_groups"][0]["cpu_optimizer_cls"] is torch.optim.AdamW
+
     def test_distributed_mixed_precision_uses_owned_shard_order(self) -> None:
         """Real K3 has FP32 A_log and FusedAdam-owned BF16 masters without main_param aliases."""
         fp32 = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))

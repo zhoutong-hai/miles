@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from tests.fast.ray.train import conftest as train_conftest
@@ -162,3 +162,28 @@ async def test_initial_membership_uses_sparse_observed_cell_indices(
             assert cell.indep_dp_info.alive_size == 2
     finally:
         await controller.dispose()
+
+
+@pytest.mark.parametrize("fail_flush", [False, True])
+async def test_dispose_flushes_only_live_cells_once_even_when_a_writer_fails(fail_flush):
+    controller = TrainerController.__new__(TrainerController)
+    controller._disposed = False
+    stopped = []
+
+    async def stop():
+        stopped.append("watcher")
+
+    controller._watcher_disposer = stop
+    live = SimpleNamespace(
+        cell_index=0,
+        cell_id="live",
+        is_alive=True,
+        execute=AsyncMock(side_effect=RuntimeError("writer failed") if fail_flush else None),
+    )
+    dead = SimpleNamespace(cell_index=1, cell_id="dead", is_alive=False, execute=AsyncMock())
+    controller._cells_by_id = {"live": live, "dead": dead}
+    await controller.dispose()
+    await controller.dispose()
+    assert stopped == ["watcher"]
+    live.execute.assert_awaited_once_with("finish_tracking", kill_on_failure=False, timeout=60.0)
+    dead.execute.assert_not_called()

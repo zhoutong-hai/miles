@@ -50,6 +50,9 @@ class DummyTrainActor:
     def init(self, *args: Any, **kwargs: Any) -> None:
         self._record("init", args, kwargs)
 
+    def finish_tracking(self) -> None:
+        self._record("finish_tracking", (), {})
+
     def configure_master_addr_and_port(self, *args: Any, **kwargs: Any) -> None:
         self._record("configure_master_addr_and_port", args, kwargs)
 

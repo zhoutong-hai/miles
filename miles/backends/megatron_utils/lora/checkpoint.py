@@ -25,6 +25,7 @@ from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapte
 from miles.backends.megatron_utils.lora.bridge_checkpoint_loader import MegatronBridgeCheckpointLoader
 from miles.backends.megatron_utils.lora.native.checkpoint import NativeAdapterSlots
 from miles.backends.megatron_utils.lora.optimizer import SlotOptimizer
+from miles.backends.megatron_utils.lora.rng_state import capture_rng_state, restore_rng_state
 from miles.backends.megatron_utils.lora.utils import (
     OPTIMIZER_KEY,
     _distributed_optimizers,
@@ -667,6 +668,8 @@ def save_single_lora(
         "first_rollout": first_rollout,
         "opt_param_scheduler": opt_param_scheduler.state_dict() if opt_param_scheduler is not None else None,
     }
+    if not args.backend.no_save_rng:
+        training_state["rng_state"] = capture_rng_state()
     save_and_commit_adapter_dir(
         Path(args.backend.save) / f"iter_{iteration:07d}",
         "adapter",
@@ -760,6 +763,8 @@ def restore_single_lora(
     scheduler_state = training_state.get("opt_param_scheduler")
     if opt_param_scheduler is not None and scheduler_state is not None:
         opt_param_scheduler.load_state_dict(scheduler_state)
+    if "rng_state" in training_state and not args.backend.no_load_rng:
+        restore_rng_state(training_state["rng_state"])
     return AdapterRestore(training_state["iteration"], scheduler_state is not None, training_state["first_rollout"])
 
 

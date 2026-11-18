@@ -2,12 +2,14 @@
 
 import json
 import multiprocessing
+import random
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -50,7 +52,9 @@ def _restore(path, *, convert_save=None):
         experts_shared_outer_loras=False,
         megatron_to_hf_mode="bridge",
         multi_lora=False,
-        backend=SimpleNamespace(no_load_optim=True, no_save_optim=False, use_precision_aware_optimizer=False),
+        backend=SimpleNamespace(
+            no_load_optim=True, no_save_optim=False, no_load_rng=False, use_precision_aware_optimizer=False
+        ),
     )
     scheduler = MagicMock()
     slots = MagicMock()
@@ -96,6 +100,70 @@ def test_a_source_without_training_state_restarts_at_rollout_0(tmp_path):
     (iteration, _, _), scheduler, _ = _restore(tmp_path)
     assert iteration is None
     scheduler.load_state_dict.assert_not_called()
+
+
+def test_restore_loads_the_rng_state_inside_the_committed_training_state(tmp_path):
+    state = {"iteration": 1, "first_rollout": 0, "rng_state": {"saved": "streams"}}
+    with patch(f"{_MODULE}.read_training_state", return_value=state), patch(f"{_MODULE}.restore_rng_state") as restore:
+        _restore(tmp_path)
+    restore.assert_called_once_with(state["rng_state"])
+
+
+@pytest.fixture
+def rng_checkpoint_runtime(monkeypatch):
+    import miles.backends.megatron_utils.lora.rng_state as rng
+
+    original = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    cuda = torch.Generator().manual_seed(11)
+    tracker = SimpleNamespace(states={"model-parallel-rng": torch.tensor([3, 7], dtype=torch.uint8)})
+    tracker.get_states = lambda: tracker.states
+    tracker.set_states = lambda states: setattr(tracker, "states", states)
+    group = SimpleNamespace(size=1, rank=0)
+    monkeypatch.setattr(
+        rng,
+        "get_parallel_state",
+        lambda: SimpleNamespace(**{name: group for name in ("tp", "pp", "cp", "ep", "etp", "effective_dp")}),
+    )
+    monkeypatch.setattr(rng, "get_cuda_rng_tracker", lambda: tracker)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", cuda.get_state)
+    monkeypatch.setattr(torch.cuda, "set_rng_state", cuda.set_state)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "all_gather_object", lambda rows, value, **kwargs: rows.__setitem__(0, value))
+    monkeypatch.setattr(rng, "gloo_group", lambda: None)
+    yield rng, cuda, tracker
+    random.setstate(original[0])
+    np.random.set_state(original[1])
+    torch.set_rng_state(original[2])
+
+
+def test_rng_json_roundtrip_repeats_next_draws_and_restores_tracker(rng_checkpoint_runtime):
+    rng, cuda, tracker = rng_checkpoint_runtime
+    snapshot = json.loads(json.dumps(rng.capture_rng_state()))
+
+    def draws():
+        return random.random(), np.random.rand(4), torch.rand(4), torch.rand(4, generator=cuda)
+
+    expected = draws()
+    tracker.states = {"model-parallel-rng": torch.tensor([9, 8], dtype=torch.uint8)}
+    draws()
+    rng.restore_rng_state(snapshot)
+    actual = draws()
+    assert actual[0] == expected[0]
+    np.testing.assert_array_equal(actual[1], expected[1])
+    for found, wanted in zip(actual[2:], expected[2:], strict=True):
+        torch.testing.assert_close(found, wanted, rtol=0, atol=0)
+    assert tracker.states["model-parallel-rng"].tolist() == [3, 7]
+
+
+def test_rng_layout_mismatch_is_refused_before_any_stream_changes(rng_checkpoint_runtime):
+    rng, cuda, tracker = rng_checkpoint_runtime
+    snapshot = json.loads(json.dumps(rng.capture_rng_state()))
+    snapshot["ranks"][0]["layout"]["sizes"][0] = 2
+    before = rng.capture_rng_state()
+    with pytest.raises(RuntimeError, match="rank layout differs"):
+        rng.restore_rng_state(snapshot)
+    assert rng.capture_rng_state() == before
 
 
 def test_a_weights_only_convert_save_writes_neither_moments_nor_a_placeholder_training_state(tmp_path):

@@ -146,7 +146,7 @@ def test_pp_adapter_broadcasts_are_lazy_and_preserve_owner_tensor_values():
         patch.object(module.dist, "broadcast", broadcast),
         patch.object(module.torch.cuda, "current_device", return_value="cpu"),
     ):
-        stages = module._iter_pp_adapter_stages(local, layout)
+        stages = module._iter_pp_adapter_stages(local, layout, max_bytes=1024)
         assert broadcasts == []
         first = next(stages)
         assert broadcasts == [3]
@@ -171,13 +171,14 @@ def test_non_materializing_adapter_rank_still_drains_every_pipeline_collective()
 
     joined = []
 
-    def stages(*_args):
+    def stages(*_args, **_kwargs):
         for owner in (0, 1):
             joined.append(owner)
             yield [(f"layer{owner}.lora_A", torch.ones(2))]
 
     iterator = object.__new__(Stage)
     iterator.placement = WeightUpdatePlacement(gather_pp=True)
+    iterator.args = Namespace(update_weight_buffer_size=1024)
     with (
         patch.object(module, "_count_full_adapter_tensors", return_value=(2, 2)),
         patch.object(module, "_gather_pp_adapter_layout", return_value=[]),
@@ -185,3 +186,49 @@ def test_non_materializing_adapter_rank_still_drains_every_pipeline_collective()
     ):
         assert list(iterator._iter_hf_adapter_units(None, materialize=False)) == []
     assert joined == [0, 1]
+
+
+def test_pp_adapter_staging_budget_preserves_names_dtypes_and_held_tensors():
+    from miles.backends.megatron_utils.update_weight import hf_weight_iterator as module
+
+    local = [(f"layer0.{i}.lora_A", torch.full((4,), float(i))) for i in range(3)]
+    layout = [
+        [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in reversed(local)],
+        [],
+        [("layer2.lora_B", (3, 4), torch.float64)],
+    ]
+    allocations = []
+    real_empty = torch.empty
+    broadcasts = []
+
+    def empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        allocations.append(tensor.nbytes)
+        return tensor
+
+    def broadcast(flat, src, group):
+        broadcasts.append(src)
+        if src == 9:
+            flat.fill_(7)
+
+    pp = Namespace(size=3, rank=0, group=None)
+    with (
+        patch.object(module, "get_parallel_state", return_value=Namespace(pp=pp)),
+        patch.object(module.dist, "get_process_group_ranks", return_value=[3, 5, 9]),
+        patch.object(module.dist, "broadcast", broadcast),
+        patch.object(module.torch.cuda, "current_device", return_value="cpu"),
+        patch.object(module.torch, "empty", empty),
+    ):
+        chunks = module._iter_pp_adapter_stages(local, layout, max_bytes=24)
+        first = next(chunks)
+        assert broadcasts == [3]  # No eager allocation for the remainder of this owner.
+        rest = list(chunks)
+
+    flattened = first + [item for chunk in rest for item in chunk]
+    assert broadcasts == [3, 3, 3, 9]  # Empty PP stage joins no tensor broadcast.
+    assert allocations == [16, 16, 16, 96]  # Only the indivisible factor exceeds the budget.
+    assert [name for name, _ in flattened] == [name for name, _ in local] + ["layer2.lora_B"]
+    assert all(
+        torch.equal(found, expected) for (_, found), (_, expected) in zip(flattened[: len(local)], local, strict=True)
+    )
+    assert flattened[-1][1].dtype == torch.float64 and torch.all(flattened[-1][1] == 7)

@@ -40,8 +40,9 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
 
     def _iter_hf_adapter_units(self, adapter, *, materialize):
         """Both megatron exporters are PP-local after gathering TP/EP; the PP
-        gather streams one owner stage at a time, avoiding a full MoE adapter
-        on every rank. Non-materializing ranks still join every collective."""
+        gather streams size-bounded pieces of each owner stage. Even one MoE
+        stage can exceed colocated headroom at high rank. Non-materializing
+        ranks still join every collective."""
         named_tensors = self._export_pp_local_lora(adapter)
         num_tensors, num_lora_weights = _count_full_adapter_tensors(named_tensors, is_pp_local=True)
         if materialize and num_tensors == 0:
@@ -49,7 +50,11 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
         if materialize and num_lora_weights == 0:
             raise RuntimeError("LoRA weight sync failed: the adapter export contains no lora_A/lora_B names.")
         stages = (
-            _iter_pp_adapter_stages(named_tensors, _gather_pp_adapter_layout(named_tensors))
+            _iter_pp_adapter_stages(
+                named_tensors,
+                _gather_pp_adapter_layout(named_tensors),
+                max_bytes=self.args.update_weight_buffer_size,
+            )
             if self.placement.gather_pp
             else iter([named_tensors])
         )
@@ -130,10 +135,14 @@ def _gather_pp_adapter_layout(
 def _iter_pp_adapter_stages(
     hf_named_tensors: Sequence[tuple[str, torch.Tensor]],
     layout: list[list[tuple[str, tuple[int, ...], torch.dtype]]],
+    *,
+    max_bytes: int,
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
-    """Stream a PP owner's adapter before allocating the next owner's buffers.
+    """Stream bounded pieces of each PP owner, preserving sorted HF names.
 
-    Adapted from upstream PR #4127, retaining the current PP-local count reduction.
+    The transport budget also bounds PP staging. A single indivisible factor
+    may exceed it, as in the downstream transport packer; never flatten a whole
+    stage merely because every factor has the same dtype.
     """
     pp = get_parallel_state().pp
     if pp.size == 1:
@@ -144,29 +153,44 @@ def _iter_pp_adapter_stages(
 
     local_by_name = {n: t for n, t in hf_named_tensors}
     for src, meta in enumerate(layout):
-        by_dtype: dict = {}
-        for n, shape, dtype in meta:
-            by_dtype.setdefault(dtype, []).append((n, shape))
-        stage = []
-        for dtype, entries in by_dtype.items():
-            numel = sum(math.prod(shape) for _, shape in entries)
+        for entries in _pack_pp_adapter_metadata(meta, max_bytes=max_bytes):
+            dtype = entries[0][2]
+            numel = sum(math.prod(shape) for _, shape, _ in entries)
             flat = torch.empty(numel, dtype=dtype, device=device)
             if src == pp.rank:
                 off = 0
-                for n, shape in entries:
+                for n, shape, _ in entries:
                     k = math.prod(shape)
                     flat[off : off + k].copy_(local_by_name[n].reshape(-1))
                     off += k
             dist.broadcast(flat, src=global_ranks[src], group=pp.group)
             off = 0
-            for n, shape in entries:
+            stage = []
+            for n, shape, _ in entries:
                 k = math.prod(shape)
                 stage.append((n, flat[off : off + k].view(shape)))
                 off += k
             del flat
-        stage.sort(key=lambda item: item[0])
-        yield stage
-        del stage
+            yield stage
+            del stage
+
+
+def _pack_pp_adapter_metadata(meta, *, max_bytes):
+    """Deterministic, same-dtype batches; one oversized factor stays atomic."""
+    assert max_bytes > 0
+    batch = []
+    size = 0
+    for entry in sorted(meta, key=lambda entry: entry[0]):
+        _, shape, dtype = entry
+        nbytes = math.prod(shape) * dtype.itemsize
+        if batch and (dtype != batch[0][2] or size + nbytes > max_bytes):
+            yield batch
+            batch = []
+            size = 0
+        batch.append(entry)
+        size += nbytes
+    if batch:
+        yield batch
 
 
 _FROZEN_TOWER_PROVIDERS = ("inkling_mm_model_provider", "qwen3_5_mm_model_provider")

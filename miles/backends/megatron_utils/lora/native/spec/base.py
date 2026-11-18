@@ -127,6 +127,7 @@ class FixedTargets:
     serving: Callable[[list[str]], list[str] | str]
     optional: frozenset[str] = frozenset()
     select_all: bool = False
+    alternative_layouts: Callable[[dict], tuple[frozenset[str], ...]] = lambda _config: ()
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ import dataclasses
 import torch.nn as nn
 
 from miles.backends.megatron_utils.lora.native.modules.linear import (
+    LoRAColumnPlainLinear,
     LoRAGroupedColumnLinear,
     LoRAReplicatedPlainLinear,
     LoRASplitAdapter,
@@ -262,7 +263,18 @@ class KimiK3AttentionSpec(AttentionSpecBase):
     kda_layout = ModuleLayout(
         name="kimi_k3_kda_attention",
         full_sequence=True,
-        singles=(
+        singles=tuple(
+            ProjectionBinding(
+                projection=ProjectionSpec(f"{leaf}_proj", leaf, ShardLayout.COLUMN),
+                module_attr=f"{leaf}_proj",
+                in_dim=L.hidden_size,
+                out_dim=L.host_out_local(f"{leaf}_proj"),
+                adapter_attr=f"lora_{leaf}_adapter",
+                adapter_class=LoRAColumnPlainLinear,
+            )
+            for leaf in ("q", "k", "v")
+        )
+        + (
             ProjectionBinding(
                 projection=ProjectionSpec("o_proj", "o", ShardLayout.ROW),
                 module_attr="out_proj",
@@ -276,6 +288,10 @@ class KimiK3AttentionSpec(AttentionSpecBase):
 
     def applies_to(self, block: nn.Module) -> bool:
         return True
+
+    @property
+    def supported_targets(self) -> frozenset[str]:
+        return self.layout.targets | self.kda_layout.targets
 
     def attach(self, block: nn.Module, layer: nn.Module, context: AttachContext) -> int:
         if block.is_kda:

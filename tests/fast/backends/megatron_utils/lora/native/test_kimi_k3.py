@@ -55,6 +55,8 @@ def _attention(is_kda, *, tp_size=1):
     if is_kda:
         attention.linear_attn = nn.Module()
         attention.linear_attn.out_proj = nn.Linear(12 // tp_size, HIDDEN, bias=False)
+        for leaf in ("q", "k", "v"):
+            setattr(attention.linear_attn, f"{leaf}_proj", nn.Linear(HIDDEN, 16 // tp_size, bias=False))
     else:
         attention.o_proj = _Linear(HIDDEN, 12)
         attention.q_a_proj = _Linear(4, HIDDEN)
@@ -116,11 +118,13 @@ def _single_rank_comms(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
 
 
-def _model(*, include_fc2=True, sequence_parallel=False, num_slots=None):
+def _model(*, include_fc2=True, sequence_parallel=False, num_slots=None, kda_qkv=False):
     """Layer 3: MLA attention + dense MLP. Layer 4: KDA attention + routed and shared experts."""
     leaves = ("w1", "w3", "w2") if include_fc2 else ("w1", "w3")
     targets = [f"{PREFIX}*.block_sparse_moe.experts.*.{leaf}" for leaf in leaves]
     targets += [f"{PREFIX}*.{block}.{leaf}" for block, leaf in _NON_EXPERT_TARGETS]
+    if kda_qkv:
+        targets += [f"{PREFIX}*.self_attn.{leaf}_proj" for leaf in ("q", "k", "v")]
     context = _context(tuple(targets), sequence_parallel=sequence_parallel, num_slots=num_slots)
     model = nn.Module()
     model.mla, model.dense, model.kda, model.moe = _attention(False), _mlp(), _attention(True), _moe()
@@ -158,6 +162,38 @@ def test_k3_is_built_from_the_shared_tables():
     """Kimi K3 adds no modules of its own: every adapter is one the other architectures use."""
     adapters = {type(module).__name__ for module in _model().modules() if hasattr(module, "hf_prefix")}
     assert adapters == {"LoRALinear", "LoRAUnreducedRowLinear", "LoRASplitFC1", "LoRAGroupedFC1", "LoRAGroupedFC2"}
+
+
+def test_e007_kda_qkv_layout_is_explicit_complete_and_does_not_change_defaults():
+    defaults = resolve_hf_lora_targets(_k3_hf_config())
+    qkv = [f"{PREFIX}*.self_attn.{leaf}_proj" for leaf in ("q", "k", "v")]
+    assert not set(defaults) & set(qkv)
+    assert set(_resolve([*defaults, *qkv])) >= set(qkv)
+    for partial in (qkv[:1], qkv[:2]):
+        with pytest.raises(AssertionError, match="verified adapter layout"):
+            _resolve([*defaults, *partial])
+
+
+def test_e007_kda_qkv_exports_and_has_dense_reference_gradients():
+    model = _model(kda_qkv=True)
+    exports = dict(export_lora_hf_named(iter_adapters([model])))
+    for leaf in ("q", "k", "v"):
+        prefix = f"{PREFIX}4.self_attn.{leaf}_proj"
+        assert exports[f"{prefix}.lora_A.weight"].shape == (RANK, HIDDEN)
+        assert exports[f"{prefix}.lora_B.weight"].shape == (16, RANK)
+        assert not any(f"3.self_attn.{leaf}_proj" in name for name in exports)
+        host = getattr(model.kda.linear_attn, f"{leaf}_proj")
+        adapter = getattr(model.kda.linear_attn, f"lora_{leaf}_adapter")
+        x = torch.randn(3, HIDDEN, requires_grad=True)
+        a, b = getattr(adapter, f"{leaf}_A"), getattr(adapter, f"{leaf}_B")
+        expected = x @ host.weight.t() + adapter.context.lora.scale * ((x @ a.t()) @ b.t())
+        actual = host(x)
+        torch.testing.assert_close(actual, expected)
+        actual_grad = torch.autograd.grad(actual.sum(), (x, a, b), retain_graph=True)
+        expected_grad = torch.autograd.grad(expected.sum(), (x, a, b))
+        for actual_value, expected_value in zip(actual_grad, expected_grad, strict=True):
+            torch.testing.assert_close(actual_value, expected_value)
+        assert a._lora_grad_sum_group == "tp" and b.tensor_model_parallel and b.partition_dim == 0
 
 
 @pytest.mark.parametrize("include_fc2", [True, False])
@@ -211,8 +247,9 @@ def test_the_checkpoint_probe_exports_one_adapter_at_a_time(monkeypatch):
         torch.testing.assert_close(tensor, expected, rtol=0, atol=0, msg=name)
 
 
-def test_hf_import_round_trips_the_export(tmp_path):
-    source, target = _model(), _model()
+@pytest.mark.parametrize("kda_qkv", [False, True])
+def test_hf_import_round_trips_the_export(tmp_path, kda_qkv):
+    source, target = _model(kda_qkv=kda_qkv), _model(kda_qkv=kda_qkv)
     with torch.no_grad():
         for parameter in target.parameters():
             parameter.zero_()

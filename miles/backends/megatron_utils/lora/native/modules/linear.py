@@ -262,6 +262,16 @@ class LoRALinear(PhasedLoRAAdapter):
         yield host.weight, lambda: self.context.lora.scale * (b.float() @ a.float())
 
 
+class LoRAColumnPlainLinear(LoRALinear):
+    """Column-parallel adapter on a plain local linear returning a tensor, not a bias tuple."""
+
+    host_returns_bias = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        assert self.layout == ShardLayout.COLUMN, f"{type(self).__name__} requires a column-parallel projection"
+
+
 class LoRAUnreducedRowLinear(LoRALinear):
     """Row-parallel adapter on a plain local ``nn.Linear`` whose caller reduces the TP partial sums.
 

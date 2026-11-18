@@ -80,6 +80,14 @@ def _inkling_arch_spec() -> LoRAArchSpec:
     )
 
 
+def _kimi_k3_qkv_layout(hf_config: dict) -> tuple[frozenset[str], ...]:
+    """E007's optional complete KDA Q/K/V trio; ordinary K3 defaults remain unchanged."""
+    layout = resolve_hf_lora_targets(hf_config)
+    output = next(target for target in layout if target.endswith(".self_attn.o_proj"))
+    qkv = {output.removesuffix("o_proj") + f"{leaf}_proj" for leaf in ("q", "k", "v")}
+    return (frozenset(layout) | qkv,)
+
+
 def _kimi_k3_arch_spec() -> LoRAArchSpec:
     attention = KimiK3AttentionSpec()
     return LoRAArchSpec(
@@ -89,7 +97,9 @@ def _kimi_k3_arch_spec() -> LoRAArchSpec:
         experts=GroupedExpertsSpec(),
         # the routed-expert down-proj may be omitted: its EP-shared w2_lora_B dominates adapter growth (#1559)
         fixed_targets=FixedTargets(
-            serving=_shared_outer_serving_targets, optional=frozenset({"block_sparse_moe.experts.*.w2"})
+            serving=_shared_outer_serving_targets,
+            optional=frozenset({"block_sparse_moe.experts.*.w2"}),
+            alternative_layouts=_kimi_k3_qkv_layout,
         ),
     )
 
@@ -256,13 +266,18 @@ def _selects_head(spec: LoRAArchSpec, hf_modules: list[str], hf_targets: list[st
 
 
 def _assert_fixed_target_layout(spec: LoRAArchSpec, hf_config: dict, hf_targets: list[str]) -> None:
-    layout = resolve_hf_lora_targets(hf_config)
-    optional = {t for t in layout if any(t.endswith(f".{suffix}") for suffix in spec.fixed_targets.optional)}
-    missing = sorted(set(layout) - set(hf_targets) - optional)
-    unexpected = sorted(set(hf_targets) - set(layout))
-    assert not (missing or unexpected), (
-        f"native {spec.name} LoRA requires its verified adapter layout (missing={missing}, "
-        f"unexpected={unexpected}); omit --target-modules and --exclude-modules to use it"
+    layouts = (frozenset(resolve_hf_lora_targets(hf_config)), *spec.fixed_targets.alternative_layouts(hf_config))
+    differences = []
+    for layout in layouts:
+        optional = {t for t in layout if any(t.endswith(f".{suffix}") for suffix in spec.fixed_targets.optional)}
+        missing = sorted(set(layout) - set(hf_targets) - optional)
+        unexpected = sorted(set(hf_targets) - set(layout))
+        if not (missing or unexpected):
+            return
+        differences.append({"missing": missing, "unexpected": unexpected})
+    raise AssertionError(
+        f"native {spec.name} LoRA requires a complete verified adapter layout ({differences}); "
+        "omit --target-modules and --exclude-modules to use the default"
     )
 
 

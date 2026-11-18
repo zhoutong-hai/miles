@@ -11,9 +11,7 @@ from miles.utils.tracking_utils.base import TrackingManager
 
 
 class TestInitOrchestrationScript:
-    async def test_partial_tracking_initialization_releases_started_backends(
-        self, monkeypatch: pytest.MonkeyPatch, partially_failing_tracking_manager: TrackingManager
-    ) -> None:
+    async def test_partial_tracking_initialization_releases_started_backends(self, monkeypatch: pytest.MonkeyPatch, partially_failing_tracking_manager: TrackingManager) -> None:
         """A later backend failure still releases previously initialized tracking resources."""
         resources: list[object] = []
         monkeypatch.setattr(tracking, "_manager", partially_failing_tracking_manager)
@@ -24,9 +22,7 @@ class TestInitOrchestrationScript:
         with pytest.raises(RuntimeError, match="tracking backend unavailable"):
             async with Disposer() as disposer:
                 orchestration_utils.init_orchestration_script(
-                    ArgvOrchestratorStartupInfo(
-                        args=Namespace(enabled=True, resources=resources), all_args=Namespace()
-                    ),
+                    ArgvOrchestratorStartupInfo(args=Namespace(enabled=True, resources=resources), all_args=Namespace()),
                     disposer=disposer,
                 )
 
@@ -34,9 +30,7 @@ class TestInitOrchestrationScript:
 
     def test_initializes_the_shared_driver_machinery_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every driver restores the event history first, then initializes the shared machinery in order."""
-        args = Namespace(
-            run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, wandb_run_id="wandb", mlflow_run_id="mlflow", entropy_control_mode="off"
-        )
+        args = Namespace(run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, wandb_run_id="wandb", mlflow_run_id="mlflow", entropy_control_mode="off")
         all_args = Namespace(wandb_run_id=None, mlflow_run_id=None)
         worker_manager = object()
         capability = object()
@@ -87,9 +81,7 @@ class TestInitOrchestrationScript:
         monkeypatch.setattr(orchestration_utils, "compute_backend_capability", fake_compute_backend_capability)
         monkeypatch.setattr(orchestration_utils.object_store, "init_instance", fake_init_object_store)
 
-        result = orchestration_utils.init_orchestration_script(
-            ArgvOrchestratorStartupInfo(args=args, all_args=all_args), disposer=Disposer()
-        )
+        result = orchestration_utils.init_orchestration_script(ArgvOrchestratorStartupInfo(args=args, all_args=all_args), disposer=Disposer())
 
         assert calls == [
             "event_logger_checkpoint.restore",
@@ -113,7 +105,7 @@ class TestInitOrchestrationScript:
 
     def test_a_payload_started_orchestrator_launches_no_workers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The launcher installed the workers, so the capability comes from the payload's static connections."""
-        args = Namespace(run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, cluster_backend="kubernetes")
+        args = Namespace(run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, cluster_backend="kubernetes", entropy_control_mode="off")
         static_connections = object()
         capability = object()
         captured: dict[str, object] = {}
@@ -132,22 +124,14 @@ class TestInitOrchestrationScript:
         monkeypatch.setattr(orchestration_utils, "init_tracking", lambda _args: None)
         monkeypatch.setattr(orchestration_utils, "launch_worker_manager", refuse_to_launch)
         monkeypatch.setattr(orchestration_utils.factory, "get_backend_capability", fake_get_backend_capability)
-        monkeypatch.setattr(
-            orchestration_utils.object_store, "init_instance", lambda _args, *, contribute_segment: None
-        )
+        monkeypatch.setattr(orchestration_utils.object_store, "init_instance", lambda _args, *, contribute_segment: None)
 
-        result = orchestration_utils.init_orchestration_script(
-            PayloadOrchestratorStartupInfo(args=args, static_connections=static_connections), disposer=Disposer()
-        )
+        result = orchestration_utils.init_orchestration_script(PayloadOrchestratorStartupInfo(args=args, static_connections=static_connections), disposer=Disposer())
 
         assert result is capability
-        assert captured == dict(
-            cluster_backend=orchestration_utils.ClusterBackend.KUBERNETES, static_connections=static_connections
-        )
+        assert captured == dict(cluster_backend=orchestration_utils.ClusterBackend.KUBERNETES, static_connections=static_connections)
 
-    async def test_the_manager_and_the_tracking_are_released_by_the_disposer_it_is_handed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_the_manager_and_the_tracking_are_released_by_the_disposer_it_is_handed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Four drivers each remembering these two teardowns is four chances to forget one of them."""
         worker_manager = object()
         released: list[object] = []
@@ -161,9 +145,7 @@ class TestInitOrchestrationScript:
         monkeypatch.setattr(orchestration_utils, "init_tracking", lambda _args: None)
         monkeypatch.setattr(orchestration_utils, "launch_worker_manager", lambda _args: worker_manager)
         monkeypatch.setattr(orchestration_utils, "compute_backend_capability", lambda _args: object())
-        monkeypatch.setattr(
-            orchestration_utils.object_store, "init_instance", lambda _args, *, contribute_segment: None
-        )
+        monkeypatch.setattr(orchestration_utils.object_store, "init_instance", lambda _args, *, contribute_segment: None)
         monkeypatch.setattr(orchestration_utils, "finish_tracking", lambda: released.append("tracking"))
         monkeypatch.setattr(orchestration_utils, "shutdown_worker_manager", fake_shutdown_worker_manager)
 
@@ -176,6 +158,7 @@ class TestInitOrchestrationScript:
                         ci_fault_hooks_path=None,
                         wandb_run_id=None,
                         mlflow_run_id=None,
+                        entropy_control_mode="off",
                     ),
                     all_args=Namespace(),
                 ),

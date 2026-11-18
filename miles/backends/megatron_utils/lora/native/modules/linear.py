@@ -263,13 +263,20 @@ class LoRALinear(PhasedLoRAAdapter):
 
 
 class LoRAColumnPlainLinear(LoRALinear):
-    """Column-parallel adapter on a plain local linear returning a tensor, not a bias tuple."""
+    """Column adapter whose parent owns the TP input collective; the host returns a bare tensor.
+
+    K3's head-sharded linear-attention layer gathers/copies its input with summed TP
+    backward before calling the projections. A second copy here would sum dx twice.
+    """
 
     host_returns_bias = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         assert self.layout == ShardLayout.COLUMN, f"{type(self).__name__} requires a column-parallel projection"
+
+    def prepare_input(self, x: torch.Tensor, base_module: nn.Module) -> torch.Tensor:
+        return apply_lora_dropout(x, self.context, base_module.training)
 
 
 class LoRAUnreducedRowLinear(LoRALinear):

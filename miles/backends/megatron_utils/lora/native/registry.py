@@ -274,7 +274,7 @@ def _assert_fixed_target_layout(spec: LoRAArchSpec, hf_config: dict, hf_targets:
         unexpected = sorted(set(hf_targets) - set(layout))
         if not (missing or unexpected):
             return
-        differences.append({"missing": missing, "unexpected": unexpected})
+        differences.append(f"missing={missing}, unexpected={unexpected}")
     raise AssertionError(
         f"native {spec.name} LoRA requires a complete verified adapter layout ({differences}); "
         "omit --target-modules and --exclude-modules to use the default"

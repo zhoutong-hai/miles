@@ -7,7 +7,7 @@ import math
 import os
 from abc import abstractmethod
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import torch
 import torch.distributed as dist
@@ -40,22 +40,26 @@ class MegatronHfWeightIteratorBase(HfWeightIteratorBase):
 
     def _iter_hf_adapter_units(self, adapter, *, materialize):
         """Both megatron exporters are PP-local after gathering TP/EP; the PP
-        gather runs only where the resolved placement asks for it."""
+        gather streams one owner stage at a time, avoiding a full MoE adapter
+        on every rank. Non-materializing ranks still join every collective."""
         named_tensors = self._export_pp_local_lora(adapter)
-        if self.placement.gather_pp:
-            named_tensors = _gather_pp_full_adapter(named_tensors)
-        num_tensors, num_lora_weights = _count_full_adapter_tensors(
-            named_tensors, is_pp_local=not self.placement.gather_pp
-        )
-        if not materialize:
-            return
-        if num_tensors == 0:
+        num_tensors, num_lora_weights = _count_full_adapter_tensors(named_tensors, is_pp_local=True)
+        if materialize and num_tensors == 0:
             raise RuntimeError("LoRA weight sync failed: the adapter export produced zero tensors")
-        if num_lora_weights == 0:
+        if materialize and num_lora_weights == 0:
             raise RuntimeError("LoRA weight sync failed: the adapter export contains no lora_A/lora_B names.")
-        while named_tensors:
-            hf_name, tensor = named_tensors.pop(0)
-            yield [(hf_name, tensor)]
+        stages = (
+            _iter_pp_adapter_stages(named_tensors, _gather_pp_adapter_layout(named_tensors))
+            if self.placement.gather_pp
+            else iter([named_tensors])
+        )
+        del named_tensors
+        for stage in stages:
+            while stage:
+                hf_name, tensor = stage.pop(0)
+                if materialize:
+                    yield [(hf_name, tensor)]
+                del tensor
 
     @abstractmethod
     def _export_pp_local_lora(self, adapter) -> list[tuple[str, torch.Tensor]]:
@@ -110,27 +114,40 @@ def _count_full_adapter_tensors(
     return counts[0], counts[1]
 
 
-def _gather_pp_full_adapter(
+def _gather_pp_adapter_layout(
     hf_named_tensors: Sequence[tuple[str, torch.Tensor]],
-) -> list[tuple[str, torch.Tensor]]:
-    """Gather the complete adapter onto every PP rank: exchange metadata, then
-    one flat broadcast per (owner, dtype)."""
+) -> list[list[tuple[str, tuple[int, ...], torch.dtype]]]:
+    """Exchange only adapter names, shapes and dtypes across pipeline stages."""
+    pp = get_parallel_state().pp
+    local_meta = [(n, tuple(t.shape), t.dtype) for n, t in hf_named_tensors]
+    if pp.size == 1:
+        return [local_meta]
+    all_meta: list = [None] * pp.size
+    dist.all_gather_object(all_meta, local_meta, group=pp.group)
+    return all_meta
+
+
+def _iter_pp_adapter_stages(
+    hf_named_tensors: Sequence[tuple[str, torch.Tensor]],
+    layout: list[list[tuple[str, tuple[int, ...], torch.dtype]]],
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    """Stream a PP owner's adapter before allocating the next owner's buffers.
+
+    Adapted from upstream PR #4127, retaining the current PP-local count reduction.
+    """
     pp = get_parallel_state().pp
     if pp.size == 1:
-        return list(hf_named_tensors)
+        yield hf_named_tensors if isinstance(hf_named_tensors, list) else list(hf_named_tensors)
+        return
     global_ranks = dist.get_process_group_ranks(pp.group)
     device = torch.cuda.current_device()
 
-    local_meta = [(n, tuple(t.shape), t.dtype) for n, t in hf_named_tensors]
-    all_meta: list = [None] * pp.size
-    dist.all_gather_object(all_meta, local_meta, group=pp.group)
-
     local_by_name = {n: t for n, t in hf_named_tensors}
-    merged: dict[str, torch.Tensor] = {}
-    for src, meta in enumerate(all_meta):
+    for src, meta in enumerate(layout):
         by_dtype: dict = {}
         for n, shape, dtype in meta:
             by_dtype.setdefault(dtype, []).append((n, shape))
+        stage = []
         for dtype, entries in by_dtype.items():
             numel = sum(math.prod(shape) for _, shape in entries)
             flat = torch.empty(numel, dtype=dtype, device=device)
@@ -144,9 +161,12 @@ def _gather_pp_full_adapter(
             off = 0
             for n, shape in entries:
                 k = math.prod(shape)
-                merged[n] = flat[off : off + k].view(shape)
+                stage.append((n, flat[off : off + k].view(shape)))
                 off += k
-    return sorted(merged.items())
+            del flat
+        stage.sort(key=lambda item: item[0])
+        yield stage
+        del stage
 
 
 _FROZEN_TOWER_PROVIDERS = ("inkling_mm_model_provider", "qwen3_5_mm_model_provider")

@@ -124,3 +124,64 @@ class TestPpLocalAdapterUnits:
     def test_an_adapter_empty_on_every_stage_raises(self):
         with pytest.raises(RuntimeError, match="zero tensors"):
             self._iter_stage([], peer_counts=[0, 0])
+
+
+def test_pp_adapter_broadcasts_are_lazy_and_preserve_owner_tensor_values():
+    from miles.backends.megatron_utils.update_weight import hf_weight_iterator as module
+
+    local = [("layer0.lora_A", torch.arange(6).view(2, 3).float())]
+    peer = torch.arange(4).float() + 10
+    layout = [[("layer0.lora_A", (2, 3), torch.float32)], [("layer1.lora_B", (4,), torch.float32)]]
+    broadcasts = []
+
+    def broadcast(flat, src, group):
+        broadcasts.append(src)
+        if src == 5:
+            flat.copy_(peer)
+
+    pp = Namespace(size=2, rank=0, group=None)
+    with (
+        patch.object(module, "get_parallel_state", return_value=Namespace(pp=pp)),
+        patch.object(module.dist, "get_process_group_ranks", return_value=[3, 5]),
+        patch.object(module.dist, "broadcast", broadcast),
+        patch.object(module.torch.cuda, "current_device", return_value="cpu"),
+    ):
+        stages = module._iter_pp_adapter_stages(local, layout)
+        assert broadcasts == []
+        first = next(stages)
+        assert broadcasts == [3]
+        assert first[0][0] == local[0][0] and torch.equal(first[0][1], local[0][1])
+        del first
+        second = next(stages)
+        assert broadcasts == [3, 5]
+        assert second[0][0] == "layer1.lora_B" and torch.equal(second[0][1], peer)
+        with pytest.raises(StopIteration):
+            next(stages)
+
+
+def test_non_materializing_adapter_rank_still_drains_every_pipeline_collective():
+    from miles.backends.megatron_utils.update_weight import hf_weight_iterator as module
+
+    class Stage(module.MegatronHfWeightIteratorBase):
+        def _iter_hf_param_units(self, weights, *, materialize):
+            yield from ()
+
+        def _export_pp_local_lora(self, adapter):
+            return [("layer0.lora_A", torch.ones(2))]
+
+    joined = []
+
+    def stages(*_args):
+        for owner in (0, 1):
+            joined.append(owner)
+            yield [(f"layer{owner}.lora_A", torch.ones(2))]
+
+    iterator = object.__new__(Stage)
+    iterator.placement = WeightUpdatePlacement(gather_pp=True)
+    with (
+        patch.object(module, "_count_full_adapter_tensors", return_value=(2, 2)),
+        patch.object(module, "_gather_pp_adapter_layout", return_value=[]),
+        patch.object(module, "_iter_pp_adapter_stages", stages),
+    ):
+        assert list(iterator._iter_hf_adapter_units(None, materialize=False)) == []
+    assert joined == [0, 1]

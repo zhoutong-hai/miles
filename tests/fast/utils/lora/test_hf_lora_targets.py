@@ -4,7 +4,9 @@ import pytest
 
 from miles.utils.lora.hf_lora_targets import (
     exclude_hf_lora_targets,
+    expand_hf_lora_targets,
     expand_packed_hf_lora_targets,
+    get_hf_lora_targets,
     parse_lora_targets,
     resolve_hf_lora_targets,
     unembed_lora_targets,
@@ -19,6 +21,27 @@ def test_missing_targets_and_all_linear_use_model_defaults(selection):
     assert "model.layers.*.self_attn.q_proj" in targets
     assert "model.layers.*.mlp.gate_proj" in targets
     assert "lm_head" not in targets
+
+
+def test_kimi_kda_qkv_are_explicit_targets_without_changing_defaults():
+    config = {
+        "model_type": "kimi_k3",
+        "text_config": {
+            "num_experts": 896,
+            "num_hidden_layers": 93,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "num_shared_experts": 1,
+        },
+    }
+    layout = get_hf_lora_targets(config)
+    defaults = resolve_hf_lora_targets(config)
+    qkv = [f"language_model.model.layers.*.self_attn.{name}_proj" for name in ("q", "k", "v")]
+    assert not set(qkv) & set(defaults)
+    assert expand_hf_lora_targets(defaults, layout) == defaults
+    assert set(expand_hf_lora_targets(defaults + qkv, layout)) == set(defaults + qkv)
+    with pytest.raises(AssertionError, match="not an HF target"):
+        expand_hf_lora_targets(["language_model.model.layers.*.self_attn.g_proj"], layout)
 
 
 @pytest.mark.parametrize(

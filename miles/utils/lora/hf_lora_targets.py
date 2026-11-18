@@ -28,6 +28,8 @@ class HfLoraTargets:
     packed_expert_gate_up_layout: str | None = None
     # the HF vocab: the most head lora_B rows an HF-shaped source may hold
     vocab_size: int | None = None
+    # Supported by explicit selectors, without widening all-linear / attn defaults.
+    explicit_only_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class _HfLoraModelSpec:
     tinker_name_renames: tuple[tuple[str, str], ...] = ()
     component_rows_by_fused_module: Callable[[dict], tuple[tuple[str, tuple[int, ...]], ...]] = lambda config: ()
     packed_expert_gate_up_layout: str | None = None
+    explicit_only_targets: tuple[str, ...] = ()
 
 
 # official Tinker exports (checked against SDK 0.36 exports): HF names except the head and the stacked 3D experts
@@ -339,6 +342,7 @@ _HF_LORA_MODELS = {
         layer_prefix="language_model.model.layers.*",
         unembed="language_model.lm_head",
         unwrap_text_config=True,
+        explicit_only_targets=_prefix_paths("self_attn", "q_proj", "k_proj", "v_proj"),
     ),
     "glm4": _HfLoraModelSpec(_glm4_targets),
     "glm4_moe": _HfLoraModelSpec(_glm4_moe_targets),
@@ -381,6 +385,7 @@ def get_hf_lora_targets(hf_config: dict) -> HfLoraTargets:
         component_rows_by_fused_module=spec.component_rows_by_fused_module(text_config),
         vocab_size=text_config.get("vocab_size"),
         packed_expert_gate_up_layout=spec.packed_expert_gate_up_layout,
+        explicit_only_targets=_prefix_paths(spec.layer_prefix, *spec.explicit_only_targets),
     )
 
 
@@ -448,7 +453,7 @@ def exclude_hf_lora_targets(targets: list[str], exclusions: list[str]) -> list[s
 
 
 def expand_hf_lora_targets(targets: list[str], layout: HfLoraTargets) -> list[str]:
-    available = layout.attention + layout.mlp + layout.unembed
+    available = layout.attention + layout.mlp + layout.unembed + layout.explicit_only_targets
     for target in targets:
         assert any(
             matches_lora_target(module, target) for module in available

@@ -168,6 +168,47 @@ class ModelCompanionWeightVersionUtils:
             companion.weight_version.add_(1)
 
 
+class ModelCompanionCheckpointUtils:
+    """Small JSON-compatible companion state for adapter-only training checkpoints."""
+
+    @staticmethod
+    def capture(model: Sequence[torch.nn.Module]) -> list[dict]:
+        return [
+            {
+                "pipeline_rank": companion.pipeline_rank,
+                "chunk_index": companion.chunk_index,
+                "replica_id": list(companion.replica_id),
+                "parameters": {
+                    name: {"shape": list(value.shape), "values": value.tolist()}
+                    for name, value in companion.state_dict().items()
+                },
+            }
+            for companion in _get_companions_of_model(model)
+        ]
+
+    @staticmethod
+    def restore(model: Sequence[torch.nn.Module], saved: list[dict]) -> None:
+        companions = _get_companions_of_model(model)
+        assert len(companions) == len(saved), "adapter checkpoint companion count differs"
+        prepared = []
+        for companion, state in zip(companions, saved, strict=True):
+            assert (companion.pipeline_rank, companion.chunk_index, list(companion.replica_id)) == (
+                state["pipeline_rank"],
+                state["chunk_index"],
+                state["replica_id"],
+            ), "adapter checkpoint companion topology differs"
+            current = companion.state_dict()
+            assert current.keys() == state["parameters"].keys(), "adapter checkpoint companion fields differ"
+            prepared.append(
+                {
+                    name: torch.tensor(value["values"], dtype=current[name].dtype).reshape(value["shape"])
+                    for name, value in state["parameters"].items()
+                }
+            )
+        for companion, state in zip(companions, prepared, strict=True):
+            companion.load_state_dict(state)
+
+
 class SampleIdentityExtractor:
     @staticmethod
     def get_consumed_sample_identities(

@@ -109,6 +109,23 @@ def test_restore_loads_the_rng_state_inside_the_committed_training_state(tmp_pat
     restore.assert_called_once_with(state["rng_state"])
 
 
+def test_adapter_checkpoint_companions_restore_version_and_dynamic_consumption_rows():
+    from miles.backends.training_utils.model_companion import ModelCompanion
+
+    model = torch.nn.Module()
+    companion = ModelCompanion(pipeline_rank=0, chunk_index=0, replica_id=(0, 0, 0))
+    model.add_module("model_companion", companion)
+    companion.weight_version.fill_(2)
+    rows = torch.arange(10, dtype=torch.int64).reshape(2, 5)
+    companion.sample_consumptions.data = rows.clone()
+    saved = json.loads(json.dumps(lora_checkpoint._capture_model_companions([model])))
+    companion.weight_version.zero_()
+    companion.sample_consumptions.data = torch.empty((0, 5), dtype=torch.int64)
+    lora_checkpoint._restore_model_companions([model], saved)
+    assert companion.weight_version.item() == 2
+    torch.testing.assert_close(companion.sample_consumptions, rows, rtol=0, atol=0)
+
+
 @pytest.fixture
 def rng_checkpoint_runtime(monkeypatch):
     import miles.backends.megatron_utils.lora.rng_state as rng

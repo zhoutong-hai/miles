@@ -55,6 +55,7 @@ from miles.backends.training_utils.checkpoint.adapter.parametrization import (
 )
 from miles.backends.training_utils.checkpoint.adapter.readers import AdapterSourceKind, read_source_lora_alpha
 from miles.backends.training_utils.checkpoint.adapter.source_error import AdapterSourceError, require_fields
+from miles.backends.training_utils.model_companion import ModelCompanionCheckpointUtils
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.hf_utils.config import load_hf_config
 
@@ -644,6 +645,24 @@ def single_lora_parametrization(
     )
 
 
+def _capture_model_companions(model) -> list:
+    with agree_on_failure_context():
+        local = ModelCompanionCheckpointUtils.capture(model)
+    if not dist.is_initialized():
+        return [local]
+    ranks = [None] * dist.get_world_size()
+    dist.all_gather_object(ranks, local, group=gloo_group())
+    return ranks
+
+
+def _restore_model_companions(model, saved: list) -> None:
+    with agree_on_failure_context():
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        assert len(saved) == world, "adapter checkpoint companion world size differs"
+        ModelCompanionCheckpointUtils.restore(model, saved[rank])
+
+
 def save_single_lora(
     model,
     optimizer,
@@ -667,6 +686,7 @@ def save_single_lora(
         # a dynamic global batch decouples from rollouts
         "first_rollout": first_rollout,
         "opt_param_scheduler": opt_param_scheduler.state_dict() if opt_param_scheduler is not None else None,
+        "model_companions": _capture_model_companions(model),
     }
     if not args.backend.no_save_rng:
         training_state["rng_state"] = capture_rng_state()
@@ -763,6 +783,8 @@ def restore_single_lora(
     scheduler_state = training_state.get("opt_param_scheduler")
     if opt_param_scheduler is not None and scheduler_state is not None:
         opt_param_scheduler.load_state_dict(scheduler_state)
+    if "model_companions" in training_state:
+        _restore_model_companions(model, training_state["model_companions"])
     if "rng_state" in training_state and not args.backend.no_load_rng:
         restore_rng_state(training_state["rng_state"])
     return AdapterRestore(training_state["iteration"], scheduler_state is not None, training_state["first_rollout"])

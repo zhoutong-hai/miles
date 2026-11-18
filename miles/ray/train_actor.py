@@ -348,6 +348,15 @@ class TrainRayActor(NodeProbeMixin):
         """Export current weights as an HF checkpoint to ``path`` (eval snapshots)."""
         raise NotImplementedError(f"{type(self).__name__} does not support HF export")
 
+    def set_entropy_packet(self, packet: dict) -> str:
+        raise NotImplementedError("Entropy control is supported by the Megatron backend")
+
+    def set_entropy_checkpoint_state(self, state: dict) -> str:
+        raise NotImplementedError("Entropy checkpoint state requires the Megatron backend")
+
+    def log_entropy_publication(self, event: dict, metrics: dict) -> int:
+        raise NotImplementedError("Entropy publication logging requires the Megatron backend")
+
     @abc.abstractmethod
     def update_weights(
         self, info: UpdatableEngines, debug_weight_update_id: str, rollout_id: int | None

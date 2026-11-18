@@ -509,6 +509,7 @@ def run_forward_backward_pass(
                 "loss_weights",
                 "prompt_loss_scale",
                 "entropy_response_scale",
+                "entropy_metadata",
                 "target_tokens",
                 "sample_indices",
                 *sampling_mask_keys,
@@ -691,6 +692,9 @@ def train_one_step(
     # step and subsequent zero_grad release them.
     if outcome == TrainStepOutcome.NORMAL:
         dumper_phase_util.finalize(model)
+
+    if args.entropy_control_mode != "off" and (disable_optimizer or not valid_step):
+        raise FloatingPointError("Entropy feedback cannot accept a skipped or invalid optimizer update")
 
     if not disable_optimizer and valid_step:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -954,6 +958,7 @@ def save(
     *,
     adapter_slots: BridgeAdapterSlots | NativeAdapterSlots | None = None,
     schedule_first_rollout: int | None = None,
+    entropy_control_state: dict | None = None,
 ) -> None:
     """Persist a training checkpoint safely with forward hooks disabled.
 
@@ -975,7 +980,8 @@ def save(
     if is_lora_model(model):
         assert adapter_slots is not None, "a LoRA --save needs the model's adapter slots"
         assert schedule_first_rollout is not None, "a LoRA --save records the rollout its schedule counts from"
-        save_single_lora(model, optimizer, opt_param_scheduler, adapter_slots, args, iteration, schedule_first_rollout)
+        save_single_lora(model, optimizer, opt_param_scheduler, adapter_slots, args, iteration, schedule_first_rollout,
+                         entropy_control_state=entropy_control_state)
     else:
         save_checkpoint(
             iteration,

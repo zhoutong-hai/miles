@@ -671,6 +671,8 @@ def save_single_lora(
     args,
     iteration: int,
     first_rollout: int,
+    *,
+    entropy_control_state: dict | None = None,
 ):
     """``{save}/iter_N/adapter``: adapter state, training state and the PEFT export, committed by rank 0."""
     members = DistributedOptimizerMembers(
@@ -688,6 +690,10 @@ def save_single_lora(
         "opt_param_scheduler": opt_param_scheduler.state_dict() if opt_param_scheduler is not None else None,
         "model_companions": _capture_model_companions(model),
     }
+    if args.entropy_control_mode != "off":
+        if entropy_control_state is None or entropy_control_state["pending"]["used"]["for_update"] != iteration + 1:
+            raise ValueError("LoRA checkpoint lacks its matching pre-publication entropy state")
+        training_state["entropy_control"] = entropy_control_state
     if not args.backend.no_save_rng:
         training_state["rng_state"] = capture_rng_state()
     save_and_commit_adapter_dir(

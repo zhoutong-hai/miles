@@ -13,6 +13,7 @@ from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutpu
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train.cell import TrainerCell
+from miles.ray.train.entropy import EntropyCoordinator
 from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
 from miles.ray.train.init_request import TrainerControllerInitRequest
 from miles.ray.train_actor import WeightUpdateOutput
@@ -93,6 +94,7 @@ class TrainerController:
 
         self._cells_by_id: dict[str, TrainerCell] = {}
         self._debug_trainer_load_state_timestamp = time.time()
+        self._entropy: EntropyCoordinator | None = None
 
     @property
     def pool_id(self) -> str:
@@ -217,6 +219,8 @@ class TrainerController:
 
             log_structured(logger.info, tag="ft", op="train", phase="start", rollout=rollout_id, attempt=attempt)
             await self._refresh_cells(rollout_id=rollout_id)
+            if self._entropy is not None:
+                await self._entropy.prepare(self._cells, rollout_id)
             snapshot_alive_cells, results = await self._gather_all_alive_and_catch(
                 lambda cell: cell.train(
                     rollout_id=rollout_id,
@@ -251,6 +255,9 @@ class TrainerController:
             return worker_results
 
         worker_results = await retry(_fn, max_attempts=_RETRY_MAX_ATTEMPTS)
+
+        if self._entropy is not None:
+            self._entropy.accept(worker_results)
 
         await reach_fault_hook_async(FaultHookName.TRAINER_CONTROLLER_STEP_END, rollout_id=rollout_id)
 
@@ -356,6 +363,7 @@ class TrainerController:
         args.num_rollout = request.num_rollout
         args.wandb_run_id = request.wandb_run_id
         args.mlflow_run_id = request.mlflow_run_id
+        self._entropy = EntropyCoordinator(args) if args.entropy_control_mode != "off" else None
         configure_logger(
             args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id, model_id=args.trainer_model_id)
         )
@@ -401,13 +409,18 @@ class TrainerController:
                 for cell in initial_cells
             ]
         )
-        return [item for sublist in cell_results for item in sublist]
+        cursors = [item for sublist in cell_results for item in sublist]
+        if self._entropy is not None:
+            self._entropy.validate_loaded_cursors(cursors)
+        return cursors
 
     async def is_initialized(self) -> bool:
         return self._init_once.is_initialized()
 
     async def load_state(self, request: TrainerControllerInitRequest) -> list[Any]:
         assert self._init_once.is_initialized()
+        if self._entropy is not None:
+            raise ValueError("Entropy-controlled restore requires a fresh coordinator bound to the saved adapter state")
 
         await self._wait_expected_num_cells(timeout=_CELLS_READY_TIMEOUT_SECONDS)
 
@@ -422,11 +435,19 @@ class TrainerController:
 
     async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
+        if self._entropy is not None:
+            await self._entropy.prepare_save(self._cells)
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         await retry(
             lambda _: self._execute_first_alive("save_model", rollout_id=rollout_id, force_sync=force_sync),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
+
+    async def commit_entropy_publication(self, rollout_id: int | None, weight_version: int | None,
+                                         failed_cell_ids: tuple[str, ...]) -> None:
+        if self._entropy is not None:
+            await self._entropy.published(self._cells, rollout_id=rollout_id,
+                                          weight_version=weight_version, failed_cell_ids=failed_cell_ids)
 
     async def export_hf(self, rollout_id: int, path: str) -> None:
         """Export current weights as an HF checkpoint. Only cell 0 exports to avoid file write conflicts."""

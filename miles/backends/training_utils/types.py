@@ -18,3 +18,5 @@ class TrainStepOutcome(StrEnum):
 class TrainStepOutput:
     outcome: TrainStepOutcome
     values: StoreObjectRef | None = None
+    entropy_observation: dict | None = None
+    optimizer_step_valid: bool | None = None

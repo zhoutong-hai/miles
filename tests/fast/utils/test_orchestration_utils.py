@@ -35,7 +35,7 @@ class TestInitOrchestrationScript:
     def test_initializes_the_shared_driver_machinery_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every driver restores the event history first, then initializes the shared machinery in order."""
         args = Namespace(
-            run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, wandb_run_id="wandb", mlflow_run_id="mlflow"
+            run="test", ci_fault_hooks=None, ci_fault_hooks_path=None, wandb_run_id="wandb", mlflow_run_id="mlflow", entropy_control_mode="off"
         )
         all_args = Namespace(wandb_run_id=None, mlflow_run_id=None)
         worker_manager = object()

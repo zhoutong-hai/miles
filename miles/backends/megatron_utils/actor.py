@@ -10,6 +10,7 @@ from megatron.training.async_utils import maybe_finalize_async_save
 from torch_memory_saver import torch_memory_saver
 
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
+from miles.backends.megatron_utils.entropy_runtime import EntropyWorkerState
 from miles.backends.megatron_utils.hf_export import save_hf_model
 from miles.backends.megatron_utils.lora.bridge_adapter_slots import BridgeAdapterSlots
 from miles.backends.megatron_utils.lora.checkpoint import build_adapter_slots
@@ -125,6 +126,8 @@ def _setup_disk_offload_reclaim(disk_dir: str) -> None:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    _entropy: EntropyWorkerState | None = None
+
     @property
     def _trains_indexers(self) -> bool:
         # Megatron leaves --dsa-indexer-loss-coeff None unless set, which like 0 means no indexer loss
@@ -313,6 +316,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def _init_training_state(self) -> None:
         args = self.args
+        self._entropy = EntropyWorkerState(args) if args.entropy_control_mode != "off" else None
         self._init_weight_updater_and_publisher(
             update_weights=not args.debug_train_only,
             publish_snapshots=exports_hf_snapshots(args),
@@ -449,6 +453,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 resume_from_ckpt=resume_from_ckpt,
             )
         self._last_rollout_id = None
+
+        self._entropy = EntropyWorkerState(self.args) if self.args.entropy_control_mode != "off" else None
 
         rebind_env_reporting(self.args)
         logger.info(f"load_state rolled this trainer back to checkpoint iteration {load_output.loaded_rollout_id}")
@@ -871,7 +877,9 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
             self._set_replay_stage("replay_backward")
-            with timer("actor_train"):
+            with timer("actor_train"), (
+                self._entropy.capture(rollout_id=rollout_id) if self._entropy is not None else nullcontext()
+            ) as entropy_capture:
                 self._log_first_train_config()
                 train_step_outcome = train(
                     self.args,
@@ -885,6 +893,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     witness_info=witness_info,
                     attempt=attempt,
                 )
+            entropy_observation = (
+                self._entropy.finish(entropy_capture)
+                if self._entropy is not None and train_step_outcome == TrainStepOutcome.NORMAL else None
+            )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -917,7 +929,23 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
         self._heartbeat.bump()
-        return TrainStepOutput(outcome=train_step_outcome)
+        return TrainStepOutput(outcome=train_step_outcome, entropy_observation=entropy_observation,
+                               optimizer_step_valid=True if self._entropy is not None else None)
+
+    def set_entropy_packet(self, packet: dict) -> str:
+        if self._entropy is None:
+            raise ValueError("Entropy control was not selected at startup")
+        return self._entropy.set_packet(packet)
+
+    def set_entropy_checkpoint_state(self, state: dict) -> str:
+        if self._entropy is None:
+            raise ValueError("Entropy control was not selected at startup")
+        return self._entropy.set_checkpoint_state(state)
+
+    def log_entropy_publication(self, event: dict, metrics: dict) -> int:
+        if self._entropy is None:
+            raise ValueError("Entropy control was not selected at startup")
+        return self._entropy.log_publication(event, metrics)
 
     def _log_first_train_config(self) -> None:
         if SNAPSHOT_TESTING_ENABLED and not self._config_snapshot_train_recorded:
@@ -956,6 +984,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.opt_param_scheduler,
             adapter_slots=self.adapter_slots,
             schedule_first_rollout=self._schedule_first_rollout,
+            entropy_control_state=self._entropy.checkpoint_state if self._entropy is not None else None,
         )
 
         if self.args.save_hf is not None and self.role == "actor":

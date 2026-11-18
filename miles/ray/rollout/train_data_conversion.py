@@ -50,6 +50,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "rewards": ValueSpec(codec="ndarray", dtype="float32"),
     "prompt_loss_scale": ValueSpec(codec="ndarray", dtype="float32"),
     "entropy_response_scale": ValueSpec(codec="ndarray", dtype="float32"),
+    "entropy_metadata": ValueSpec(codec="msgpack_ragged"),
     "truncated": ValueSpec(codec="ndarray", dtype="int64"),
     "round_number": ValueSpec(codec="ndarray", dtype="int64"),
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
@@ -136,6 +137,15 @@ def convert_samples_to_train_data(
         )
         train_data["prompt_loss_scale"] = factors
         train_data["entropy_response_scale"] = [response_scale] * len(samples)
+
+    if args.entropy_control_mode != "off":
+        entropy_metadata = []
+        for sample in samples:
+            meta = sample.metadata
+            if not isinstance(meta, dict) or not all(isinstance(meta.get(key), str) and meta[key] for key in ("theme", "scenario")):
+                raise ValueError("Entropy observations require original theme/scenario metadata")
+            entropy_metadata.append({"group_index": sample.group_index, "theme": meta["theme"], "scenario": meta["scenario"]})
+        train_data["entropy_metadata"] = entropy_metadata
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -555,6 +565,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "loss_weights",
             "prompt_loss_scale",
             "entropy_response_scale",
+            "entropy_metadata",
             "advantages",
             "target_tokens",
         ]:

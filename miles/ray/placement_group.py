@@ -423,6 +423,10 @@ async def update_weights(
     if output.weight_version is not None:
         await rollout_executor.set_weight_version(output.weight_version, trainer_model_id=trainer_model_id)
 
+    if args.entropy_control_mode != "off":
+        await actor_model.commit_entropy_publication(rollout_id=rollout_id, weight_version=output.weight_version,
+                                                     failed_cell_ids=output.failed_cell_ids)
+
 
 def _log_inference_engine_weight_checksums(
     args,

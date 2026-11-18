@@ -61,6 +61,7 @@ from miles.utils.object_store_config import (
 )
 from miles.utils.output_store.config import check_output_store_args
 from miles.utils.prompt_mean import validate_prompt_mean_args
+from miles.utils.entropy_control import validate_entropy_control_args
 from miles.utils.rollout_data_config import RolloutDatasetConfig, check_dataset_length_limits, load_rollout_data_config
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
 from miles.utils.run_uuid import generate_run_uuid, validate_run_uuid
@@ -2048,6 +2049,7 @@ def miles_validate_args(args):
 
     validate_score_centering_args(args)
     validate_prompt_mean_args(args)
+    validate_entropy_control_args(args)
     if args.observe_advantage_sign_metrics and not (
         args.policy_loss_aggregation == "prompt-mean"
         and args.use_tis

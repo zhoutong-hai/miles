@@ -7,6 +7,7 @@ CUDA/Ray. Only the row scorer/layout is replaced by a CPU softmax layout.
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,8 +15,10 @@ import pytest
 import torch
 
 from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_function
+from miles.backends.training_utils.loss.hub.entropy_observation import apply_entropy_control, capture_entropy, negative_pg_multiplier
 from miles.backends.training_utils.loss.hub.sign_metrics import advantage_sign_metrics
 from miles.utils.prompt_mean import prompt_mean_scales, scale_prompt_losses, validate_prompt_mean_args
+from miles.utils.entropy_control import merge_response_fragments
 
 ROOT = Path(__file__).resolve().parents[4]
 HUB = ROOT / "miles/backends/training_utils/loss/hub"
@@ -70,6 +73,7 @@ def _loss_function():
         vanilla_tis_function=vanilla_tis_function,
         scale_prompt_losses=scale_prompt_losses,
         advantage_sign_metrics=advantage_sign_metrics,
+        apply_entropy_control=apply_entropy_control,
     )
     _source_functions(
         HUB / "math_utils.py",
@@ -84,6 +88,7 @@ def _args(**updates):
         policy_loss_aggregation="prompt-mean",
         train_backend="megatron",
         loss_type="policy_loss",
+        entropy_control_mode="off",
         calculate_per_token_loss=True,
         skip_actor_forward_only=True,
         use_routing_replay=False,
@@ -127,7 +132,8 @@ def _args(**updates):
 @pytest.mark.parametrize("split", ["whole", "unequal_microbatches", "dp_cp_slices"])
 @pytest.mark.parametrize("empty_response", [False, True])
 @pytest.mark.parametrize("routing_forward", [False, True])
-def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empty_response, routing_forward):
+@pytest.mark.parametrize("entropy_scale", [None, 1.0, 0.6, 1.1])
+def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empty_response, routing_forward, entropy_scale):
     torch.manual_seed(42)
     masks = [torch.ones(n) for n in (1, 3, 2, 2, 1, 5)]
     if empty_response:
@@ -145,9 +151,7 @@ def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empt
     for rows in partitions:
         cp_parts = [0, 1] if split == "dp_cp_slices" else [None]
         for cp in cp_parts:
-            selections = [
-                torch.arange(len(masks[i])) if cp is None else torch.arange(cp, len(masks[i]), 2) for i in rows
-            ]
+            selections = [torch.arange(len(masks[i])) if cp is None else torch.arange(cp, len(masks[i]), 2) for i in rows]
             token_ids = torch.cat([positions + offsets[i] for i, positions in zip(rows, selections, strict=True)])
             local_masks = [masks[i][positions] for i, positions in zip(rows, selections, strict=True)]
             batch = dict(
@@ -163,17 +167,19 @@ def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empt
             if routing_forward:
                 # The standalone forward exists to record R3 routes. Deliberately
                 # perturb its scores: PG/TIS must still use the training forward.
-                batch["log_probs"] = list((logits[token_ids].detach().log_softmax(-1)[:, 0] - 3).split(
-                    [len(x) for x in local_masks]
-                ))
+                batch["log_probs"] = list((logits[token_ids].detach().log_softmax(-1)[:, 0] - 3).split([len(x) for x in local_masks]))
 
             def reduce(values, masks=local_masks):
                 return (values * torch.cat(masks)).sum()
 
-            part, frame = _loss_function()(
-                _args(skip_actor_forward_only=not routing_forward, use_routing_replay=routing_forward),
-                batch, logits[token_ids], reduce,
-            )
+            packet = {"scale": entropy_scale, "spec": {"threshold": 0.05}}
+            with capture_entropy(packet, cp_rank=cp or 0, record_enabled=False, tis_low=0.5, tis_high=2.0) if entropy_scale is not None else nullcontext():
+                part, frame = _loss_function()(
+                    _args(skip_actor_forward_only=not routing_forward, use_routing_replay=routing_forward, entropy_control_mode="off" if entropy_scale is None else "direct"),
+                    batch,
+                    logits[token_ids],
+                    reduce,
+                )
             loss = loss + part / normalizer
             for name, value in frame.items():
                 metrics[name] = metrics.get(name, 0) + value / normalizer
@@ -184,29 +190,18 @@ def test_native_score_reuse_gradient_matches_direct_prompt_reinforce(split, empt
     logp = reference_logits.log_softmax(-1)[:, 0]
     weights = (logp.detach().float() - original_q.detach().float()).exp().clamp(0.5, 2)
     token_loss = -torch.cat(advantages) * weights * logp
-    expected = (
-        sum(
-            sum((token_loss[offsets[i] : offsets[i] + len(masks[i])] * masks[i]).sum() for i in [2 * g, 2 * g + 1])
-            / sum(masks[i].sum() for i in [2 * g, 2 * g + 1])
-            for g in range(3)
-        )
-        / 3
-    )
+    if entropy_scale is not None:
+        eligible = (torch.cat(advantages) < 0) & (logp.detach().float().exp() <= torch.tensor(0.05))
+        token_loss = token_loss * torch.where(eligible, torch.tensor(entropy_scale), torch.tensor(1.0))
+    expected = sum(sum((token_loss[offsets[i] : offsets[i] + len(masks[i])] * masks[i]).sum() for i in [2 * g, 2 * g + 1]) / sum(masks[i].sum() for i in [2 * g, 2 * g + 1]) for g in range(3)) / 3
     expected.backward()
     torch.testing.assert_close(actual, reference_logits.grad, rtol=2e-6, atol=1e-7)
     entropy = -(logits.detach().log_softmax(-1).exp() * logits.detach().log_softmax(-1)).sum(-1)
-    response_mean = sum(
-        (entropy[start : start + len(mask)] * mask).sum() / mask.sum()
-        for start, mask in zip(offsets, masks, strict=True)
-        if mask.sum() > 0
-    ) / sum(mask.sum() > 0 for mask in masks)
+    response_mean = sum((entropy[start : start + len(mask)] * mask).sum() / mask.sum() for start, mask in zip(offsets, masks, strict=True) if mask.sum() > 0) / sum(mask.sum() > 0 for mask in masks)
     torch.testing.assert_close(metrics["entropy/equal_nonempty_response_mean"], response_mean)
     for name in ["positive", "negative", "zero"]:
         prefix = f"sign/{name}"
-        histogram = sum(
-            metrics[f"{prefix}/tis_{bin}_fraction"]
-            for bin in ["below_floor", "floor_to_one", "one_to_cap", "above_cap"]
-        )
+        histogram = sum(metrics[f"{prefix}/tis_{bin}_fraction"] for bin in ["below_floor", "floor_to_one", "one_to_cap", "above_cap"])
         torch.testing.assert_close(histogram, metrics[f"{prefix}/token_fraction"])
     torch.testing.assert_close(
         sum(metrics[f"sign/{name}/token_fraction"] for name in ["positive", "negative", "zero"]),
@@ -238,8 +233,7 @@ def test_r3_scoring_forward_is_admitted_without_rollout_replay():
     with pytest.raises(ValueError):
         validate_prompt_mean_args(_args(skip_actor_forward_only=False))
     with pytest.raises(ValueError):
-        validate_prompt_mean_args(_args(skip_actor_forward_only=False, use_routing_replay=True,
-                                        use_rollout_routing_replay=True))
+        validate_prompt_mean_args(_args(skip_actor_forward_only=False, use_routing_replay=True, use_rollout_routing_replay=True))
 
 
 def test_composed_algorithm_cli_registers_prompt_mean_once():
@@ -272,21 +266,67 @@ def test_native_uniform_reward_group_has_exact_zero_advantage(value):
     path = ROOT / "miles/ray/rollout/train_data_conversion.py"
     normalize = _source_functions(path, ["_normalize_rewards_by_rollout"], namespace)["_normalize_rewards_by_rollout"]
     assert normalize(_args(), [object()] * 16, [value] * 16, None) == [0.0] * 16
-    torch.testing.assert_close(
-        torch.tensor(normalize(_args(), [object()] * 2, [0.25, 0.75], None)), torch.tensor([-0.25, 0.25])
-    )
+    torch.testing.assert_close(torch.tensor(normalize(_args(), [object()] * 2, [0.25, 0.75], None)), torch.tensor([-0.25, 0.25]))
 
 
 def test_complete_batch_scales_follow_actual_native_dp_packaging():
     path = ROOT / "miles/ray/rollout/train_data_conversion.py"
     package = _source_functions(path, ["_package_shards"], {})["_package_shards"]
-    factors, response_scale = prompt_mean_scales(
-        [0, 0, 1, 1], [[1], [1], [1, 1], [1, 1]], expected_groups=2, expected_fanout=2
-    )
-    data = dict(prompt_loss_scale=factors, entropy_response_scale=[response_scale] * 4, total_lengths=[2, 2, 3, 3])
+    factors, response_scale = prompt_mean_scales([0, 0, 1, 1], [[1], [1], [1, 1], [1, 1]], expected_groups=2, expected_fanout=2)
+    data = dict(prompt_loss_scale=factors, entropy_response_scale=[response_scale] * 4, total_lengths=[2, 2, 3, 3], entropy_metadata=[{"group_index": group, "theme": "theme", "scenario": "scenario"} for group in [0, 0, 1, 1]])
     shards = package(_args(), data, [[3, 0], [2, 1]])
     assert [shard["prompt_loss_scale"] for shard in shards] == [[0.75, 1.5], [0.75, 1.5]]
     assert all(shard["entropy_response_scale"] == [1.5, 1.5] for shard in shards)
+    assert [row["group_index"] for row in shards[0]["entropy_metadata"]] == [1, 0]
+
+
+def test_probability_threshold_is_inclusive_fp32_and_detached():
+    logp = torch.tensor([0.0499999, 0.05, 0.0500001, 0.01, 0.01, 0.01]).log().requires_grad_()
+    advantage = torch.tensor([-1.0, -1.0, -1.0, 1.0, 0.0, -1.0], requires_grad=True)
+    scale, eligible = negative_pg_multiplier(logp, advantage, torch.tensor([True] * 5 + [False]), threshold=0.05, scale=0.8)
+    assert eligible.tolist() == [True, True, False, False, False, False]
+    assert not scale.requires_grad
+    torch.testing.assert_close(scale, torch.tensor([0.8, 0.8, 1.0, 1.0, 1.0, 1.0]))
+
+
+def test_native_forward_entropy_capture_merges_original_cp_fragments_once():
+    torch.manual_seed(7)
+    lengths = [3, 2, 1, 4]
+    offsets = [0, 3, 5, 6]
+    masks = [torch.ones(n) for n in lengths]
+    advantages = [torch.full((n,), a) for n, a in zip(lengths, [1.0, -1.0, 0.0, 0.0], strict=True)]
+    factors, response_scale = prompt_mean_scales([0, 0, 1, 1], masks, expected_groups=2, expected_fanout=2)
+    logits = torch.randn(10, 5, requires_grad=True)
+    q = torch.linspace(-5.0, -0.1, 10, requires_grad=True)
+    fragments = []
+    for cp in range(2):
+        selections = [torch.arange(cp, n, 2) for n in lengths]
+        token_ids = torch.cat([selected + offset for selected, offset in zip(selections, offsets, strict=True)])
+        local_masks = [torch.ones(len(selected)) for selected in selections]
+        batch = dict(
+            advantages=[a[selected] for a, selected in zip(advantages, selections, strict=True)],
+            rollout_log_probs=list(q[token_ids].split([len(x) for x in selections])),
+            loss_masks=masks,
+            local_masks=local_masks,
+            response_lengths=lengths,
+            total_lengths=[n + 1 for n in lengths],
+            prompt_loss_scale=factors,
+            entropy_response_scale=[response_scale] * 4,
+            sample_indices=list(range(4)),
+            entropy_metadata=[dict(group_index=i // 2, theme="theme", scenario="scenario") for i in range(4)],
+        )
+        packet = dict(scale=0.8, spec=dict(threshold=0.05))
+        with capture_entropy(packet, cp_rank=cp, record_enabled=True, tis_low=0.5, tis_high=2.0) as capture:
+            _loss_function()(_args(entropy_control_mode="direct"), batch, logits[token_ids], lambda values, masks=local_masks: (values * torch.cat(masks)).sum())
+        fragments.extend(capture.fragments)
+    merged = merge_response_fragments(fragments, cp_size=2)
+    logp = logits.detach().log_softmax(-1)
+    h = -(logp.exp() * logp).sum(-1)
+    for row, offset, n in zip(merged, offsets, lengths, strict=True):
+        assert row["original_tokens"] == n
+        assert row["entropy_sum"] == pytest.approx(float(h[offset : offset + n].double().sum()))
+        assert row["advantage_representation"] == "torch.float32"
+    assert len(fragments) == 8 and len(merged) == 4
 
 
 def test_sign_statistics_preserve_finite_signed_entropy_and_zero_bucket():

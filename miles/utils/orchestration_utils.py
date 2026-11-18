@@ -16,7 +16,7 @@ from miles.utils.logging_utils import configure_logger
 from miles.utils.test_utils.fault_injector.actions.base import FaultHookResources
 from miles.utils.test_utils.fault_injector.controller import fault_hook_controller
 from miles.utils.test_utils.fault_injector.models import FaultHookOwner
-from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
+from miles.utils.tracking_utils.tracking import define_step_key_metric_group, finish_tracking, init_tracking
 from miles.utils.workers.argv_utils import ORCHESTRATOR_CONFIG_FLAG, orchestrator_config_values
 from miles.utils.workers.backend_capability import factory
 from miles.utils.workers.backend_capability.base import BackendCapability
@@ -69,6 +69,9 @@ def init_orchestration_script(startup_info: OrchestratorStartupInfo, *, disposer
     maybe_start_periodic_pyspy_dump()
     disposer.add(finish_tracking)
     init_tracking(args)
+    if args.entropy_control_mode != "off":
+        define_step_key_metric_group("entropy", "entropy/step")
+        define_step_key_metric_group("entropy_control", "entropy/step")
 
     if isinstance(startup_info, ArgvOrchestratorStartupInfo):
         all_args = startup_info.all_args

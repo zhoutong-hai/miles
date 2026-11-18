@@ -199,6 +199,14 @@ class AlgoConfig(PolicyAggregationConfig):
             )
         ),
     ] = False
+    entropy_control_mode: A[
+        str,
+        Arg(choices=["off", "observe", "direct"], help="Original-response entropy feedback; observe leaves PG unchanged."),
+    ] = "off"
+    entropy_control_source_commit: A[
+        str | None,
+        Arg(help="Exact Miles source identity for entropy observation, controller packets and checkpoints."),
+    ] = None
     observe_advantage_sign_metrics: A[
         bool,
         Arg(help="Log original-token sign/zero TIS distributions and training entropy masses for prompt-mean PG."),

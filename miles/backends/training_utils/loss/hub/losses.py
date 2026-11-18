@@ -6,6 +6,7 @@ import torch
 
 from miles.backends.training_utils.data.context_parallel import all_gather_with_cp
 from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_function
+from miles.backends.training_utils.loss.hub.entropy_observation import apply_entropy_control
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss.hub.math_utils import (
     compute_approx_kl,
@@ -260,6 +261,12 @@ def policy_loss_function(
         # [decouple IS and rejection] modified masks correct the numerator only;
         # denominators stay the precomputed rollout_mask_sums.
         sum_of_sample_mean = layout.reducer(modified_response_masks)
+
+    if args.entropy_control_mode != "off":
+        pg_loss = apply_entropy_control(
+            pg_loss, batch=batch, layout=layout, entropy=entropy, advantages=advantages,
+            active=active_tokens, log_probs=train_log_probs, rollout_log_probs=rollout_old_log_probs,
+        )
 
     if args.policy_loss_aggregation == "prompt-mean":
         pg_loss = scale_prompt_losses(

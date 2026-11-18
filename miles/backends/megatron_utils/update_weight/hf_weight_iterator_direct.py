@@ -135,13 +135,18 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
 
     def _export_pp_local_lora(self, adapter):
         started = time.perf_counter()
-        if adapter is None:
-            exported = export_lora_hf_named(iter_adapters(self.model))
-        else:
-            exported = [
-                (name, slice_lora_to_rank(name, tensor, adapter.rank))
-                for name, tensor in export_lora_hf_named(iter_slot_adapters(self.model, adapter.slot))
-            ]
+        native_adapters = (
+            iter_adapters(self.model) if adapter is None else iter_slot_adapters(self.model, adapter.slot)
+        )
+        rank = None if adapter is None else adapter.rank
+        # PP staging copies bounded batches to the device later. Keep completed
+        # adapters on CPU: the native TP/EP gather otherwise retains the whole
+        # stage on GPU before the bounded PP transfer even starts.
+        stage_on_cpu = self.placement.gather_pp and get_parallel_state().pp.size > 1
+        batches = ([native] for native in native_adapters) if stage_on_cpu else [native_adapters]
+        exported = [
+            item for batch in batches for item in _export_lora_batch(batch, rank=rank, to_cpu=stage_on_cpu)
+        ]
         if not dist.is_initialized() or dist.get_rank() == 0:
             peak_b = max(
                 (tensor.abs().max().item() for name, tensor in exported if name.endswith("lora_B.weight")),
@@ -162,6 +167,17 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
                     self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
                 )
             )
+
+
+def _export_lora_batch(adapters, *, rank: int | None, to_cpu: bool) -> list[tuple[str, torch.Tensor]]:
+    """Release a native gather's device tensors before exporting the next adapter."""
+    tensors = export_lora_hf_named(adapters)
+    if rank is not None:
+        tensors = [(name, slice_lora_to_rank(name, tensor, rank)) for name, tensor in tensors]
+    if to_cpu:
+        # Own the host snapshot even when a CPU caller supplies the parameters.
+        tensors = [(name, tensor.to(device="cpu", copy=True)) for name, tensor in tensors]
+    return tensors
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:

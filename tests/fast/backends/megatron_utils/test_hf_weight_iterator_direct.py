@@ -1,5 +1,6 @@
 import sys
 import types
+import weakref
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -107,6 +108,85 @@ def _param(name: str, size: int) -> ParamInfo:
         size=size,
         src_rank=0,
     )
+
+
+def test_pp_lora_export_releases_each_gather_before_exporting_the_next(direct_module, monkeypatch):
+    from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
+
+    adapters = [object(), object(), object()]
+    gathered = []
+    calls = []
+
+    def export(batch):
+        assert all(reference() is None for reference in gathered)
+        calls.append(list(batch))
+        tensor = torch.full((2, 3), len(calls), dtype=torch.bfloat16)
+        gathered.append(weakref.ref(tensor))
+        return [(f"layer{len(calls)}.lora_B.weight", tensor)]
+
+    monkeypatch.setattr(direct_module, "iter_adapters", lambda model: iter(adapters))
+    monkeypatch.setattr(direct_module, "export_lora_hf_named", export)
+    monkeypatch.setattr(direct_module, "get_parallel_state", lambda: SimpleNamespace(pp=SimpleNamespace(size=4)))
+    monkeypatch.setattr(direct_module.dist, "is_initialized", lambda: False)
+    iterator = object.__new__(direct_module.HfWeightIteratorDirect)
+    iterator.model = []
+    iterator.placement = WeightUpdatePlacement(gather_pp=True)
+
+    exported = iterator._export_pp_local_lora(None)
+
+    assert calls == [[adapter] for adapter in adapters]
+    assert all(reference() is None for reference in gathered)
+    assert [name for name, _ in exported] == [f"layer{i}.lora_B.weight" for i in (1, 2, 3)]
+    for i, (_, tensor) in enumerate(exported, 1):
+        assert tensor.device.type == "cpu" and tensor.dtype == torch.bfloat16
+        torch.testing.assert_close(tensor, torch.full((2, 3), i, dtype=torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("pp_size", "gather_pp"), [(1, True), (4, False)])
+def test_lora_export_without_pp_staging_preserves_device_tensor_ownership(
+    direct_module, monkeypatch, pp_size, gather_pp
+):
+    from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
+
+    adapters = [object(), object()]
+    tensor = torch.ones(2, dtype=torch.bfloat16)
+    calls = []
+
+    def export(batch):
+        calls.append(list(batch))
+        return [("layer.lora_B.weight", tensor)]
+
+    monkeypatch.setattr(direct_module, "iter_adapters", lambda model: iter(adapters))
+    monkeypatch.setattr(direct_module, "export_lora_hf_named", export)
+    monkeypatch.setattr(
+        direct_module, "get_parallel_state", lambda: SimpleNamespace(pp=SimpleNamespace(size=pp_size))
+    )
+    monkeypatch.setattr(direct_module.dist, "is_initialized", lambda: False)
+    iterator = object.__new__(direct_module.HfWeightIteratorDirect)
+    iterator.model = []
+    iterator.placement = WeightUpdatePlacement(gather_pp=gather_pp)
+
+    exported = iterator._export_pp_local_lora(None)
+
+    assert calls == [adapters]
+    assert exported[0][1] is tensor
+
+
+def test_staged_slot_export_preserves_rank_slice_and_owns_its_cpu_snapshot(direct_module, monkeypatch):
+    a, b = torch.zeros(4, 3), torch.zeros(3, 4)
+    a[:2] = torch.arange(6).view(2, 3)
+    b[:, :2] = torch.arange(6).view(3, 2)
+    source = [("layer.lora_A.weight", a), ("layer.lora_B.weight", b)]
+    monkeypatch.setattr(direct_module, "export_lora_hf_named", lambda adapters: source)
+
+    exported = direct_module._export_lora_batch([object()], rank=2, to_cpu=True)
+
+    assert [name for name, _ in exported] == [name for name, _ in source]
+    torch.testing.assert_close(exported[0][1], a[:2], rtol=0, atol=0)
+    torch.testing.assert_close(exported[1][1], b[:, :2], rtol=0, atol=0)
+    a.zero_()
+    b.zero_()
+    assert exported[0][1].sum() == exported[1][1].sum() == 15
 
 
 def test_gather_batches_pack_by_size_only(direct_module, monkeypatch):

@@ -43,6 +43,7 @@ from miles.backends.training_utils.model_companion import (
     SampleIdentityExtractor,
 )
 from miles.backends.training_utils.types import TrainStepOutcome
+from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.args.runtime import TrainerConfig
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
@@ -1077,7 +1078,11 @@ def load_model_state(
     )
     explicit_selection = args.backend.ckpt_step is not None or args.backend.exit_on_missing_checkpoint
     if load_dir is None or explicit_selection or _has_loadable_ckpt(load_dir):
-        with load_ctx:
+        base_only = (
+            is_lora_enabled(args) and role == "actor" and args.lora_adapter_path is not None and not resume_from_ckpt
+        )
+        base_overrides = dict(finetune=True, no_load_optim=True, no_load_rng=True) if base_only else {}
+        with load_ctx, args.backend.mutable(), inplace_modify_args(args.backend, base_overrides):
             iteration, restored_trained_iteration = load_checkpoint(
                 model,
                 optimizer,
@@ -1086,11 +1091,9 @@ def load_model_state(
                 args=args,
                 skip_load_to_model_and_opt=False,
             )
-        # MCore loads scheduler state with the optimizer state, and its load_state_dict
-        # replays the saved step count whatever use_checkpoint_opt_param_scheduler says;
-        # that flag only picks which scheduler settings win. A release checkpoint returns
-        # iteration 0 without scheduler state, so it still needs the step(0) refresh below.
-        scheduler_restored = restored_trained_iteration and iteration > 0 and not args.backend.no_load_optim
+            # Only the base checkpoint's flags apply here. The adapter restore
+            # below uses the caller's original optimizer/RNG policy.
+            scheduler_restored = restored_trained_iteration and iteration > 0 and not args.backend.no_load_optim
     else:
         if is_first_replica_megatron_main_rank():
             logger.warning("--load %r is empty; starting from model_provider-initialized weights", load_dir)

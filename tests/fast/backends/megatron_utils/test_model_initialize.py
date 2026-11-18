@@ -385,6 +385,48 @@ class TestALoraAdapterThatCarriesItsOwnIteration:
         """An adapter's saved iteration zero is a trained iteration, not a missing training state."""
         assert self._start(tmp_path, adapter_iteration=0).start_rollout_id == 1
 
+    def test_pretrained_base_reset_does_not_reset_adapter_optimizer_or_rng(self, tmp_path: Path):
+        from miles.backends.megatron_utils.lora.checkpoint import AdapterRestore
+        from miles.backends.megatron_utils.model import load_model_state
+
+        args = make_trainer_args(
+            lora_rank=128,
+            lora_adapter_path=str(tmp_path / "adapter"),
+            load=str(tmp_path),
+            finetune=False,
+            no_load_optim=False,
+            no_load_rng=False,
+        )
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text("release")
+        seen = []
+
+        def load_base(*unused, **kwargs):
+            backend = kwargs["args"].backend
+            seen.append(("base", backend.finetune, backend.no_load_optim, backend.no_load_rng))
+            return 0, False
+
+        def load_adapter(*unused, **kwargs):
+            seen.append(("adapter", args.backend.finetune, args.backend.no_load_optim, args.backend.no_load_rng))
+            return AdapterRestore(1, True, 0)
+
+        with ExitStack() as stack:
+            _patch_initialize_side_effects(stack)
+            stack.enter_context(patch("miles.backends.megatron_utils.model.load_checkpoint", side_effect=load_base))
+            stack.enter_context(
+                patch("miles.backends.megatron_utils.model.restore_single_lora", side_effect=load_adapter)
+            )
+            output = load_model_state(
+                args,
+                model=[_FakeModelChunk()],
+                optimizer=None,
+                opt_param_scheduler=None,
+                role="actor",
+                checkpointing_context=None,
+                resume_from_ckpt=False,
+            )
+        assert seen == [("base", True, True, True), ("adapter", False, False, False)]
+        assert output.start_rollout_id == 2
+
     def test_a_resume_continues_after_the_iteration_the_adapter_names(self, tmp_path: Path) -> None:
         output = self._start(tmp_path, adapter_iteration=100)
 

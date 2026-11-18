@@ -478,6 +478,12 @@ class TestResolveArgsCheckpointLoad:
 
         assert args.ckpt_step == 7
 
+    def test_native_adapter_resume_preserves_optimizer_and_rng_policy(self, tmp_path):
+        args = _make_checkpoint_args(tmp_path, lora_adapter_path=str(tmp_path / "adapter"))
+        resolve_args_checkpoint_load(args, role="actor")
+        assert args.load == str(tmp_path / "ref")
+        assert (args.no_load_optim, args.no_load_rng, args.finetune) == (False, False, False)
+
     def test_a_core_run_with_a_real_checkpoint_is_left_untouched(self, tmp_path):
         """A resume must keep its optimizer state, and start_rollout_id staying None is what says 'resume'."""
         load = _write_megatron_checkpoint(tmp_path)

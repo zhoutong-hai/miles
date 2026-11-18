@@ -476,9 +476,13 @@ def resolve_args_checkpoint_load(args: Namespace, *, role: str) -> bool:
         args.load = args.ref_load or args.hf_checkpoint
         args.start_rollout_id = 0
     else:
-        args.no_load_optim = True
-        args.no_load_rng = True
-        args.finetune = True
+        # An adapter resume initializes its frozen base separately. Preserve the
+        # caller's adapter restore policy; load_model_state scopes the base-only
+        # finetune/no-load overrides around the pretrained checkpoint read.
+        if role != "actor" or args.lora_adapter_path is None:
+            args.no_load_optim = True
+            args.no_load_rng = True
+            args.finetune = True
         args.load = args.ref_load
         if args.ref_ckpt_step is not None:
             args.ckpt_step = args.ref_ckpt_step

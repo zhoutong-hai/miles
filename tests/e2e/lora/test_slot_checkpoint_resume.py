@@ -74,11 +74,14 @@ class CheckpointModelExport:
         # inside expose_adapter_slot, which swaps each layer's slots for the exposed one
         yield from self._named([layer.adapter for layer in self._layers])
 
-    def materialize_adapter(self, spec, *, materialize: bool = True) -> dict[str, torch.Tensor]:
+    def materialize_adapter(self, spec, *, materialize: bool = True, device=None) -> dict[str, torch.Tensor]:
         if not materialize:
             return {}
         adapters = [layer.adapters[spec.slot] for layer in self._layers]
-        return {name: tensor.detach().clone() for name, tensor in self._named(adapters, spec.rank)}
+        return {
+            name: tensor.detach().to(device=device or tensor.device, copy=True)
+            for name, tensor in self._named(adapters, spec.rank)
+        }
 
 
 def snapshot(model, optimizer):

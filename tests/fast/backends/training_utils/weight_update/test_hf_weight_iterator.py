@@ -70,6 +70,28 @@ class _StubIterator(HfWeightIteratorBase):
 
 
 class TestIterHfWeightsTemplate:
+    def test_cpu_checkpoint_materialization_transfers_before_advancing_the_stream(self):
+        transfers = []
+
+        class PendingTensor:
+            def __init__(self, value):
+                self.value = value
+
+            def to(self, device):
+                assert device == "cpu"
+                transfers.append(self.value)
+                return torch.tensor(self.value)
+
+        class CheckedIterator(_StubIterator):
+            def _iter_hf_adapter_units(self, adapter, *, materialize):
+                for value in range(3):
+                    assert transfers == list(range(value)), "earlier GPU tensors are still untransferred"
+                    yield [(str(value), PendingTensor(value))]
+
+        result = CheckedIterator([]).materialize_adapter(None, device="cpu")
+        assert {key: value.item() for key, value in result.items()} == {"0": 0, "1": 1, "2": 2}
+        assert transfers == [0, 1, 2]
+
     @staticmethod
     def _names(buckets):
         return [name for bucket in buckets for name, _ in bucket]

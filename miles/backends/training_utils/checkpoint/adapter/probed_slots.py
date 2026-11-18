@@ -230,7 +230,7 @@ class ProbedAdapterSlots(abc.ABC):
 
     def export_bf16_adapter(self, slot: int) -> Iterable[tuple[str, torch.Tensor]]:
         is_writer = dist.get_rank() == 0
-        return self._iterator.materialize_adapter(self.slot_spec(slot), materialize=is_writer).items()
+        return self._iterator.materialize_adapter(self.slot_spec(slot), materialize=is_writer, device="cpu").items()
 
     def parametrization(
         self,

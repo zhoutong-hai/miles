@@ -135,11 +135,16 @@ class HfWeightIteratorBase(ABC):
         """Backend hook: HF-namespace atomic groups for this model. Default none."""
         return []
 
-    def materialize_adapter(self, adapter, *, materialize: bool = True) -> dict[str, torch.Tensor]:
+    def materialize_adapter(
+        self, adapter, *, materialize: bool = True, device: str | torch.device | None = None
+    ) -> dict[str, torch.Tensor]:
         """One adapter as ``{hf_key: tensor}``, skipping the transport bucketing.
-        Collective: ``materialize=False`` joins the gathers, returns {}."""
+        Collective: ``materialize=False`` joins the gathers, returns {}.
+        ``device`` moves each tensor before advancing the stream, so checkpoint
+        writers can retain the whole adapter on CPU without retaining it on GPU.
+        """
         return {
-            name: tensor
+            name: tensor if device is None else tensor.to(device)
             for unit in self._iter_hf_adapter_units(adapter, materialize=materialize)
             for name, tensor in unit
         }

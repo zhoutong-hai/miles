@@ -30,9 +30,9 @@ class EntropyCapture:
     tis_high: float
     fragments: list[dict] = field(default_factory=list)
 
-    def record(self, *, batch, layout, entropy, advantages, active, ratio, multiplier, eligible, log_probs, q):
+    def record(self, *, batch, layout, entropy, advantages, active, ratio, multiplier, eligible, log_probs, q, rollout_kl):
         masks = layout.per_sample(active)
-        per_sample = [layout.per_sample(value) for value in (entropy, advantages, ratio, multiplier, eligible, log_probs, q)]
+        per_sample = [layout.per_sample(value) for value in (entropy, advantages, ratio, multiplier, eligible, log_probs, q, rollout_kl)]
         for index, (sample_id, metadata, mask, original, factor) in enumerate(
             zip(
                 batch["sample_indices"],
@@ -44,7 +44,7 @@ class EntropyCapture:
             )
         ):
             values = [column[index][mask] for column in per_sample]
-            h, advantage, ratio_i, scale_i, chosen, logp, logq = values
+            h, advantage, ratio_i, scale_i, chosen, logp, logq, kl = values
             if not all(torch.isfinite(value).all() for value in (h, advantage, logp, logq)):
                 raise ValueError("Nonfinite original entropy feedback token")
             if advantage.numel() and not torch.equal(advantage, advantage[0].expand_as(advantage)):
@@ -52,11 +52,10 @@ class EntropyCapture:
             weight = ratio_i.clamp(self.tis_low, self.tis_high)
             coefficient = advantage.detach().abs().float() * weight
             difference = logp.detach().float() - logq.detach().float()
-            k3_gap = (-difference).clamp(-10, 10)
             statistics = {
                 "entropy_sum": h.detach().double().sum(),
                 "train_rollout_abs_diff_sum": difference.abs().double().sum(),
-                "train_rollout_k3_sum": (k3_gap.exp() - k3_gap - 1).double().sum(),
+                "train_rollout_k3_sum": kl.double().sum(),
                 "tis_weight_sum": weight.double().sum(),
                 "tis_weight_squared_sum": weight.double().square().sum(),
                 "tis_below_floor_tokens": (ratio_i < self.tis_low).sum(),
@@ -95,7 +94,7 @@ def capture_entropy(packet, *, cp_rank, record_enabled, tis_low, tis_high):
         _capture.reset(token)
 
 
-def apply_entropy_control(pg_loss, *, batch, layout, entropy, advantages, active, log_probs, rollout_log_probs):
+def apply_entropy_control(pg_loss, *, batch, layout, entropy, advantages, active, log_probs, rollout_log_probs, compute_kl):
     capture = _capture.get()
     if capture is None:
         raise ValueError("Entropy-controlled PG requires the worker's acknowledged update packet")
@@ -109,5 +108,7 @@ def apply_entropy_control(pg_loss, *, batch, layout, entropy, advantages, active
     )
     if capture.record_enabled:
         ratio = torch.exp(log_probs.detach().float() - rollout_log_probs.detach().float())
-        capture.record(batch=batch, layout=layout, entropy=entropy, advantages=advantages, active=active, ratio=ratio, multiplier=multiplier, eligible=eligible, log_probs=log_probs, q=rollout_log_probs)
+        # Tokens follow rollout q; share native KL(q || train) direction and clamps.
+        rollout_kl = compute_kl(rollout_log_probs.detach(), log_probs.detach(), kl_loss_type="low_var_kl")
+        capture.record(batch=batch, layout=layout, entropy=entropy, advantages=advantages, active=active, ratio=ratio, multiplier=multiplier, eligible=eligible, log_probs=log_probs, q=rollout_log_probs, rollout_kl=rollout_kl)
     return pg_loss * multiplier

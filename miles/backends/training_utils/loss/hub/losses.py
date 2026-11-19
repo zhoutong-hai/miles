@@ -266,6 +266,7 @@ def policy_loss_function(
         pg_loss = apply_entropy_control(
             pg_loss, batch=batch, layout=layout, entropy=entropy, advantages=advantages,
             active=active_tokens, log_probs=train_log_probs, rollout_log_probs=rollout_old_log_probs,
+            compute_kl=compute_approx_kl,
         )
 
     if args.policy_loss_aggregation == "prompt-mean":

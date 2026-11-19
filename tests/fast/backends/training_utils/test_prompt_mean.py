@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import nullcontext
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -327,6 +328,31 @@ def test_native_forward_entropy_capture_merges_original_cp_fragments_once():
         assert row["entropy_sum"] == pytest.approx(float(h[offset : offset + n].double().sum()))
         assert row["advantage_representation"] == "torch.float32"
     assert len(fragments) == 8 and len(merged) == 4
+
+
+@pytest.mark.parametrize("rollout,trainer,expected", [
+    ([0.8] * 4 + [0.2], [0.2] * 4 + [0.8], 0.6 * math.log(4)),
+    ([1e-20], [0.5], 10.0),
+    ([0.5], [1e-20], 10.0),
+])
+def test_entropy_capture_uses_rollout_sampled_kl_direction_and_native_clamps(rollout, trainer, expected):
+    # The first population follows q exactly: its mean must equal KL(q || p).
+    n = len(rollout)
+    advantage = torch.ones(n)
+    batch = dict(
+        advantages=[advantage], loss_masks=[torch.ones(n)], sample_indices=[0],
+        entropy_metadata=[dict(group_index=0, theme="theme", scenario="scenario")],
+        prompt_loss_scale=[1.0],
+    )
+    with capture_entropy(dict(scale=1.0, spec=dict(threshold=0.05)), cp_rank=0,
+                         record_enabled=True, tis_low=0.5, tis_high=2.0) as capture:
+        apply_entropy_control(
+            torch.ones(n), batch=batch, layout=_Layout(batch, None, torch.sum),
+            entropy=torch.ones(n), advantages=advantage, active=torch.ones(n, dtype=torch.bool),
+            log_probs=torch.tensor(trainer).log(), rollout_log_probs=torch.tensor(rollout).log(),
+            compute_kl=_loss_function().__globals__["compute_approx_kl"],
+        )
+    assert capture.fragments[0]["statistics"]["train_rollout_k3_sum"] / n == pytest.approx(expected, abs=1e-6)
 
 
 def test_sign_statistics_preserve_finite_signed_entropy_and_zero_bucket():

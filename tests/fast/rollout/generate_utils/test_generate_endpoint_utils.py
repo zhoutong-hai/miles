@@ -74,6 +74,28 @@ class TestComputeRequestPayloadExtraKey:
         assert payload["extra_key"] == "train:-:7"
 
 
+class TestComputeRequestPayloadReplay:
+    @pytest.mark.parametrize("evaluation", [False, True])
+    @pytest.mark.parametrize("routing_replay", [False, True])
+    @pytest.mark.parametrize("indexer_replay", [False, True])
+    def test_only_training_requests_the_selected_replay_channels(self, evaluation, routing_replay, indexer_replay):
+        args = _make_args()
+        args.use_rollout_routing_replay = routing_replay
+        args.use_rollout_indexer_replay = indexer_replay
+        original = vars(args).copy()
+
+        payload, halt_status = compute_request_payload(
+            args, input_ids=[1, 2], sampling_params={}, evaluation=evaluation
+        )
+
+        assert halt_status is None
+        assert payload["return_routed_experts"] is (routing_replay and not evaluation)
+        assert payload["return_indexer_topk"] is (indexer_replay and not evaluation)
+        assert payload["return_logprob"] is True
+        assert payload["input_ids"] == [1, 2]
+        assert vars(args) == original
+
+
 class TestComputeRequestPayloadOutputStore:
     def make_args(self, **overrides) -> SimpleNamespace:
         return SimpleNamespace(**{**vars(_make_args()), "use_output_store": True, **overrides})

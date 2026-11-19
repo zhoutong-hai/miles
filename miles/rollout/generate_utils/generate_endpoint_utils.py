@@ -144,8 +144,9 @@ def compute_request_payload(
         "input_ids": input_ids,
         "sampling_params": {**sampling_params, "max_new_tokens": max_new_tokens},
         "return_logprob": True,
-        "return_routed_experts": args.use_rollout_routing_replay,
-        "return_indexer_topk": args.use_rollout_indexer_replay,
+        # Replay side channels follow launch flags for training; evaluation never consumes them.
+        "return_routed_experts": not evaluation and args.use_rollout_routing_replay,
+        "return_indexer_topk": not evaluation and args.use_rollout_indexer_replay,
     }
     if return_sampling_mask:
         payload["return_sampling_mask"] = True

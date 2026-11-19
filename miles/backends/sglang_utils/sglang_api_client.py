@@ -482,15 +482,21 @@ class SGLangApiClient:
     async def abort_all_requests(self, timeout: float | None = None):
         return await self._make_request("abort_request", {"abort_all": True}, timeout=timeout)
 
-    async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
+    async def begin_weight_update(self, selector: str = "all", sync_base: bool = True, verify_lora_checksums: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
         adapter-only session (no quant unpack; base tensors rejected)."""
-        return await self._make_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
+        return await self._make_request(
+            "begin_weight_update",
+            {"selector": selector, "sync_base": sync_base, "verify_lora_checksums": verify_lora_checksums},
+        )
 
-    async def end_weight_update(self, expected_lora_checksums=None):
+    async def end_weight_update(self, expected_lora_checksums=None, expected_lora_metadata=None):
         """Close the weight-update session: re-finalize base weights (sync_base
         sessions) and apply the streamed LoRA stash."""
-        return await self._make_request("end_weight_update", {"expected_lora_checksums": expected_lora_checksums})
+        return await self._make_request(
+            "end_weight_update",
+            {"expected_lora_checksums": expected_lora_checksums, "expected_lora_metadata": expected_lora_metadata},
+        )
 
     async def update_weight_version(self, weight_version: str, abort_all_requests: bool = False):
         return await self._make_request(

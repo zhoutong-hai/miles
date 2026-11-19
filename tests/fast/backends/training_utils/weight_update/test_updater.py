@@ -118,6 +118,10 @@ class TestMarkCellsErroredOnAnyRank:
 
 
 class TestGatherLoraChecksums:
+    def test_conflicting_sender_manifests_are_rejected(self, monkeypatch):
+        with pytest.raises(ValueError, match="Conflicting"):
+            self._gather(monkeypatch, rank=0, manifests=[{"a": {"x": "one"}}, {"a": {"x": "two"}}])
+
     def _gather(self, monkeypatch: pytest.MonkeyPatch, rank: int, manifests: list[dict]) -> dict | None:
         def gather_object(obj: Any, object_list: list | None, dst: int, group: Any) -> None:
             assert group is _GLOO_GROUP and dst == 0

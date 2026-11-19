@@ -124,7 +124,8 @@ class LoraConfig(BaseConfig):
                 "and each rollout engine hashes the "
                 "tensors it received and fails the load on any mismatch/missing/extra "
                 "name. The LoRA analogue of --check-weight-update-equal, which only "
-                "covers base weights."
+                "covers base weights. Completeness/shape/dtype manifests remain mandatory "
+                "when disabled; receiver-owned slices still complete before the sender ACK."
             )
         ),
     ] = False

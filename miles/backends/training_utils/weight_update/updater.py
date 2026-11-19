@@ -32,7 +32,7 @@ from miles.backends.training_utils.weight_update.session import (
     set_weight_version,
     weight_update_selector,
 )
-from miles.backends.training_utils.weight_update.utils import record_lora_checksums
+from miles.backends.training_utils.weight_update.utils import record_lora_checksums, record_lora_metadata
 from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora.utils import LORA_ADAPTER_NAME
@@ -158,11 +158,13 @@ class WeightUpdater:
                     enable_mtp_training=self.args.enable_mtp_training,
                 ),
                 sync_base=sync_base,
+                verify_lora_checksums=not self.is_lora or self.args.check_lora_weight_equal,
             )
         _mark_cells_errored_on_any_rank(cell_updaters)
         dist.barrier(group=get_gloo_group())
 
         checksums = {name: {} for name, _ in adapters} if self.is_lora and self.args.check_lora_weight_equal else None
+        metadata = {name: {} for name, _ in adapters} if self.is_lora else None
         # a full gather gives rank 0 the whole adapter; a PP-local sync splits it across senders
         records_checksums = protocol.is_sender and (driver or not self._hf_weight_iterator.placement.gather_pp)
         with timer("update_weights_implementation"):
@@ -174,20 +176,26 @@ class WeightUpdater:
                 materialize=protocol.is_sender,
             ):
                 if protocol.is_sender:
+                    if metadata is not None and records_checksums:
+                        record_lora_metadata(bucket, metadata)
                     if checksums is not None and records_checksums:
-                        record_lora_checksums(bucket, checksums)
-                    protocol.send_bucket(bucket)
+                        with timer("lora_publication_checksums"):
+                            record_lora_checksums(bucket, checksums)
+                    with timer("weight_publication_transport"):
+                        protocol.send_bucket(bucket)
                     pbar.update(1)
             protocol.after_base_weights()
             dist.barrier(group=get_gloo_group())
         if checksums is not None:
             checksums = _gather_lora_checksums(checksums)
+        if metadata is not None:
+            metadata = _gather_lora_checksums(metadata)
 
         with timer("finalize_and_resume_engines"):
             protocol.finalize(weight_version)
             _mark_cells_errored_on_any_rank(cell_updaters)
             if protocol.use_weight_update_session and driver:
-                end_weight_update(cell_updaters, expected_lora_checksums=checksums)
+                end_weight_update(cell_updaters, expected_lora_checksums=checksums, expected_lora_metadata=metadata)
                 set_weight_version(cell_updaters, weight_version)
                 maybe_resume_engines(self.args, cell_updaters)
             _mark_cells_errored_on_any_rank(cell_updaters)
@@ -227,7 +235,7 @@ class WeightUpdater:
             self._registered_adapters.add(lora_name)
 
 
-def _gather_lora_checksums(checksums: dict[str, dict[str, str]]) -> dict[str, dict[str, str]] | None:
+def _gather_lora_checksums(checksums: dict[str, dict]) -> dict[str, dict] | None:
     """Union of every sender's manifest, on rank 0; a PP-local sync splits the adapter across senders."""
     group = get_gloo_group()
     gathered = [None] * dist.get_world_size(group) if dist.get_rank() == 0 else None
@@ -237,6 +245,8 @@ def _gather_lora_checksums(checksums: dict[str, dict[str, str]]) -> dict[str, di
     merged = {name: {} for name in checksums}
     for sender_checksums in gathered:
         for name, entries in sender_checksums.items():
+            if any(key in merged[name] and merged[name][key] != value for key, value in entries.items()):
+                raise ValueError(f"Conflicting LoRA publication manifests for {name}")
             merged[name].update(entries)
     return merged
 

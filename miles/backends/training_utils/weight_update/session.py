@@ -42,34 +42,48 @@ def weight_update_selector(*, speculative_algorithm: str | None, enable_mtp_trai
 
 
 def begin_weight_update(
-    cell_updaters: Sequence[_RolloutCellUpdater], selector: str = "all", *, sync_base: bool = True
+    cell_updaters: Sequence[_RolloutCellUpdater],
+    selector: str = "all",
+    *,
+    sync_base: bool = True,
+    verify_lora_checksums: bool = True,
 ) -> None:
     """Open a weight-update session on the selected engines. ``sync_base=False``
     declares an adapter-only session: no quant unpack, base tensors rejected."""
     async_utils.wait_futures(
         [
-            updater.submit_client_call("begin_weight_update", selector=selector, sync_base=sync_base)
+            updater.submit_client_call(
+                "begin_weight_update",
+                selector=selector,
+                sync_base=sync_base,
+                verify_lora_checksums=verify_lora_checksums,
+            )
             for updater in cell_updaters
         ]
     )
 
 
 def end_weight_update(
-    cell_updaters: Sequence[_RolloutCellUpdater], *, expected_lora_checksums: Mapping | None = None
+    cell_updaters: Sequence[_RolloutCellUpdater],
+    *,
+    expected_lora_checksums: Mapping | None = None,
+    expected_lora_metadata: Mapping | None = None,
 ) -> None:
     """Close the session: re-finalize base weights (sync_base sessions) and apply
     the streamed LoRA stash (optionally verified against a sha256 manifest)."""
     results = async_utils.wait_futures(
         [
-            updater.submit_client_call("end_weight_update", expected_lora_checksums=expected_lora_checksums)
+            updater.submit_client_call(
+                "end_weight_update",
+                expected_lora_checksums=expected_lora_checksums,
+                expected_lora_metadata=expected_lora_metadata,
+            )
             for updater in cell_updaters
         ]
     )
     for updater, result in zip(cell_updaters, results, strict=True):
         if isinstance(result, Mapping) and result.get("success") is False:
-            updater.mark_errored(
-                RuntimeError(f"end_weight_update failed on a rollout engine: {result.get('message')}")
-            )
+            updater.mark_errored(RuntimeError(f"end_weight_update failed on a rollout engine: {result.get('message')}"))
 
 
 def register_lora_adapter(

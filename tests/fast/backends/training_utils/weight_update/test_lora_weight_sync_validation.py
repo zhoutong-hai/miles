@@ -19,6 +19,7 @@ import torch
 from miles.backends.sglang_utils.sglang_config import SglangConfig
 from miles.backends.training_utils.weight_update.session import check_weight_sync_results
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
+from miles.backends.training_utils.weight_update.utils import record_lora_checksums, record_lora_metadata
 from miles.utils.lora.utils import is_lora_weight_name
 
 _UW_MODULE = "miles.backends.training_utils.weight_update.protocols.cuda_ipc"
@@ -35,6 +36,55 @@ SAMPLE_LORA_WEIGHTS = [
     ("model.layers.0.mlp.gate_proj.lora_A.weight", torch.randn(8, 2)),
     ("model.layers.0.mlp.gate_proj.lora_B.weight", torch.randn(2, 8)),
 ]
+
+
+def test_structural_manifest_never_reads_tensor_contents():
+    manifest = {"adapter": {}}
+    # A meta tensor cannot be copied to CPU or hashed.
+    tensor = torch.empty((896, 3072, 128), dtype=torch.bfloat16, device="meta")
+    bucket = [("adapter:experts.w1.lora_B.weight", tensor)]
+    record_lora_metadata(bucket, manifest)
+    assert manifest == {"adapter": {"experts.w1.lora_B.weight": {"shape": [896, 3072, 128], "dtype": "torch.bfloat16"}}}
+    with pytest.raises(ValueError, match="Duplicate"):
+        record_lora_metadata(bucket, manifest)
+
+
+@pytest.mark.parametrize("shape,dtype", [((0, 2), torch.float32), ((2, 2), torch.int32)])
+def test_structural_manifest_rejects_invalid_factors(shape, dtype):
+    with pytest.raises(ValueError, match="Invalid"):
+        record_lora_metadata([("adapter:bad.lora_A.weight", torch.empty(shape, dtype=dtype))], {"adapter": {}})
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_lora_driver_always_delivers_metadata_and_only_optionally_hashes(verify):
+    tensor = torch.ones(2, 3) if verify else torch.empty(2, 3, device="meta")
+    iterator = MagicMock()
+    iterator.placement.gather_pp = True
+    iterator.iter_hf_weights.return_value = iter([[("miles_lora:q.lora_A.weight", tensor)]])
+    protocol = MagicMock(is_sender=True, use_weight_update_session=True, needs_base_resync_for_lora=False)
+    protocol.cell_updaters_of_cell_id = {}
+    args = _make_args(check_lora_weight_equal=verify)
+    with (
+        patch(f"{_UPDATER_MODULE}.get_weight_transfer_protocol", return_value=protocol),
+        patch(f"{_UPDATER_MODULE}.dist") as distributed,
+        patch(f"{_UPDATER_MODULE}._mark_cells_errored_on_any_rank"),
+        patch(f"{_UPDATER_MODULE}.get_gloo_group"),
+        patch(f"{_UPDATER_MODULE}._gather_lora_checksums", side_effect=lambda manifest: manifest),
+        patch(f"{_UPDATER_MODULE}.maybe_pause_engines"),
+        patch(f"{_UPDATER_MODULE}.maybe_resume_engines"),
+        patch(f"{_UPDATER_MODULE}.begin_weight_update") as begin,
+        patch(f"{_UPDATER_MODULE}.end_weight_update") as end,
+        patch(f"{_UPDATER_MODULE}.set_weight_version"),
+        patch(f"{_UPDATER_MODULE}.record_lora_checksums", wraps=record_lora_checksums) as checksum,
+    ):
+        distributed.get_rank.return_value = 0
+        driver = WeightUpdater(args, [], weights_getter=lambda: {}, model_name="fixture", quantization_config=None, iterator_factory=lambda *a, **k: iterator, parallel_state=MagicMock(), is_lora=True, lora_sync_config={"r": 2})
+        driver._register_new_lora_adapters = MagicMock()
+        assert driver.update_weights(7)
+    assert begin.call_args.kwargs["verify_lora_checksums"] is verify
+    assert end.call_args.kwargs["expected_lora_metadata"] == {"miles_lora": {"q.lora_A.weight": {"shape": [2, 3], "dtype": "torch.float32"}}}
+    assert checksum.call_count == int(verify)
+    assert (end.call_args.kwargs["expected_lora_checksums"] is not None) is verify
 
 
 @dataclass

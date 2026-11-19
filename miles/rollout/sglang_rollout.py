@@ -225,9 +225,10 @@ async def generate(
     if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
-    if args.use_rollout_routing_replay:
+    # Replay side channels feed training, while evaluation consumes only the generated samples and scores.
+    if args.use_rollout_routing_replay and not evaluation:
         payload["return_routed_experts"] = True
-    if args.use_rollout_indexer_replay:
+    if args.use_rollout_indexer_replay and not evaluation:
         payload["return_indexer_topk"] = True
 
     if token_space:

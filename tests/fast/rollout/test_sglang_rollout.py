@@ -105,6 +105,23 @@ class TestGenerateExtraKey:
         assert [payload["extra_key"] for payload in payloads] == ["train:-:7"]
         assert [payload["lora_path"] for payload in payloads] == [LORA_ADAPTER_NAME]
 
+    @pytest.mark.parametrize("evaluation", [False, True])
+    @pytest.mark.parametrize("replay_enabled", [False, True])
+    async def test_replay_side_channels_are_requested_only_for_training(
+        self, monkeypatch: pytest.MonkeyPatch, evaluation: bool, replay_enabled: bool
+    ) -> None:
+        payloads = self._patch(monkeypatch)
+        args = _make_generate_args()
+        args.use_rollout_routing_replay = replay_enabled
+        args.use_rollout_indexer_replay = replay_enabled
+
+        await sglang_rollout.generate(args, Sample(prompt="p"), {"max_new_tokens": 4}, evaluation=evaluation)
+
+        assert len(payloads) == 1
+        for key in ("return_routed_experts", "return_indexer_topk"):
+            assert payloads[0].get(key, False) == (replay_enabled and not evaluation)
+        assert args.use_rollout_routing_replay == args.use_rollout_indexer_replay == replay_enabled
+
 
 class TestAbort:
     async def test_abort_survives_one_unresponsive_worker_and_finishes_cleanup(

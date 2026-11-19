@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from tests.fast.ray.rollout.conftest import make_args, make_sample, make_samples_grouped
@@ -17,6 +18,22 @@ from miles.ray.rollout.debug_data import (
 
 
 class TestRoundTrip:
+    @pytest.mark.parametrize("strided", [False, True])
+    def test_numpy_replay_arrays_and_original_scores_round_trip(self, tmp_path: Path, strided: bool) -> None:
+        template = str(tmp_path / "rollout_{rollout_id}.pt")
+        routes = np.arange(3 * 3 * 16, dtype=np.int32).reshape(3, 3, 16)
+        routes = routes[:, :, ::2] if strided else routes[:, :, :8].copy()
+        sample = make_sample(tokens=[1, 2, 3, 4], response_length=2, rollout_log_probs=[-0.1, -0.2])
+        sample.rollout_routed_experts = routes
+
+        save_debug_rollout_data(make_args(save_debug_rollout_data=template), [sample], rollout_id=7, evaluation=False)
+        loaded, _ = load_debug_rollout_data(make_args(load_debug_rollout_data=template), rollout_id=7)
+
+        assert len(loaded) == 1
+        assert loaded[0].rollout_routed_experts.dtype == np.int32
+        np.testing.assert_array_equal(loaded[0].rollout_routed_experts, routes)
+        assert loaded[0].rollout_log_probs == sample.rollout_log_probs
+
     @pytest.mark.parametrize("field", ["{rollout_id:0>4}", "{rollout_id!s:0>4}"])
     def test_formatted_rollout_ids_are_saved(self, tmp_path: Path, field: str) -> None:
         """Valid format specifications and conversions keep working in debug dump paths."""

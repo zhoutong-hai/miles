@@ -538,3 +538,20 @@ def test_continuation_flag_rejects_reset_or_non_native_training(field, value):
     setattr(args, field, value)
     with pytest.raises(ValueError):
         validate_entropy_control_args(args)
+
+
+@pytest.mark.parametrize("rank", [0, 128])
+def test_feedback_supports_full_parameter_and_single_adapter(rank):
+    args = SimpleNamespace(entropy_control_continuation=None, entropy_control_mode="direct",
+        num_rollout=3, rollout_batch_size=48, n_samples_per_prompt=16,
+        train_backend="megatron", policy_loss_aggregation="prompt-mean",
+        observe_training_entropy=True, observe_advantage_sign_metrics=True,
+        indep_dp=False, fully_async=False, use_critic=False, multi_lora=False,
+        lora_rank=rank, num_steps_per_rollout=1, debug_disable_optimizer=False,
+        save="checkpoints", wandb_run_id="test", entropy_control_source_commit="a" * 40,
+        async_save=False)
+    validate_entropy_control_args(args)
+    if rank == 0:
+        args.async_save = True
+        with pytest.raises(ValueError, match="synchronous"):
+            validate_entropy_control_args(args)

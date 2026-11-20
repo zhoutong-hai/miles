@@ -35,7 +35,8 @@ def validate_entropy_control_args(args) -> None:
         or args.fully_async
         or args.use_critic
         or args.multi_lora
-        or args.lora_rank <= 0
+        or args.lora_rank < 0
+        or (args.lora_rank == 0 and getattr(args, "async_save", False))
         or args.num_steps_per_rollout != 1
         or args.debug_disable_optimizer
         or args.save is None
@@ -44,7 +45,7 @@ def validate_entropy_control_args(args) -> None:
         or len(args.entropy_control_source_commit) != 40
         or any(c not in "0123456789abcdef" for c in args.entropy_control_source_commit)
     ):
-        raise ValueError("Entropy feedback requires synchronous one-step single-LoRA Megatron prompt-mean PG, native entropy/sign observation, optimizer and immutable run/source identities")
+        raise ValueError("Entropy feedback requires synchronous one-step single-model Megatron prompt-mean PG, native entropy/sign observation, optimizer and immutable run/source identities; full-parameter saves must be synchronous")
 
 
 def digest(value: dict) -> str:

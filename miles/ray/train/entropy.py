@@ -13,6 +13,7 @@ from urllib.parse import quote
 from miles.backends.training_utils.checkpoint.adapter.adapter_dir import TRAINING_STATE_FILENAME, read_training_state
 from miles.backends.training_utils.types import TrainStepOutcome
 from miles.utils.entropy_control import EntropyController, digest, spec_from_args
+from miles.utils.entropy_checkpoint import read_entropy_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +94,14 @@ class EntropyCoordinator:
         self.continuation = None
         if args.entropy_control_continuation is not None and args.lora_adapter_path is None:
             raise ValueError("Entropy continuation requires a native adapter checkpoint")
+        state = None
         if args.lora_adapter_path is not None:
             state = read_training_state(Path(args.lora_adapter_path))
             if state is None or "entropy_control" not in state:
                 raise ValueError("Selected adapter checkpoint lacks native entropy controller state")
+        elif getattr(args.backend, "load", None) and not getattr(args.backend, "finetune", True):
+            state = read_entropy_checkpoint(args.backend)
+        if state is not None:
             restored = EntropyController.restore(state["entropy_control"])
             if restored.completed + (restored.pending is not None) != state["iteration"] + 1:
                 raise ValueError("Native optimizer/controller cursor differs")

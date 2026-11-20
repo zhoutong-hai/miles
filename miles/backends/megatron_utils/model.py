@@ -983,6 +983,8 @@ def save(
         save_single_lora(model, optimizer, opt_param_scheduler, adapter_slots, args, iteration, schedule_first_rollout,
                          entropy_control_state=entropy_control_state)
     else:
+        if entropy_control_state is not None and (args.backend.async_save or non_persistent_ckpt):
+            raise ValueError("Full-parameter entropy checkpoints require synchronous persistent saving")
         save_checkpoint(
             iteration,
             model,
@@ -994,6 +996,14 @@ def save(
             checkpointing_context=checkpointing_context,
             non_persistent_ckpt=non_persistent_ckpt,
         )
+        if entropy_control_state is not None and torch.distributed.get_rank() == 0:
+            from megatron.training.checkpointing import get_checkpoint_name
+            from miles.utils.entropy_checkpoint import write_entropy_checkpoint
+
+            write_entropy_checkpoint(
+                get_checkpoint_name(args.backend.save, iteration, return_base_dir=True),
+                iteration, entropy_control_state,
+            )
 
     if hashes is not None:
         save_model_hashes(args, model, iteration, hashes)

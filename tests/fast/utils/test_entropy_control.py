@@ -15,6 +15,7 @@ import pytest
 
 from miles.utils.entropy_control import EntropyController, EntropyControlSpec, decide, merge_response_fragments, summarize_responses
 from miles.utils.entropy_control import digest, spec_from_args, validate_entropy_control_args
+from miles.utils.entropy_checkpoint import read_entropy_checkpoint, write_entropy_checkpoint
 
 
 def controller(*, mode="direct", horizon=40):
@@ -230,6 +231,7 @@ def _native_entropy_coordinator():
         TrainStepOutcome=SimpleNamespace(NORMAL="NORMAL"),
         logger=logging.getLogger(__name__),
         read_training_state=lambda path: json.loads((path / "training_state.json").read_text()),
+        read_entropy_checkpoint=read_entropy_checkpoint,
         TRAINING_STATE_FILENAME="training_state.json",
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(source), "exec"), namespace)
@@ -313,6 +315,62 @@ def test_native_coordinator_refuses_missing_or_invalid_optimizer_results(tmp_pat
     results[-1].entropy_observation = results[0].entropy_observation
     with pytest.raises(ValueError):
         c.accept(results)
+
+
+def test_full_native_feedback_restore_crosses_warmup_without_reset(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    # Native directory selection is independent of model/CUDA imports here.
+    checkpointing = ModuleType("megatron.training.checkpointing")
+    checkpointing.get_checkpoint_name = lambda root, step, return_base_dir: str(Path(root) / f"iter_{step:07d}")
+    checkpointing.get_checkpoint_tracker_filename = lambda root: str(Path(root) / "latest_checkpointed_iteration.txt")
+    checkpointing.read_metadata = lambda filename: (int(Path(filename).read_text()), False)
+    monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron.training", ModuleType("megatron.training"))
+    monkeypatch.setitem(sys.modules, "megatron.training.checkpointing", checkpointing)
+    cls = _native_entropy_coordinator()
+    args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40,
+        num_rollout=3, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode="direct",
+        backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=256, finetune=True),
+        lora_adapter_path=None, entropy_control_continuation=None)
+    original = cls(args)
+    original.controller.observe(_statistical_observation(original.controller))
+    original.controller.commit_publication(completed_update=1, published_weight_version=1)
+    original.controller.observe(_statistical_observation(original.controller))
+    state = original.controller.state_dict()
+    directory = tmp_path / "checkpoints/iter_0000001"
+    directory.mkdir(parents=True)
+    (directory.parent / "latest_checkpointed_iteration.txt").write_text("1\n")
+    write_entropy_checkpoint(directory, 1, state)
+    write_entropy_checkpoint(directory, 1, state)  # Identical publication is idempotent.
+    args.backend.load, args.backend.finetune = str(directory.parent), False
+    resumed = cls(args)
+    resumed.validate_loaded_cursors([2] * 256)
+    with pytest.raises(ValueError):
+        resumed.validate_loaded_cursors([2] * 255 + [0])
+    assert resumed.controller.state_dict() == state
+    class Cell:
+        async def execute(self, method, **kwargs):
+            return [2] * 256
+    asyncio.run(resumed.published([Cell()], rollout_id=None, weight_version=2, failed_cell_ids=()))
+    original.controller.commit_publication(completed_update=2, published_weight_version=2)
+    assert resumed.controller.snapshot == original.controller.snapshot
+    assert resumed.controller.snapshot["for_update"] == 3
+    for backend in (SimpleNamespace(load=str(directory), ckpt_step=None),
+                    SimpleNamespace(load=str(directory.parent), ckpt_step=1)):
+        assert read_entropy_checkpoint(backend)["entropy_control"] == state
+    with pytest.raises(ValueError, match="cursor"):
+        write_entropy_checkpoint(directory, 2, state)
+    saved = directory / "miles_entropy_control.json"
+    bad = json.loads(saved.read_text())
+    bad["entropy_control"]["completed"] = 0
+    saved.write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="seal"):
+        cls(args)
+    saved.unlink()
+    with pytest.raises(FileNotFoundError):
+        cls(args)
 
 
 @pytest.mark.parametrize("mode", ["observe", "direct"])

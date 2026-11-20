@@ -86,7 +86,7 @@ def observation_metrics(observation: dict, event: dict) -> dict:
 
 
 class EntropyCoordinator:
-    def __init__(self, args):
+    def __init__(self, args, *, ckpt_load_config=None):
         self.args = args
         self.controller = EntropyController(args.wandb_run_id, args.entropy_control_source_commit, spec_from_args(args))
         self.root = Path(args.backend.save).parent / "entropy"
@@ -99,8 +99,9 @@ class EntropyCoordinator:
             state = read_training_state(Path(args.lora_adapter_path))
             if state is None or "entropy_control" not in state:
                 raise ValueError("Selected adapter checkpoint lacks native entropy controller state")
-        elif getattr(args.backend, "load", None) and not getattr(args.backend, "finetune", True):
-            state = read_entropy_checkpoint(args.backend)
+        elif ckpt_load_config is not None and ckpt_load_config.load and not ckpt_load_config.finetune:
+            # Checkpoint selection belongs to the init request, not the stripped backend config.
+            state = read_entropy_checkpoint(ckpt_load_config)
         if state is not None:
             restored = EntropyController.restore(state["entropy_control"])
             if restored.completed + (restored.pending is not None) != state["iteration"] + 1:
@@ -168,7 +169,10 @@ class EntropyCoordinator:
     def validate_loaded_cursors(self, cursors):
         expected = self.controller.completed + (self.controller.pending is not None)
         if len(cursors) != self.expected_workers or set(cursors) != {expected}:
-            raise ValueError("Native optimizer cursors differ from saved entropy state")
+            raise ValueError(
+                f"Native optimizer cursors differ from saved entropy state: expected "
+                f"{self.expected_workers} workers at {expected}, got {len(cursors)} workers at {set(cursors)}"
+            )
 
     async def _all(self, cells, method, *, kill_on_failure=True, timeout=None, **kwargs):
         responses = await asyncio.gather(*(cell.execute(method, kill_on_failure=kill_on_failure, timeout=timeout, **kwargs) for cell in cells))

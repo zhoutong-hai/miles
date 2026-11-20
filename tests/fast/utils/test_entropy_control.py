@@ -332,7 +332,7 @@ def test_full_native_feedback_restore_crosses_warmup_without_reset(tmp_path, mon
     cls = _native_entropy_coordinator()
     args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40,
         num_rollout=3, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode="direct",
-        backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=256, finetune=True),
+        backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=256),
         lora_adapter_path=None, entropy_control_continuation=None)
     original = cls(args)
     original.controller.observe(_statistical_observation(original.controller))
@@ -344,12 +344,19 @@ def test_full_native_feedback_restore_crosses_warmup_without_reset(tmp_path, mon
     (directory.parent / "latest_checkpointed_iteration.txt").write_text("1\n")
     write_entropy_checkpoint(directory, 1, state)
     write_entropy_checkpoint(directory, 1, state)  # Identical publication is idempotent.
-    args.backend.load, args.backend.finetune = str(directory.parent), False
-    resumed = cls(args)
+    # Runtime load fields are deliberately absent from TrainerConfig.backend.
+    request = SimpleNamespace(load=str(directory.parent), finetune=False, ckpt_step=None)
+    resumed = cls(args, ckpt_load_config=request)
     resumed.validate_loaded_cursors([2] * 256)
     with pytest.raises(ValueError):
         resumed.validate_loaded_cursors([2] * 255 + [0])
     assert resumed.controller.state_dict() == state
+    assert not {"load", "finetune", "ckpt_step"} & vars(args.backend).keys()
+    # A fresh request must not consume entropy from a previous checkpoint.
+    fresh = cls(args, ckpt_load_config=SimpleNamespace(load=request.load, finetune=True))
+    fresh.validate_loaded_cursors([0] * 256)
+    with pytest.raises(ValueError, match="expected 256 workers at 0"):
+        fresh.validate_loaded_cursors([2] * 256)
     class Cell:
         async def execute(self, method, **kwargs):
             return [2] * 256
@@ -367,10 +374,10 @@ def test_full_native_feedback_restore_crosses_warmup_without_reset(tmp_path, mon
     bad["entropy_control"]["completed"] = 0
     saved.write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="seal"):
-        cls(args)
+        cls(args, ckpt_load_config=request)
     saved.unlink()
     with pytest.raises(FileNotFoundError):
-        cls(args)
+        cls(args, ckpt_load_config=request)
 
 
 @pytest.mark.parametrize("mode", ["observe", "direct"])

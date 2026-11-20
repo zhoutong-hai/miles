@@ -363,7 +363,10 @@ class TrainerController:
         args.num_rollout = request.num_rollout
         args.wandb_run_id = request.wandb_run_id
         args.mlflow_run_id = request.mlflow_run_id
-        self._entropy = EntropyCoordinator(args) if args.entropy_control_mode != "off" else None
+        self._entropy = (
+            EntropyCoordinator(args, ckpt_load_config=request.ckpt_load_config)
+            if args.entropy_control_mode != "off" else None
+        )
         configure_logger(
             args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id, model_id=args.trainer_model_id)
         )

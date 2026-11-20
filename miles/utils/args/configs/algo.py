@@ -207,6 +207,10 @@ class AlgoConfig(PolicyAggregationConfig):
         str | None,
         Arg(help="Exact Miles source identity for entropy observation, controller packets and checkpoints."),
     ] = None
+    entropy_control_continuation: A[
+        str | None,
+        Arg(help="Sealed authorization for a larger finite entropy horizon after full native adapter resume."),
+    ] = None
     observe_advantage_sign_metrics: A[
         bool,
         Arg(help="Log original-token sign/zero TIS distributions and training entropy masses for prompt-mean PG."),

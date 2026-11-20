@@ -10,7 +10,7 @@ import math
 import struct
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 
 def spec_from_args(args) -> "EntropyControlSpec":
@@ -18,6 +18,11 @@ def spec_from_args(args) -> "EntropyControlSpec":
 
 
 def validate_entropy_control_args(args) -> None:
+    if args.entropy_control_continuation is not None and (
+        args.entropy_control_mode == "off" or args.lora_adapter_path is None or args.load is None
+        or args.finetune or args.no_load_optim or args.no_load_rng
+    ):
+        raise ValueError("Entropy continuation requires an enabled controller and full native adapter resume")
     if args.entropy_control_mode == "off":
         return
     spec_from_args(args)
@@ -186,6 +191,7 @@ class EntropyController:
     last_event_sha256: str | None = None
     last_used_packet: dict | None = None
     pending: dict | None = field(default=None, repr=False)
+    continuation: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if not self.run or len(self.source) != 40 or any(c not in "0123456789abcdef" for c in self.source):
@@ -237,9 +243,24 @@ class EntropyController:
 
     def state_dict(self) -> dict:
         # Native saves precede publication. Preserve pending as well as committed feedback.
-        return deepcopy(
-            dict(protocol="entropy_low_negative_pg_v1", run=self.run, source=self.source, spec=asdict(self.spec), completed=self.completed, scale=self.scale, history=list(self.history), last_event_sha256=self.last_event_sha256, last_used_packet=self.last_used_packet, pending=self.pending, next=self.snapshot)
+        state = dict(protocol="entropy_low_negative_pg_v1", run=self.run, source=self.source, spec=asdict(self.spec), completed=self.completed, scale=self.scale, history=list(self.history), last_event_sha256=self.last_event_sha256, last_used_packet=self.last_used_packet, pending=self.pending, next=self.snapshot)
+        if self.continuation is not None:
+            state["continuation"] = self.continuation
+        return deepcopy(state)
+
+    def continued(self, *, horizon: int, source: str, authorization_sha256: str) -> "EntropyController":
+        """Start a new finite segment without rewriting the sealed terminal prefix."""
+        if self.pending is not None or self.completed != self.spec.horizon or horizon <= self.spec.horizon:
+            raise ValueError("Entropy continuation requires a published terminal prefix and a larger horizon")
+        origin = self.state_dict()
+        continued = EntropyController(
+            run=self.run, source=source, spec=replace(self.spec, horizon=horizon),
+            completed=self.completed, scale=self.scale, history=deepcopy(self.history),
+            last_event_sha256=self.last_event_sha256, last_used_packet=deepcopy(self.last_used_packet),
+            continuation=dict(origin=origin, origin_sha256=digest(origin), authorization_sha256=authorization_sha256),
         )
+        continued._validate_restored_state()
+        return continued
 
     @classmethod
     def restore(cls, state: dict) -> "EntropyController":
@@ -255,6 +276,7 @@ class EntropyController:
             last_event_sha256=state["last_event_sha256"],
             last_used_packet=deepcopy(state["last_used_packet"]),
             pending=deepcopy(state["pending"]),
+            continuation=deepcopy(state.get("continuation")),
         )
         restored._validate_restored_state()
         if restored.state_dict() != state:
@@ -262,6 +284,7 @@ class EntropyController:
         return restored
 
     def _validate_restored_state(self) -> None:
+        origin = self._continuation_origin()
         if type(self.completed) is not int or not 0 <= self.completed <= self.spec.horizon:
             raise ValueError("Entropy cursor exceeds the finite horizon")
         if len(self.history) != min(2, self.completed):
@@ -276,7 +299,9 @@ class EntropyController:
                 raise ValueError("Fresh entropy state must not inherit history")
         else:
             used = self.last_used_packet
-            self._validate_packet(used, for_update=self.completed)
+            # Only the boundary's historical packet belongs to the sealed previous segment.
+            owner = origin if origin is not None and self.completed == origin.completed else self
+            owner._validate_packet(used, for_update=self.completed)
             expected = decide(self.history, completed=self.completed, used_scale=used["scale"], spec=self.spec)
             if self.scale != expected["final_scale"] or not isinstance(self.last_event_sha256, str) or len(self.last_event_sha256) != 64:
                 raise ValueError("Saved entropy used/next decision differs")
@@ -287,6 +312,30 @@ class EntropyController:
             observation = self.pending["observation"]
             if digest(observation) != self.pending["observation_sha256"] or summarize_responses(observation["responses"], self.spec) != self.pending["summary"]:
                 raise ValueError("Pending original entropy statistics or summary seal differs")
+
+    def _continuation_origin(self) -> "EntropyController | None":
+        if self.continuation is None:
+            return None
+        if not isinstance(self.continuation, dict) or set(self.continuation) != {"origin", "origin_sha256", "authorization_sha256"}:
+            raise ValueError("Invalid entropy continuation provenance")
+        if digest(self.continuation["origin"]) != self.continuation["origin_sha256"]:
+            raise ValueError("Entropy continuation origin seal differs")
+        authorization = self.continuation["authorization_sha256"]
+        if not isinstance(authorization, str) or len(authorization) != 64 or any(c not in "0123456789abcdef" for c in authorization):
+            raise ValueError("Entropy continuation lacks its authorization seal")
+        origin = EntropyController.restore(self.continuation["origin"])
+        if (
+            origin.pending is not None or origin.completed != origin.spec.horizon
+            or self.completed < origin.completed or self.spec.horizon <= origin.spec.horizon
+            or self.run != origin.run or replace(self.spec, horizon=origin.spec.horizon) != origin.spec
+        ):
+            raise ValueError("Entropy continuation changed the prefix, population or controller constants")
+        if self.completed == origin.completed and any(
+            getattr(self, key) != getattr(origin, key)
+            for key in ("scale", "history", "last_used_packet", "last_event_sha256")
+        ):
+            raise ValueError("Entropy continuation changed terminal feedback or its historical packet")
+        return origin
 
     def _validate_packet(self, value: dict, *, for_update: int) -> None:
         if not isinstance(value, dict):

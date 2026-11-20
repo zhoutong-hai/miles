@@ -2,6 +2,7 @@ from copy import deepcopy
 from dataclasses import replace
 import ast
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -13,7 +14,7 @@ from urllib.parse import quote
 import pytest
 
 from miles.utils.entropy_control import EntropyController, EntropyControlSpec, decide, merge_response_fragments, summarize_responses
-from miles.utils.entropy_control import digest, spec_from_args
+from miles.utils.entropy_control import digest, spec_from_args, validate_entropy_control_args
 
 
 def controller(*, mode="direct", horizon=40):
@@ -216,10 +217,12 @@ def _native_entropy_coordinator():
     nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))]
     namespace = dict(
         asyncio=asyncio,
+        hashlib=hashlib,
         json=json,
         math=math,
         os=os,
         Path=Path,
+        replace=replace,
         quote=quote,
         EntropyController=EntropyController,
         digest=digest,
@@ -227,6 +230,7 @@ def _native_entropy_coordinator():
         TrainStepOutcome=SimpleNamespace(NORMAL="NORMAL"),
         logger=logging.getLogger(__name__),
         read_training_state=lambda path: json.loads((path / "training_state.json").read_text()),
+        TRAINING_STATE_FILENAME="training_state.json",
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(source), "exec"), namespace)
     return namespace["EntropyCoordinator"]
@@ -247,7 +251,7 @@ def _statistical_observation(c):
 @pytest.mark.parametrize("tracking_error", [False, True])
 def test_native_coordinator_all128_pending_save_restore_and_publication(tmp_path, mode, tracking_error):
     cls = _native_entropy_coordinator()
-    args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40, num_rollout=40, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode=mode, backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=128), lora_adapter_path=None)
+    args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40, num_rollout=40, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode=mode, backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=128), lora_adapter_path=None, entropy_control_continuation=None)
     coordinator = cls(args)
     coordinator.validate_loaded_cursors([0] * 128)
     recorded = []
@@ -296,7 +300,7 @@ def test_native_coordinator_all128_pending_save_restore_and_publication(tmp_path
 
 def test_native_coordinator_refuses_missing_or_invalid_optimizer_results(tmp_path):
     cls = _native_entropy_coordinator()
-    args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40, num_rollout=40, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode="direct", backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=128), lora_adapter_path=None)
+    args = SimpleNamespace(wandb_run_id="test", entropy_control_source_commit="a" * 40, num_rollout=40, rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode="direct", backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=128), lora_adapter_path=None, entropy_control_continuation=None)
     c = cls(args)
     results = [SimpleNamespace(outcome="NORMAL", optimizer_step_valid=True, entropy_observation=None) for _ in range(128)]
     results[0].entropy_observation = _statistical_observation(c.controller)
@@ -309,3 +313,170 @@ def test_native_coordinator_refuses_missing_or_invalid_optimizer_results(tmp_pat
     results[-1].entropy_observation = results[0].entropy_observation
     with pytest.raises(ValueError):
         c.accept(results)
+
+
+@pytest.mark.parametrize("mode", ["observe", "direct"])
+def test_continued40to80_preserves_feedback_and_matches_uninterrupted_math(mode):
+    prefix, reference = controller(mode=mode), controller(mode=mode, horizon=80)
+
+    def inputs(update):
+        return dict(entropy=0.31 + (update % 9) * 0.026, selected=15 if update % 7 == 0 else 32)
+
+    for update in range(1, 41):
+        assert step(prefix, **inputs(update))["final_scale"] == step(reference, **inputs(update))["final_scale"]
+    original = prefix.state_dict()
+    resumed = prefix.continued(horizon=80, source="b" * 40, authorization_sha256="c" * 64)
+    assert prefix.state_dict() == original and prefix.snapshot is None
+    assert resumed.continuation["origin"] == original
+    assert resumed.snapshot["for_update"] == 41
+    assert resumed.snapshot["scale"] == reference.snapshot["scale"]
+    assert resumed.snapshot["source"] == "b" * 40
+    assert resumed.history == prefix.history and resumed.scale != 0.8
+    for update in range(41, 81):
+        resumed.observe(observation(resumed, **inputs(update)))
+        reference.observe(observation(reference, **inputs(update)))
+        if update == 60:
+            state = resumed.state_dict()
+            resumed = EntropyController.restore(state)
+            assert resumed.state_dict() == state
+        actual = resumed.commit_publication(completed_update=update, published_weight_version=update)
+        expected = reference.commit_publication(completed_update=update, published_weight_version=update)
+        assert actual["used"]["scale"] == expected["used"]["scale"]
+        for key in ("final_scale", "latest_two_batches", "guard", "coverage_valid", "reason"):
+            assert actual[key] == expected[key]
+    assert resumed.completed == 80 and resumed.snapshot is None
+    assert EntropyController.restore(resumed.state_dict()).snapshot is None
+    with pytest.raises(ValueError):
+        resumed.observe({})
+
+
+def test_continuation_rejects_early_unpublished_shrunk_and_tampered_state():
+    c = controller()
+    for _ in range(39):
+        step(c)
+    with pytest.raises(ValueError):
+        c.continued(horizon=80, source="b" * 40, authorization_sha256="c" * 64)
+    c.observe(observation(c))
+    with pytest.raises(ValueError):
+        c.continued(horizon=80, source="b" * 40, authorization_sha256="c" * 64)
+    c.commit_publication(completed_update=40)
+    for horizon, seal in ((40, "c" * 64), (39, "c" * 64), (80, "unsealed")):
+        with pytest.raises(ValueError):
+            c.continued(horizon=horizon, source="b" * 40, authorization_sha256=seal)
+    state = c.continued(horizon=80, source="b" * 40, authorization_sha256="c" * 64).state_dict()
+    for key, value in (("scale", 0.6), ("last_event_sha256", "d" * 64)):
+        broken = deepcopy(state)
+        broken["continuation"]["origin"][key] = value
+        with pytest.raises(ValueError):
+            EntropyController.restore(broken)
+    broken = deepcopy(state)
+    broken["spec"]["gain"] = 4.0
+    with pytest.raises(ValueError):
+        EntropyController.restore(broken)
+
+
+def _continuation_checkpoint(tmp_path, mode):
+    prefix = controller(mode=mode)
+    for _ in range(39):
+        step(prefix)
+    prefix.observe(_statistical_observation(prefix))
+    adapter = tmp_path / "native40"
+    adapter.mkdir()
+    state_path = adapter / "training_state.json"
+    state_path.write_text(json.dumps(dict(iteration=39, entropy_control=prefix.state_dict())))
+    original_bytes = state_path.read_bytes()
+    terminal = prefix.commit_publication(completed_update=40, published_weight_version=40)
+    manifest = dict(
+        protocol="entropy_horizon_continuation_v1", run=prefix.run,
+        from_checkpoint=str(adapter), from_source=prefix.source, from_horizon=40,
+        from_completed_update=40, from_training_state_sha256=hashlib.sha256(original_bytes).hexdigest(),
+        from_terminal_event_sha256=digest(terminal), to_source="b" * 40, to_horizon=80,
+        authority="Human selected continuation of this trajectory40to80",
+    )
+    authorization = tmp_path / "continue.json"
+    authorization.write_text(json.dumps(manifest))
+    args = SimpleNamespace(
+        wandb_run_id=prefix.run, entropy_control_source_commit="b" * 40, num_rollout=80,
+        rollout_batch_size=48, n_samples_per_prompt=16, entropy_control_mode=mode,
+        backend=SimpleNamespace(save=str(tmp_path / "checkpoints"), world_size=128),
+        lora_adapter_path=str(adapter), entropy_control_continuation=str(authorization),
+    )
+    return args, prefix, terminal, original_bytes
+
+
+@pytest.mark.parametrize("mode", ["observe", "direct"])
+def test_native_pending40_publication_then41_uses_sealed_history_and_new_packet(tmp_path, mode):
+    args, prefix, terminal, original_bytes = _continuation_checkpoint(tmp_path, mode)
+    coordinator = _native_entropy_coordinator()(args)
+    coordinator.validate_loaded_cursors([40] * 128)
+    packets = []
+
+    class Cell:
+        async def execute(self, method, **kwargs):
+            if method == "set_entropy_packet":
+                packets.append(kwargs["packet"])
+                return [kwargs["packet"]["sha256"]] * 128
+            return [kwargs["event"]["completed_update"]] * 128
+
+    cells = [Cell()]
+    with pytest.raises(ValueError):
+        asyncio.run(coordinator.prepare(cells, 40))
+    with pytest.raises(ValueError):
+        asyncio.run(coordinator.published(cells, rollout_id=None, weight_version=39, failed_cell_ids=()))
+    with pytest.raises(ValueError):
+        asyncio.run(coordinator.published(cells, rollout_id=None, weight_version=40, failed_cell_ids=("failed",)))
+    assert coordinator.controller.completed == 39
+    asyncio.run(coordinator.published(cells, rollout_id=None, weight_version=40, failed_cell_ids=()))
+    assert json.loads((tmp_path / "entropy/update-0040-decision.json").read_text()) == terminal
+    assert coordinator.controller.continuation["origin"] == prefix.state_dict()
+    assert (Path(args.lora_adapter_path) / "training_state.json").read_bytes() == original_bytes
+    asyncio.run(coordinator.prepare(cells, 40))
+    assert packets[-1]["for_update"] == 41 and packets[-1]["spec"]["horizon"] == 80
+    assert packets[-1]["source"] == args.entropy_control_source_commit
+    assert packets[-1]["scale"] == prefix.scale
+    assert EntropyController.restore(coordinator.controller.state_dict()).state_dict() == coordinator.controller.state_dict()
+
+
+@pytest.mark.parametrize("key,value", [
+    ("from_source", "e" * 40), ("from_horizon", 20), ("from_completed_update", 39),
+    ("from_training_state_sha256", "e" * 64), ("to_source", "e" * 40),
+    ("to_horizon", 81), ("from_checkpoint", "/missing/checkpoint"), ("run", "other"),
+])
+def test_native_continuation_manifest_must_match_actual_checkpoint_and_launch(tmp_path, key, value):
+    args, _, _, _ = _continuation_checkpoint(tmp_path, "direct")
+    path = Path(args.entropy_control_continuation)
+    manifest = json.loads(path.read_text())
+    manifest[key] = value
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        _native_entropy_coordinator()(args)
+
+
+def test_native_continuation_requires_authorization_and_original_terminal_event(tmp_path):
+    args, _, _, _ = _continuation_checkpoint(tmp_path, "direct")
+    unauthorized = deepcopy(args)
+    unauthorized.entropy_control_continuation = None
+    with pytest.raises(ValueError):
+        _native_entropy_coordinator()(unauthorized)
+    manifest_path = Path(args.entropy_control_continuation)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["from_terminal_event_sha256"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest))
+    coordinator = _native_entropy_coordinator()(args)
+    with pytest.raises(ValueError):
+        asyncio.run(coordinator.published([], rollout_id=None, weight_version=40, failed_cell_ids=()))
+    assert coordinator.controller.spec.horizon == 40 and coordinator.controller.snapshot is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("entropy_control_mode", "off"), ("lora_adapter_path", None), ("load", None),
+    ("finetune", True), ("no_load_optim", True), ("no_load_rng", True),
+])
+def test_continuation_flag_rejects_reset_or_non_native_training(field, value):
+    args = SimpleNamespace(
+        entropy_control_continuation="continue.json", entropy_control_mode="direct",
+        lora_adapter_path="native40/adapter", load="native40", finetune=False, no_load_optim=False, no_load_rng=False,
+    )
+    setattr(args, field, value)
+    with pytest.raises(ValueError):
+        validate_entropy_control_args(args)

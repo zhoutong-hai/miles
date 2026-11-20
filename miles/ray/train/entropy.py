@@ -1,14 +1,16 @@
 """Native coordinator integration for finite original-response entropy feedback."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
-from miles.backends.training_utils.checkpoint.adapter.adapter_dir import read_training_state
+from miles.backends.training_utils.checkpoint.adapter.adapter_dir import TRAINING_STATE_FILENAME, read_training_state
 from miles.backends.training_utils.types import TrainStepOutcome
 from miles.utils.entropy_control import EntropyController, digest, spec_from_args
 
@@ -88,14 +90,75 @@ class EntropyCoordinator:
         self.controller = EntropyController(args.wandb_run_id, args.entropy_control_source_commit, spec_from_args(args))
         self.root = Path(args.backend.save).parent / "entropy"
         self.expected_workers = args.backend.world_size
+        self.continuation = None
+        if args.entropy_control_continuation is not None and args.lora_adapter_path is None:
+            raise ValueError("Entropy continuation requires a native adapter checkpoint")
         if args.lora_adapter_path is not None:
             state = read_training_state(Path(args.lora_adapter_path))
             if state is None or "entropy_control" not in state:
                 raise ValueError("Selected adapter checkpoint lacks native entropy controller state")
             restored = EntropyController.restore(state["entropy_control"])
-            if restored.run != self.controller.run or restored.source != self.controller.source or restored.spec != self.controller.spec or restored.completed + (restored.pending is not None) != state["iteration"] + 1:
+            if restored.completed + (restored.pending is not None) != state["iteration"] + 1:
+                raise ValueError("Native optimizer/controller cursor differs")
+            if args.entropy_control_continuation is not None:
+                # The explicit continuation owns the future horizon/source; the checkpoint's
+                # original packet remains authoritative until restored publication completes.
+                self.continuation = self._read_continuation(restored, state)
+            elif restored.run != self.controller.run or restored.source != self.controller.source or restored.spec != self.controller.spec:
                 raise ValueError("Native optimizer/controller source, specification or cursor differs")
             self.controller = restored
+
+    def _read_continuation(self, restored, state):
+        path = Path(self.args.entropy_control_continuation)
+        raw = path.read_bytes()
+        manifest = json.loads(raw)
+        if not isinstance(manifest, dict):
+            raise ValueError("Entropy continuation authorization must be an object")
+        target = self.controller
+        adapter = Path(self.args.lora_adapter_path)
+        expected = dict(
+            protocol="entropy_horizon_continuation_v1", run=restored.run,
+            from_source=restored.source, from_horizon=restored.spec.horizon,
+            from_completed_update=state["iteration"] + 1,
+            from_training_state_sha256=hashlib.sha256((adapter / TRAINING_STATE_FILENAME).read_bytes()).hexdigest(),
+            to_source=target.source, to_horizon=target.spec.horizon,
+        )
+        if (
+            any(manifest.get(key) != value for key, value in expected.items())
+            or not isinstance(manifest.get("from_checkpoint"), str)
+            or Path(manifest["from_checkpoint"]).resolve() != adapter.resolve()
+            or not isinstance(manifest.get("authority"), str) or not manifest["authority"].strip()
+            or target.run != restored.run or target.spec.horizon <= restored.spec.horizon
+            or replace(target.spec, horizon=restored.spec.horizon) != restored.spec
+            or state["iteration"] + 1 != restored.spec.horizon
+            or not isinstance(manifest.get("from_terminal_event_sha256"), str)
+            or len(manifest["from_terminal_event_sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in manifest["from_terminal_event_sha256"])
+        ):
+            raise ValueError("Entropy continuation authorization does not match the native checkpoint and selected scope")
+        return dict(manifest=manifest, sha256=hashlib.sha256(raw).hexdigest())
+
+    def _continue_after_publication(self, *, weight_version, failed_cell_ids):
+        if self.continuation is None:
+            return
+        manifest = self.continuation["manifest"]
+        if (
+            failed_cell_ids or weight_version != manifest["from_completed_update"]
+            or self.controller.pending is not None
+            or self.controller.last_event_sha256 != manifest["from_terminal_event_sha256"]
+        ):
+            raise ValueError("Entropy continuation requires the exact restored terminal publication and feedback seal")
+        self.controller = self.controller.continued(
+            horizon=manifest["to_horizon"], source=manifest["to_source"],
+            authorization_sha256=self.continuation["sha256"],
+        )
+        _persist(self.root / "continuation.json", dict(
+            protocol="entropy_horizon_continuation_v1", authorization_sha256=self.continuation["sha256"],
+            from_terminal_event_sha256=manifest["from_terminal_event_sha256"],
+            origin_sha256=self.controller.continuation["origin_sha256"],
+            next=self.controller.snapshot,
+        ))
+        self.continuation = None
 
     def validate_loaded_cursors(self, cursors):
         expected = self.controller.completed + (self.controller.pending is not None)
@@ -134,10 +197,15 @@ class EntropyCoordinator:
             raise ValueError("Native save workers disagree on the entropy state")
 
     async def published(self, cells, *, rollout_id, weight_version, failed_cell_ids):
+        if self.continuation is not None and (
+            failed_cell_ids or weight_version != self.continuation["manifest"]["from_completed_update"]
+        ):
+            raise ValueError("Entropy continuation requires successful publication of the exact restored version")
         pending = self.controller.pending
         if pending is None:
             if rollout_id is not None:
                 raise ValueError("Trained entropy publication lacks pending optimizer feedback")
+            self._continue_after_publication(weight_version=weight_version, failed_cell_ids=failed_cell_ids)
             return
         completed = pending["used"]["for_update"]
         if (rollout_id is not None and completed != rollout_id + 1) or weight_version is None or failed_cell_ids:
@@ -157,3 +225,4 @@ class EntropyCoordinator:
             # Publication and optimizer work already succeeded. Keep durable metrics for reconciliation;
             # a tracking failure must not kill trained workers or roll the entropy controller back.
             logger.exception("Entropy tracking DEGRADED at update%d; private decision/metrics preserved", completed)
+        self._continue_after_publication(weight_version=weight_version, failed_cell_ids=failed_cell_ids)

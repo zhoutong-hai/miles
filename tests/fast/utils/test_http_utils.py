@@ -143,7 +143,7 @@ async def test_post_replay_preserves_stdlib_and_text_fallbacks(raw):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [{}, {"return_routed_experts": False}])
+@pytest.mark.parametrize("payload", [None, {}, {"return_routed_experts": False}, [{"batch": "value"}]])
 async def test_post_without_replay_preserves_default_decoder(payload, monkeypatch):
     expected = {"large_integer": 2**100}
 

@@ -14,6 +14,7 @@ import urllib.parse
 import aiohttp
 import httpx
 import numpy as np
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,16 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
                 )  # config-access-exempt: attribute selected at runtime from action
             response.raise_for_status()
             try:
-                output = response.json()
+                if payload and payload.get("return_routed_experts"):
+                    # SGLang replay replies carry large base64 strings. Decode
+                    # their UTF-8 bytes directly instead of building a second
+                    # full-size Unicode buffer in httpx's stdlib JSON path.
+                    try:
+                        output = orjson.loads(response.content)
+                    except orjson.JSONDecodeError:
+                        output = response.json()
+                else:
+                    output = response.json()
             except json.JSONDecodeError:
                 output = response.text
         except Exception as e:

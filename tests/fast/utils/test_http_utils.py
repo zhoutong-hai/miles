@@ -22,7 +22,10 @@ This lets us simulate 20 seconds of polling in <1ms of real time.
 """
 
 import asyncio
+import base64
+import gzip
 import inspect
+import json
 import multiprocessing
 import socket
 import subprocess
@@ -74,7 +77,8 @@ async def test_post_does_not_retry_permanent_client_errors(status):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [408, 429, 503])
-async def test_post_still_retries_transient_responses(status, monkeypatch):
+@pytest.mark.parametrize("replay", [False, True])
+async def test_post_still_retries_transient_responses(status, replay, monkeypatch):
     calls = []
 
     def respond(request):
@@ -86,8 +90,71 @@ async def test_post_still_retries_transient_responses(status, monkeypatch):
 
     monkeypatch.setattr(http_utils.asyncio, "sleep", no_wait)
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        assert await http_utils._post(client, "http://engine/generate", {}) == {"ok": True}
+        payload = {"return_routed_experts": True} if replay else {}
+        assert await http_utils._post(client, "http://engine/generate", payload) == {"ok": True}
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_post_replay_decodes_bytes_preserving_routes_and_logprobs(compressed, monkeypatch):
+    routes = bytes(range(256)) * 1024
+    expected = {
+        "text": "synthetic α response",
+        "meta_info": {
+            "routed_experts": base64.b64encode(routes).decode("ascii"),
+            "output_token_logprobs": [[x, 42, "x"] for x in [-0.0, -0.12345678901234567, -1e-300, -512.25]],
+            "weight_version": "21",
+            "prompt_tokens": 65536,
+        },
+    }
+    raw = json.dumps(expected).encode()
+    headers = {"content-encoding": "gzip"} if compressed else {}
+
+    def respond(request):
+        assert json.loads(request.content)["return_routed_experts"] is True
+        return httpx.Response(200, content=gzip.compress(raw) if compressed else raw, headers=headers)
+
+    def reject_stdlib_decode(*_args, **_kwargs):
+        raise AssertionError("replay took the full-size stdlib JSON decoding path")
+
+    monkeypatch.setattr(httpx.Response, "json", reject_stdlib_decode)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        actual = await http_utils._post(client, "http://engine/generate", {"return_routed_experts": True})
+    assert actual == expected
+    assert base64.b64decode(actual["meta_info"]["routed_experts"]) == routes
+    assert [x[0].hex() for x in actual["meta_info"]["output_token_logprobs"]] == [
+        x[0].hex() for x in expected["meta_info"]["output_token_logprobs"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b'{"logprob": -Infinity}', '{"text": "α"}'.encode("utf-16"), b"plain reply"])
+async def test_post_replay_preserves_stdlib_and_text_fallbacks(raw):
+    def respond(_request):
+        return httpx.Response(200, content=raw)
+
+    try:
+        expected = json.loads(raw)
+    except json.JSONDecodeError:
+        expected = raw.decode()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        assert await http_utils._post(client, "http://engine/generate", {"return_routed_experts": True}) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"return_routed_experts": False}])
+async def test_post_without_replay_preserves_default_decoder(payload, monkeypatch):
+    expected = {"large_integer": 2**100}
+
+    def reject_replay_decode(*_args, **_kwargs):
+        raise AssertionError("ordinary HTTP response changed decoder")
+
+    monkeypatch.setattr(http_utils.orjson, "loads", reject_replay_decode)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=json.dumps(expected)))
+    ) as client:
+        assert await http_utils._post(client, "http://engine/generate", payload) == expected
 
 
 def _listen_after_delay(host: str, port: int, delay: float, stop_event: threading.Event):

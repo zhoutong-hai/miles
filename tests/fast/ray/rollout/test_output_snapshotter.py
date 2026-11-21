@@ -162,6 +162,44 @@ class TestRolloutExecutorOutputSnapshotter:
         assert output.data == [Sample(index=7, tokens=[1, 2])]
         assert output.metadata == {"prompt_group_sizes": [1]}
 
+    @pytest.mark.parametrize("field", ["rollout_routed_experts", "rollout_indexer_topk"])
+    def test_immutable_inline_replay_is_shared_without_copying_sample_state(self, tmp_path: Path, field: str) -> None:
+        """R3 buffers decoded from bytes need no second full-batch allocation."""
+        array = np.frombuffer(np.arange(8, dtype=np.int32).tobytes(), dtype=np.int32).reshape(2, 2, 2)
+        sample = Sample(index=7, tokens=[1, 2], **{field: array})
+        snapshotter = _RolloutExecutorOutputSnapshotter(args=_args())
+        snapshotter.capture(trainer_model_id=None, rollout_id=3, data=[sample], metadata={})
+        entry = next(iter(snapshotter._snapshots.values()))
+
+        assert entry.data[0] is not sample
+        assert entry.data[0].tokens is not sample.tokens
+        assert getattr(entry.data[0], field) is array
+        with pytest.raises(ValueError):
+            array.setflags(write=True)
+
+        snapshotter.save(tmp_path)
+        restored = _RolloutExecutorOutputSnapshotter(args=_args())
+        restored.load(tmp_path)
+        output = restored.get(trainer_model_id=None, rollout_id=3)
+        np.testing.assert_array_equal(getattr(output.data[0], field), array)
+
+    @pytest.mark.parametrize("readonly_view", [False, True])
+    def test_mutable_replay_storage_stays_isolated(self, readonly_view: bool) -> None:
+        """A read-only flag alone cannot protect a snapshot from a writable alias."""
+        owner = np.arange(8, dtype=np.int32)
+        array = owner.reshape(2, 2, 2)
+        if readonly_view:
+            array.setflags(write=False)
+        snapshotter = _RolloutExecutorOutputSnapshotter(args=_args())
+        snapshotter.capture(
+            trainer_model_id=None, rollout_id=3, data=[Sample(rollout_routed_experts=array)], metadata={}
+        )
+        entry = next(iter(snapshotter._snapshots.values()))
+        owner[:] = -1
+
+        assert not np.shares_memory(entry.data[0].rollout_routed_experts, owner)
+        np.testing.assert_array_equal(entry.data[0].rollout_routed_experts.ravel(), np.arange(8))
+
     def test_replayed_outputs_are_isolated_from_later_mutations(self, tmp_path: Path) -> None:
         """A replayed batch is mutated by conversion, and a save before training must not follow."""
         snapshotter = _RolloutExecutorOutputSnapshotter(args=_args())

@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import numpy as np
+
 from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.output_store.dropped import record_dropped_samples, regenerated_on_restore, store_refs_of
 from miles.utils.simple_checkpointer import load_simple_checkpoint, save_simple_checkpoint
@@ -29,7 +31,7 @@ class _RolloutExecutorOutputSnapshotter:
             "a replayed batch must not be captured again"
         )
 
-        self._snapshots[key] = copy.deepcopy(
+        self._snapshots[key] = _copy_snapshot(
             _OutputSnapshotEntry(data=data, metadata=metadata, phase=_OutputSnapshotPhase.CAPTURED)
         )
         captured = [one for one, entry in self._snapshots.items() if entry.phase is _OutputSnapshotPhase.CAPTURED]
@@ -57,7 +59,7 @@ class _RolloutExecutorOutputSnapshotter:
         ), f"rollout {rollout_id} of trainer model {trainer_model_id} was already replayed"
 
         self._snapshots[key] = replace(entry, phase=_OutputSnapshotPhase.REPLAYED)
-        return copy.deepcopy(entry)
+        return _copy_snapshot(entry)
 
     def discard_completed(self, *, completed_rollout_ids: dict[str | None, int]) -> None:
         self._snapshots = {
@@ -125,3 +127,21 @@ class _OutputSnapshotEntry:
     data: list[Sample]
     metadata: dict[str, Any]
     phase: _OutputSnapshotPhase
+
+
+def _copy_snapshot(entry: _OutputSnapshotEntry) -> _OutputSnapshotEntry:
+    """Isolate mutable sample state without copying immutable inline replay buffers."""
+    memo = {}
+    for sample in entry.data:
+        for array in (sample.rollout_routed_experts, sample.rollout_indexer_topk):
+            if array is None or array.flags.writeable:
+                continue
+            base = array
+            while isinstance(base, np.ndarray):
+                base = base.base
+            # A read-only view of writable storage is not immutable. The inline
+            # decoder uses frombuffer(bytes): those buffers cannot be made writable,
+            # and retaining the array also retains its storage for checkpointing.
+            if isinstance(base, bytes):
+                memo[id(array)] = array
+    return copy.deepcopy(entry, memo=memo)

@@ -9,6 +9,7 @@ from miles.ray.rollout.eval_dispatch import EvalDispatcher
 from miles.ray.specs.train import compute_trainer_configs
 from miles.utils import checkpoint_decay
 from miles.utils.async_utils import Disposer, with_disposer
+from miles.utils.checkpoint_lifecycle import CheckpointLifecycle
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.lora.utils import lora_rollout_enabled
@@ -26,6 +27,9 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
     args = startup_info.args
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     capability = init_orchestration_script(startup_info, disposer=disposer)
+    checkpoints = CheckpointLifecycle.from_args(args)
+    disposer.add(checkpoints.close)
+    await checkpoints.event("start")
     trainer_handles = create_trainer_handles(
         args, trainer_configs=compute_trainer_configs(args), capability=capability
     )
@@ -67,6 +71,8 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
     if args.offload_rollout:
         await inference_controller.onload_kv()
 
+    await checkpoints.event("ready")
+
     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
     disposer.add(eval_dispatcher.drain)
 
@@ -85,6 +91,7 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
 
     async def save(rollout_id, force_sync=False):
         force_sync = force_sync or rollout_id == args.num_rollout - 1
+        await checkpoints.event("before_save", rollout_id)
 
         async def save_training_model(model):
             if args.use_critic and args.offload_train:
@@ -99,6 +106,7 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
             await save_training_model(actor_model)
         if args.use_critic:
             await save_training_model(critic_model)
+        await checkpoints.event("after_save", rollout_id)
 
     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()

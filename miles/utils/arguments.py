@@ -1448,6 +1448,13 @@ def miles_validate_args(args):
     if args.custom_megatron_post_save_hook_path is not None:
         assert args.save is not None, "'--save' is required when custom_megatron_post_save_hook_path is set."
 
+    if args.custom_checkpoint_lifecycle_hook_path is not None:
+        assert args.save is not None, "Checkpoint lifecycle hooks require --save"
+        assert not args.async_save, "Checkpoint lifecycle hooks require synchronous native saves"
+        assert (
+            not args.fully_async and args.advantage_estimator != "ppo"
+        ), "Checkpoint lifecycle hooks require the single-actor synchronous driver"
+
     validate_lora_args(args)
     _validate_fused_lm_head_lora_targets(args)
     _resolve_data_source_path(args)

@@ -74,6 +74,13 @@ class AlgoConfig(PolicyAggregationConfig):
             ),
         ),
     ] = None
+    custom_checkpoint_lifecycle_hook_path: A[
+        CustomFunctionConfig | None,
+        Arg(
+            help="Driver-side synchronous checkpoint lifecycle hook: hook(args, *, phase, rollout_id). "
+            "Phases: start, ready, before_save, after_save, close. Runs outside trainer collectives."
+        ),
+    ] = None
     num_critic_only_steps: A[
         int,
         Arg(

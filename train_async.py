@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
     args = startup_info.args
+    assert (
+        args.custom_checkpoint_lifecycle_hook_path is None
+    ), "Checkpoint lifecycle hooks require synchronous train.py"
     assert not args.colocate or args.fully_async, "Colocation is only supported for async training with --fully-async."
     validate_async_off_policy_correction(args)
     capability = init_orchestration_script(startup_info, disposer=disposer)

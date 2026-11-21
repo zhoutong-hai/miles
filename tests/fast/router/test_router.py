@@ -1,4 +1,6 @@
 import asyncio
+import gzip
+import json
 from collections.abc import Callable
 from urllib.parse import urlencode
 
@@ -585,3 +587,114 @@ class TestProxyIntegration:
         r = requests.get(f"{router_env.url}/health", timeout=5.0)
         r.raise_for_status()
         assert r.json()["status"] == "ok"
+
+
+class TestProxyResponseBytes:
+    @pytest.mark.parametrize(
+        "body,content_type,status_code",
+        [
+            (b' { "value": 1e-08, "text": "hello" }\n', "application/json", 200),
+            (b"data: first\n\ndata: second\n\n", "text/event-stream", 200),
+            (b"\x00\xff\x80not-json", "application/octet-stream", 503),
+            (b"", None, 204),
+        ],
+    )
+    def test_preserves_body_ownership_status_and_headers(self, body, content_type, status_code):
+        headers = {
+            "Content-Length": "1",
+            "Transfer-Encoding": "chunked",
+            "Server": "upstream",
+            "Date": "upstream date",
+            "X-Request-Id": "request-1",
+        }
+        if content_type:
+            headers["Content-Type"] = content_type
+        response = MilesRouter.build_proxy_response(
+            None, {"response_body": body, "status_code": status_code, "headers": headers}
+        )
+        assert response.body is body
+        assert response.status_code == status_code
+        if status_code == 204:
+            assert "content-length" not in response.headers
+        else:
+            assert response.headers["content-length"] == str(len(body))
+        assert response.headers["x-request-id"] == "request-1"
+        assert response.headers.get("content-type") == content_type
+        assert all(key not in response.headers for key in ("transfer-encoding", "server", "date"))
+
+    def test_large_replay_response_does_not_parse_or_serialize_json(self, monkeypatch):
+        body = json.dumps(
+            {"text": "synthetic", "meta_info": {"routed_experts": "ABCD" * 262144, "weight_version": "20"}}
+        ).encode()
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("A proxy must not parse or serialize the replay payload")
+
+        monkeypatch.setattr(router_module.json, "loads", forbidden)
+        monkeypatch.setattr(router_module.json, "dumps", forbidden)
+        response = MilesRouter.build_proxy_response(
+            None, {"response_body": body, "status_code": 200, "headers": {"content-type": "application/json"}}
+        )
+        assert response.body is body
+
+    @pytest.mark.parametrize("compressed", [False, True])
+    @pytest.mark.parametrize("status_code", [200, 429])
+    async def test_proxy_preserves_wire_body_and_encoding(self, compressed, status_code):
+        payload = {"input_ids": [1, 2, 3], "return_logprob": True, "return_routed_experts": True}
+        body = b' {"text":"test","meta_info":{"routed_experts":"AQIDBA==","q":[-0.125],"weight_version":"20"}}\n'
+
+        def backend(request):
+            assert request.url == "http://worker.test/generate"
+            assert json.loads(request.content) == payload
+            headers = {"content-type": "application/json", "x-request-id": "reply-1"}
+            if compressed:
+                headers["content-encoding"] = "gzip"
+            return httpx.Response(
+                status_code, stream=httpx.ByteStream(gzip.compress(body) if compressed else body), headers=headers
+            )
+
+        router = MilesRouter(make_router_config(20000), verbose=False)
+        await router.client.aclose()
+        router.client = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+        router._add_worker_url("http://worker.test")
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=router.app), base_url="http://router.test"
+            ) as client:
+                response = await client.post("/generate", json=payload)
+            assert response.status_code == status_code
+            assert response.content == body
+            assert response.json()["meta_info"]["q"] == [-0.125]
+            assert response.headers["x-request-id"] == "reply-1"
+            assert response.headers.get("content-encoding") == ("gzip" if compressed else None)
+            assert router.worker_request_counts == {"http://worker.test": 0}
+        finally:
+            await router.client.aclose()
+
+    async def test_upstream_read_failure_closes_response_and_releases_worker(self):
+        closed = []
+
+        class BrokenStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"partial response"
+                raise httpx.ReadError("synthetic upstream disconnect")
+
+            async def aclose(self):
+                closed.append(True)
+
+        router = MilesRouter(make_router_config(20000), verbose=False)
+        await router.client.aclose()
+        router.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=BrokenStream()))
+        )
+        router._add_worker_url("http://worker.test")
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=router.app), base_url="http://router.test"
+            ) as client:
+                with pytest.raises(httpx.ReadError, match="synthetic upstream disconnect"):
+                    await client.post("/generate", json={"input_ids": [1]})
+            assert closed == [True]
+            assert router.worker_request_counts == {"http://worker.test": 0}
+        finally:
+            await router.client.aclose()

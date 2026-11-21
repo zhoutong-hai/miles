@@ -152,14 +152,16 @@ class MilesRouter:
             headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
 
         try:
-            response = await self.client.request(request.method, url, content=body, headers=headers)
-            content = await response.aread()
-            return {
-                "request_body": body,
-                "response_body": content,
-                "status_code": response.status_code,
-                "headers": dict(response.headers),
-            }
+            async with self.client.stream(request.method, url, content=body, headers=headers) as response:
+                # Keep the upstream representation intact, including compressed
+                # bodies. The downstream client owns content decoding.
+                content = b"".join([chunk async for chunk in response.aiter_raw()])
+                return {
+                    "request_body": body,
+                    "response_body": content,
+                    "status_code": response.status_code,
+                    "headers": dict(response.headers),
+                }
         finally:
             self._finish_url(worker_url)
 
@@ -173,12 +175,10 @@ class MilesRouter:
             for k, v in headers.items()
             if k.lower() not in ("content-length", "transfer-encoding", "server", "date")
         }
-        content_type = headers.get("content-type", "")
-        try:
-            data = json.loads(content)
-            return JSONResponse(content=data, status_code=status_code, headers=headers)
-        except Exception:
-            return Response(content=content, status_code=status_code, headers=headers, media_type=content_type)
+        # Replay replies can contain large base64 buffers. Forward their bytes
+        # without JSON parsing/re-encoding, which blocks this shared event loop
+        # and duplicates the buffers for every completed request.
+        return Response(content=content, status_code=status_code, headers=headers)
 
     async def add_worker(self, request: Request):
         """Add a new worker to the router.

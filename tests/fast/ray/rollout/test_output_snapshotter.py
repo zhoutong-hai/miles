@@ -173,15 +173,19 @@ class TestRolloutExecutorOutputSnapshotter:
 
         assert entry.data[0] is not sample
         assert entry.data[0].tokens is not sample.tokens
-        assert getattr(entry.data[0], field) is array
+        captured_array = getattr(entry.data[0], field)
+        assert captured_array is not array
+        assert np.shares_memory(captured_array, array)
         with pytest.raises(ValueError):
             array.setflags(write=True)
+        array.shape = (8,)
+        assert captured_array.shape == (2, 2, 2)
 
         snapshotter.save(tmp_path)
         restored = _RolloutExecutorOutputSnapshotter(args=_args())
         restored.load(tmp_path)
         output = restored.get(trainer_model_id=None, rollout_id=3)
-        np.testing.assert_array_equal(getattr(output.data[0], field), array)
+        np.testing.assert_array_equal(getattr(output.data[0], field), array.reshape(2, 2, 2))
 
     @pytest.mark.parametrize("readonly_view", [False, True])
     def test_mutable_replay_storage_stays_isolated(self, readonly_view: bool) -> None:

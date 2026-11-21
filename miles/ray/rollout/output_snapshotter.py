@@ -143,5 +143,7 @@ def _copy_snapshot(entry: _OutputSnapshotEntry) -> _OutputSnapshotEntry:
             # decoder uses frombuffer(bytes): those buffers cannot be made writable,
             # and retaining the array also retains its storage for checkpointing.
             if isinstance(base, bytes):
-                memo[id(array)] = array
+                # Array headers remain mutable even when their bytes do not:
+                # isolate shape/dtype changes while sharing only the payload.
+                memo[id(array)] = array.view()
     return copy.deepcopy(entry, memo=memo)
